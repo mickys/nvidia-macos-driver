@@ -260,6 +260,99 @@ static bool nvmtl_nvenc_forced(const char *knob)
     }
     return false;
 }
+// Pre-Blackwell NVENC input layout. The encoder library tiles each NV12 plane in Blackwell's layout, while NVC4B7,
+// NVC7B7 and NVC9B7 read classic block-linear, so the engine sees every 64-byte x 8-row tile with its 8-byte chunks
+// moved (the torn pictures of #65). libnvdec_h264.dylib (Blackwell untiling) on such a GPU returns the same
+// permutation P of a bit-exact decode (tools/nvdec_layout_probe.m): output chunk j of tile row r comes from
+//   luma:   row (r>>1) + 4*((j>>1)&1),  column 8*(r&1) + 16*(j&1) + 32*(j>>2)
+//   chroma: row (r&3)  + 4*((j>>1)&1),  column 8*(j&1) + 16*((r>>2)&1) + 32*(j>>2)
+// The encoder path applies the inverse, so a frame handed to the library already arranged as in[p] = img[P(p)]
+// reaches the engine as the original picture. The library reads frames only through CVPixelBufferLockBaseAddress and
+// CVPixelBufferGetBaseAddressOfPlane, so those two entries of its import table point at the functions below, which
+// return a rearranged copy of the plane with the same bytes per row. The library binary is not modified.
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach/mach.h>
+#include <syslog.h>
+#include <CoreVideo/CVPixelBuffer.h>
+// CoreVideo is not linked into the plugin; VideoToolbox has loaded it by the time an encoder is registered
+static CVReturn (*g_nvl_lock)(CVPixelBufferRef, CVPixelBufferLockFlags);
+static void *(*g_nvl_base)(CVPixelBufferRef, size_t);
+static OSType (*g_nvl_fmt)(CVPixelBufferRef);
+static size_t (*g_nvl_bpr)(CVPixelBufferRef, size_t), (*g_nvl_rows)(CVPixelBufferRef, size_t);
+static __thread struct { CVPixelBufferRef pb; uint8_t *buf[2]; size_t cap[2]; bool valid[2]; } t_nvl;
+static inline void nvl_src_of(int plane, int r, int j, int *sr, int *sc)
+{
+    if (plane == 0) { *sr = (r >> 1) + 4 * ((j >> 1) & 1); *sc = 8 * (r & 1) + 16 * (j & 1) + 32 * (j >> 2); }
+    else            { *sr = (r & 3) + 4 * ((j >> 1) & 1);  *sc = 8 * (j & 1) + 16 * ((r >> 2) & 1) + 32 * (j >> 2); }
+}
+static CVReturn nvl_lock(CVPixelBufferRef pb, CVPixelBufferLockFlags fl)
+{
+    t_nvl.pb = pb; t_nvl.valid[0] = t_nvl.valid[1] = false;      // a new lock = possibly new contents
+    return g_nvl_lock(pb, fl);
+}
+static void *nvl_base(CVPixelBufferRef pb, size_t plane)
+{
+    uint8_t *src = g_nvl_base(pb, plane);
+    OSType f = g_nvl_fmt(pb);
+    if (!src || plane > 1 || (f != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && f != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange))
+        return src;
+    if (t_nvl.pb == pb && t_nvl.valid[plane]) return t_nvl.buf[plane];
+    size_t bpr = g_nvl_bpr(pb, plane), rows = g_nvl_rows(pb, plane);
+    size_t prow = (rows + 15) & ~(size_t)15;                     // the library may read a partial last tile
+    size_t need = bpr * prow;
+    if (t_nvl.cap[plane] < need) {
+        free(t_nvl.buf[plane]); t_nvl.buf[plane] = malloc(need); t_nvl.cap[plane] = t_nvl.buf[plane] ? need : 0;
+        if (!t_nvl.buf[plane]) return src;
+    }
+    uint8_t *d = t_nvl.buf[plane]; size_t cols = bpr & ~(size_t)63;
+    for (size_t r = 0; r < prow; r++) {
+        uint8_t *drow = d + r * bpr;
+        for (size_t c = 0; c < cols; c += 8) {
+            int sr, sc; nvl_src_of((int)plane, (int)(r & 7), (int)((c & 63) >> 3), &sr, &sc);
+            size_t R = (r & ~(size_t)7) + (size_t)sr; if (R >= rows) R = rows - 1;
+            memcpy(drow + c, src + R * bpr + (c & ~(size_t)63) + (size_t)sc, 8);
+        }
+        if (cols < bpr) memcpy(drow + cols, src + (r < rows ? r : rows - 1) * bpr + cols, bpr - cols);
+    }
+    t_nvl.pb = pb; t_nvl.valid[plane] = true;
+    return d;
+}
+// Point the image's __got entries for the two CoreVideo functions at the hooks. 0 = both hooked.
+static int nvl_hook_image(const void *anyFunctionInImage, const char *what)
+{
+    Dl_info di; if (!dladdr(anyFunctionInImage, &di) || !di.dli_fbase) return -1;
+    const struct mach_header_64 *mh = di.dli_fbase;
+    intptr_t slide = 0;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) if (_dyld_get_image_header(i) == (const void *)mh) { slide = _dyld_get_image_vmaddr_slide(i); break; }
+    g_nvl_lock = dlsym(RTLD_DEFAULT, "CVPixelBufferLockBaseAddress");
+    g_nvl_base = dlsym(RTLD_DEFAULT, "CVPixelBufferGetBaseAddressOfPlane");
+    g_nvl_fmt = dlsym(RTLD_DEFAULT, "CVPixelBufferGetPixelFormatType");
+    g_nvl_bpr = dlsym(RTLD_DEFAULT, "CVPixelBufferGetBytesPerRowOfPlane");
+    g_nvl_rows = dlsym(RTLD_DEFAULT, "CVPixelBufferGetHeightOfPlane");
+    if (!g_nvl_lock || !g_nvl_base || !g_nvl_fmt || !g_nvl_bpr || !g_nvl_rows) return -2;
+    int hooked = 0;
+    const uint8_t *lc = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc += ((const struct load_command *)lc)->cmdsize) {
+        const struct segment_command_64 *seg = (const void *)lc;
+        if (seg->cmd != LC_SEGMENT_64) continue;
+        const struct section_64 *sec = (const void *)(seg + 1);
+        for (uint32_t k = 0; k < seg->nsects; k++, sec++) {
+            if (strcmp(sec->sectname, "__got") && strcmp(sec->sectname, "__la_symbol_ptr")) continue;
+            void **slot = (void **)(sec->addr + slide); size_t n = sec->size / sizeof(void *);
+            for (size_t e = 0; e < n; e++) {
+                void *rep = slot[e] == (void *)g_nvl_lock ? (void *)nvl_lock : slot[e] == (void *)g_nvl_base ? (void *)nvl_base : NULL;
+                if (!rep) continue;
+                vm_address_t page = (vm_address_t)&slot[e] & ~(vm_address_t)(vm_page_size - 1);
+                if (vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return -3;
+                slot[e] = rep; hooked++;
+                vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ);
+            }
+        }
+    }
+    syslog(LOG_NOTICE, "NullMoth nvenc-layout: %s in %s: %d import(s) redirected for the classic NVENC input layout", what, getprogname(), hooked);
+    return hooked == 2 ? 0 : -4;
+}
 static void nvmtl_nvenc_register(void)
 {
     static dispatch_once_t once;
@@ -281,6 +374,8 @@ static void nvmtl_nvenc_register(void)
         if (!h) { nvlog("nvenc: dlopen %s FAILED: %s", path, dlerror()); return; }
         void *fac = dlsym(h, "NVEncH264_CreateInstance");
         if (!fac) { nvlog("nvenc: %s has no NVEncH264_CreateInstance", path); return; }
+        if (!nvmtl_video_is_blackwell() && nvl_hook_image(fac, "libnvenc_h264") != 0) {
+            nvlog("nvenc: could not redirect libnvenc_h264's frame reads for the classic layout - not registering"); return; }
         NSDictionary *info = @{ @"CMClassImplementationID": @"com.nvmtl.videoencoder.avc.nvenc",
                                 @"CMClassImplementationName": @"NVIDIA NVENC H.264",
                                 @"VTRating": @1000, @"VTIsHardwareAccelerated": @YES };
