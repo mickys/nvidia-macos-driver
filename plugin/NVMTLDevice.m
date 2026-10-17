@@ -244,13 +244,30 @@ static void nvmtl_nvdec_register(void)
               st ? "NOT registered" : "REGISTERED", me, (int)st, path);
     });
 }
+// NVMTL_NVENC_FORCE / NVMTL_NVENC_HEVC_FORCE (nvrm610.conf; release builds drop inherited NVMTL_* variables):
+// register the encoders on pre-Blackwell GPUs too. "1" = every process, otherwise a comma-separated list of process
+// names (getprogname), so testing can stay limited to chosen programs while apps keep Apple's encoder.
+static bool nvmtl_nvenc_forced(const char *knob)
+{
+    const char *v = getenv(knob), *me = getprogname();
+    if (!v || !*v || !me) return false;
+    if (!strcmp(v, "1")) return true;
+    size_t n = strlen(me);
+    for (const char *p = v; *p; ) {
+        const char *e = strchr(p, ','); size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l == n && !strncmp(p, me, n)) return true;
+        if (!e) break; p = e + 1;
+    }
+    return false;
+}
 static void nvmtl_nvenc_register(void)
 {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVENC")) { nvlog("nvenc: NVMTL_NO_NVENC set - not registering in %s", me); return; }
-        if (!nvmtl_video_is_blackwell()) { nvlog("nvenc: %s is not Blackwell - H.264 encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
+        if (!nvmtl_video_is_blackwell() && !nvmtl_nvenc_forced("NVMTL_NVENC_FORCE")) { nvlog("nvenc: %s is not Blackwell - H.264 encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
+        if (!nvmtl_video_is_blackwell()) nvlog("nvenc: %s is not Blackwell - NVMTL_NVENC_FORCE covers %s, registering H.264 anyway", nvmtl_vk_device_name(), me);
         if (!strcmp(me, "WindowServer")) return;
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
@@ -343,7 +360,8 @@ static void nvmtl_nvenc_hevc_register(void)
     dispatch_once(&once, ^{
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVENC_HEVC")) { nvlog("nvenc: NVMTL_NO_NVENC_HEVC set - not registering HEVC in %s", me); return; }
-        if (!nvmtl_video_is_blackwell()) { nvlog("nvenc: %s is not Blackwell - HEVC encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
+        if (!nvmtl_video_is_blackwell() && !nvmtl_nvenc_forced("NVMTL_NVENC_HEVC_FORCE")) { nvlog("nvenc: %s is not Blackwell - HEVC encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
+        if (!nvmtl_video_is_blackwell()) nvlog("nvenc: %s is not Blackwell - NVMTL_NVENC_HEVC_FORCE covers %s, registering HEVC anyway", nvmtl_vk_device_name(), me);
         if (!strcmp(me, "WindowServer")) return;
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
