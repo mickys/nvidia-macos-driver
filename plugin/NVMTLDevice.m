@@ -274,6 +274,7 @@ static bool nvmtl_nvenc_forced(const char *knob)
 #include <mach-o/loader.h>
 #include <mach/mach.h>
 #include <syslog.h>
+#include <immintrin.h>
 #include <CoreVideo/CVPixelBuffer.h>
 // CoreVideo is not linked into the plugin; VideoToolbox has loaded it by the time an encoder is registered
 static CVReturn (*g_nvl_lock)(CVPixelBufferRef, CVPixelBufferLockFlags);
@@ -291,6 +292,41 @@ static CVReturn nvl_lock(CVPixelBufferRef pb, CVPixelBufferLockFlags fl)
     t_nvl.pb = pb; t_nvl.valid[0] = t_nvl.valid[1] = false;      // a new lock = possibly new contents
     return g_nvl_lock(pb, fl);
 }
+// One 8-row band of whole tiles, all rows inside the plane: the copy that runs for nearly every row.
+// Each output row of a tile takes four chunks from source row A and four from row A+4 (the j1 bit), so it is
+// [A0 A1 B0 B1 | A2 A3 B2 B3] where A/B are those four chunks in order:
+//   luma:   A = every other chunk from r0 (chunks r0, 2+r0, 4+r0, 6+r0) of row (r>>1)
+//   chroma: A = the 16-byte pairs at 16*r2 and 32+16*r2 of row (r&3)
+__attribute__((target("avx2"))) static void nvl_band_avx2(int plane, const uint8_t *s, uint8_t *o, size_t bpr, size_t cols)
+{
+    for (size_t t = 0; t < cols; t += 64)
+        for (int r = 0; r < 8; r++) {
+            __m256i A, B;
+            if (plane == 0) {
+                const uint8_t *ra = s + (size_t)(r >> 1) * bpr + t, *rb = ra + 4 * bpr;
+                __m256i a0 = _mm256_loadu_si256((const __m256i *)ra), a1 = _mm256_loadu_si256((const __m256i *)(ra + 32));
+                __m256i b0 = _mm256_loadu_si256((const __m256i *)rb), b1 = _mm256_loadu_si256((const __m256i *)(rb + 32));
+                // unpack gives qwords [x, x+4, x+2, x+6] for x = r0; 0xD8 puts them in order
+                A = _mm256_permute4x64_epi64((r & 1) ? _mm256_unpackhi_epi64(a0, a1) : _mm256_unpacklo_epi64(a0, a1), 0xD8);
+                B = _mm256_permute4x64_epi64((r & 1) ? _mm256_unpackhi_epi64(b0, b1) : _mm256_unpacklo_epi64(b0, b1), 0xD8);
+            } else {
+                size_t h = 16 * (size_t)((r >> 2) & 1);
+                const uint8_t *ra = s + (size_t)(r & 3) * bpr + t, *rb = ra + 4 * bpr;
+                A = _mm256_set_m128i(_mm_loadu_si128((const __m128i *)(ra + 32 + h)), _mm_loadu_si128((const __m128i *)(ra + h)));
+                B = _mm256_set_m128i(_mm_loadu_si128((const __m128i *)(rb + 32 + h)), _mm_loadu_si128((const __m128i *)(rb + h)));
+            }
+            _mm256_storeu_si256((__m256i *)(o + r * bpr + t), _mm256_permute2x128_si256(A, B, 0x20));
+            _mm256_storeu_si256((__m256i *)(o + r * bpr + t + 32), _mm256_permute2x128_si256(A, B, 0x31));
+        }
+}
+// The same band without AVX2: the 64 chunk offsets of a tile from a table, so the loop has no per-chunk math.
+static void nvl_band_table(int plane, const uint8_t *s, uint8_t *o, size_t bpr, size_t cols)
+{
+    size_t off[64];
+    for (int k = 0; k < 64; k++) { int sr, sc; nvl_src_of(plane, k >> 3, k & 7, &sr, &sc); off[k] = (size_t)sr * bpr + (size_t)sc; }
+    for (size_t t = 0; t < cols; t += 64)
+        for (int k = 0; k < 64; k++) { uint64_t v; memcpy(&v, s + t + off[k], 8); memcpy(o + (size_t)(k >> 3) * bpr + t + (size_t)(k & 7) * 8, &v, 8); }
+}
 static void *nvl_base(CVPixelBufferRef pb, size_t plane)
 {
     uint8_t *src = g_nvl_base(pb, plane);
@@ -305,8 +341,15 @@ static void *nvl_base(CVPixelBufferRef pb, size_t plane)
         free(t_nvl.buf[plane]); t_nvl.buf[plane] = malloc(need); t_nvl.cap[plane] = t_nvl.buf[plane] ? need : 0;
         if (!t_nvl.buf[plane]) return src;
     }
-    uint8_t *d = t_nvl.buf[plane]; size_t cols = bpr & ~(size_t)63;
-    for (size_t r = 0; r < prow; r++) {
+    static int avx2 = -1;
+    if (avx2 < 0) avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+    uint8_t *d = t_nvl.buf[plane]; size_t cols = bpr & ~(size_t)63, full = rows & ~(size_t)7;
+    for (size_t b = 0; b < full; b += 8) {                       // whole bands: no row past the plane
+        if (avx2) nvl_band_avx2((int)plane, src + b * bpr, d + b * bpr, bpr, cols);
+        else nvl_band_table((int)plane, src + b * bpr, d + b * bpr, bpr, cols);
+        if (cols < bpr) for (size_t r = b; r < b + 8; r++) memcpy(d + r * bpr + cols, src + r * bpr + cols, bpr - cols);
+    }
+    for (size_t r = full; r < prow; r++) {                       // the partial last band: rows past the plane repeat the last one
         uint8_t *drow = d + r * bpr;
         for (size_t c = 0; c < cols; c += 8) {
             int sr, sc; nvl_src_of((int)plane, (int)(r & 7), (int)((c & 63) >> 3), &sr, &sc);
