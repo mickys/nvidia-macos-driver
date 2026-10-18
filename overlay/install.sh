@@ -2,14 +2,14 @@
 # Install the mickys overlay on top of NullMoth's NVIDIA driver: replaces the Metal plugin binary in
 # /Library/GPUBundles/NVMTLDriver.bundle with the overlay's build and adds libnvencvt.dylib next to it.
 #   sudo ./install.sh [--nvenc=<process list>|--nvenc=1|--nvenc=off]
-#     --nvenc   which processes get the open-source H.264/HEVC encoder (RTX 40 only): a comma-separated list of process
-#               names, 1 = every process, off = none. Default: parsecd,obs,ffmpeg,sunshine
+#     --nvenc   which processes get the open-source H.264/HEVC encoder (RTX 40 only): 1 = every app (default), a
+#               comma-separated list of process names to limit it to those, off = none
 # It installs only over a NullMoth driver version listed in COMPATIBLE-DRIVERS, and only when the kernel extensions
 # on disk and the ones running are that version too (the plugin and the kernel driver share interfaces).
 # Undo: sudo ./uninstall.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-NVENC="parsecd,obs,ffmpeg,sunshine"
+NVENC=1
 for a in "$@"; do case $a in
   --nvenc=*) NVENC=${a#--nvenc=} ;;
   *) echo "unknown option $a"; exit 2 ;;

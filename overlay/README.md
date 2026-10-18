@@ -25,11 +25,12 @@ Turn it off with `NVMTL_SURFIN_UPLOAD=cpu` (GPU copy) and `NVMTL_SURFIN_KEEP=0` 
 `/Library/GPUBundles/nvmtl/nvrm610.conf`, then log out and in.
 
 **Hardware H.264 and HEVC encoding on RTX 40 (Ada).** NullMoth's driver registers its NVENC encoders only on Blackwell
-(RTX 50), so on older cards VideoToolbox encodes in software (H.264) or not at all (HEVC). The overlay adds an
-open-source encoder for Ada NVENC ([mickys/nvenc](https://github.com/mickys/nvenc), `libnvencvt.dylib`) for the
-processes you list. Parsec at 4K: about 5 ms per frame with either codec; HEVC needs about 40 % less bitrate for the
+(RTX 50), so on older cards VideoToolbox encodes in software. The overlay adds an open-source encoder for Ada NVENC
+([mickys/nvenc](https://github.com/mickys/nvenc), `libnvencvt.dylib`), available to every app that uses
+VideoToolbox (Parsec, OBS, ffmpeg, AVFoundation apps, ...). Parsec at 4K: about 5 ms per frame with either codec; HEVC needs about 40 % less bitrate for the
 same quality. It checks the GPU first and stays off on cards without Ada NVENC (RTX 20/30 and GTX 16 keep Apple's
-encoder).
+encoder). Limits: 8-bit 4:2:0 only (H.264 Baseline/Main/High, HEVC Main) and no B-frames; an app that asks for
+10-bit HEVC (Main10) gets 8-bit Main from it, so use `--nvenc=off` or a process list if you export 10-bit HDR video.
 
 ## Requirements
 
@@ -45,8 +46,8 @@ encoder).
 
 ```bash
 tar -xzf mickys-overlay-<version>.tar.gz && cd mickys-overlay-<version>
-sudo ./install.sh                      # encoder for parsecd, obs, ffmpeg, sunshine
-sudo ./install.sh --nvenc=1            # encoder for every app
+sudo ./install.sh                      # encoder for every app
+sudo ./install.sh --nvenc=parsecd,obs  # encoder only for these processes
 sudo ./install.sh --nvenc=off          # desktop change only
 ```
 
