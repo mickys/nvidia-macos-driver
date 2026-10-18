@@ -1229,8 +1229,9 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
     const uint64_t tin = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    extern _Atomic uint64_t g_imgw_cpu_ns; const uint64_t cin = g_imgw_cpu_ns;   // other threads' copies can land in between: approximate
     int rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
-    if (!rc) nvmtl_surfstat(r->_surf, r->_shareWhy, 1, (uint64_t)row * r->_i.h, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - tin);
+    if (!rc) nvmtl_surfstat_cpu(r->_surf, r->_shareWhy, 1, (uint64_t)row * r->_i.h, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - tin, g_imgw_cpu_ns - cin);
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }

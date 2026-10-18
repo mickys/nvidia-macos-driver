@@ -6178,9 +6178,11 @@ int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t r
     nvmtl_upstage *sl = nvmtl_upstage_get(tight * (size_t)rows);
     if (!sl) return -1;
     uint8_t *dst = (uint8_t *)sl->buf.map;
+    const uint64_t tcp = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (row_bytes == tight) nvmtl_copy_from_surface(dst, src, tight * (size_t)rows);   /* a 4K surface is 2160 rows of 15 KB: one pass, not 2160 calls */
     else for (uint32_t y = 0; y < rows; y++)
         nvmtl_copy_from_surface(dst + (size_t)y * tight, (const uint8_t *)src + (size_t)y * row_bytes, tight);
+    g_imgw_cpu_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - tcp;   /* plugin-logging: CPU part of a surface-in */
     nvk_cmdbuf *const c = &sl->cb;
     if (nvmtl_vk_cmd_begin(q, c)) return -1;
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
