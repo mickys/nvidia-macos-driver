@@ -1212,6 +1212,25 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         return monitor;
     }
 }
+// Surface-in experiment (branch surface-upload): /tmp/nvmtl-surfin-mode holds a bit mask, re-read every 250 ms
+// (non-release builds; release builds cannot open /tmp/nvmtl-* and stay at 0).
+//   1: keep the last 32 uploaded IOSurfaces retained in this process, so their mapping (and its page tables) survives
+//      from one frame to the next instead of being faulted in again
+//   2: upload through the GPU: import the surface's locked pages as host memory and copy them on the GPU (no CPU copy)
+static int nvmtl_surfin_mode(void) { static uint64_t next; static int mode; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= next) { next = now + 250000000ull; int m = 0; FILE *f = fopen("/tmp/nvmtl-surfin-mode", "r");
+        if (f) { if (fscanf(f, "%d", &m) != 1) m = 0; fclose(f); }
+        if (m != mode) nvlog("surface-in mode %d -> %d (1 keep surfaces mapped, 2 GPU upload from the surface's pages)", mode, m);
+        mode = m; }
+    return mode; }
+static void nvmtl_surfin_keep(IOSurfaceRef surf) {
+    static IOSurfaceRef ring[32]; static unsigned at; static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lk);
+    for (unsigned i = 0; i < 32; i++) if (ring[i] == surf) { pthread_mutex_unlock(&lk); return; }
+    IOSurfaceRef old = ring[at]; ring[at] = (IOSurfaceRef)CFRetain(surf); at = (at + 1) % 32;
+    pthread_mutex_unlock(&lk);
+    if (old) CFRelease(old);
+}
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return;
@@ -1225,12 +1244,20 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
           static unsigned ns; if (ns++ < 6 || ns % 2000 == 0) nvlog("item 7: surface-in SKIPPED (shared VRAM current at seed %u): %llu skipped, %llu copied", now, g_surfin_skip, g_surfin_copy);
           return; } }
     uint32_t seed = 0;
+    const int mode = nvmtl_surfin_mode();
+    if (mode & 1) nvmtl_surfin_keep(r->_surf);
     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
+    nvmtl_surfstat_base(r->_surf, base);
     const uint64_t tin = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     extern _Atomic uint64_t g_imgw_cpu_ns; const uint64_t cin = g_imgw_cpu_ns;   // other threads' copies can land in between: approximate
-    int rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
+    int rc = -1;
+    if ((mode & 2) && base && row) {
+        const size_t off = (size_t)((uint8_t *)base - (uint8_t *)IOSurfaceGetBaseAddress(r->_surf));
+        rc = nvmtl_vk_image_write_host(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off);
+    }
+    if (rc) rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
     if (!rc) nvmtl_surfstat_cpu(r->_surf, r->_shareWhy, 1, (uint64_t)row * r->_i.h, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - tin, g_imgw_cpu_ns - cin);
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
