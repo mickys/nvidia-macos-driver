@@ -2,7 +2,7 @@
 # Install the mickys overlay on top of NullMoth's NVIDIA driver: replaces the Metal plugin binary in
 # /Library/GPUBundles/NVMTLDriver.bundle with the overlay's build and adds libnvencvt.dylib next to it.
 #   sudo ./install.sh [--nvenc=<process list>|--nvenc=1|--nvenc=off]
-#     --nvenc   which processes get the open-source H.264 encoder (RTX 40 only): a comma-separated list of process
+#     --nvenc   which processes get the open-source H.264/HEVC encoder (RTX 40 only): a comma-separated list of process
 #               names, 1 = every process, off = none. Default: parsecd,obs,ffmpeg,sunshine
 # It installs only over a NullMoth driver version listed in COMPATIBLE-DRIVERS, and only when the kernel extensions
 # on disk and the ones running are that version too (the plugin and the kernel driver share interfaces).
@@ -69,6 +69,8 @@ fi
 echo "== 3. install"
 install -o root -g wheel -m 755 "$HERE/payload/NVMTLDriver" "$X/NVMTLDriver"
 install -o root -g wheel -m 755 "$HERE/payload/libnvencvt.dylib" "$X/libnvencvt.dylib"
+# a browser-downloaded package carries com.apple.quarantine onto the extracted files; system binaries should not have it
+xattr -d com.apple.quarantine "$X/NVMTLDriver" "$X/libnvencvt.dylib" 2>/dev/null || true
 codesign -f -s - "$X/libnvencvt.dylib" 2>&1 | grep -v "replacing existing signature" || true
 codesign -f -s - --preserve-metadata=identifier "$B" 2>&1 | grep -v "replacing existing signature" || true
 codesign -v "$B" || die "the bundle signature does not verify (undo: sudo ./uninstall.sh)"

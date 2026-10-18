@@ -24,11 +24,12 @@ CSS animation in Safari, for a 3158x1816 window:
 Turn it off with `NVMTL_SURFIN_UPLOAD=cpu` (GPU copy) and `NVMTL_SURFIN_KEEP=0` (keep mapped) in
 `/Library/GPUBundles/nvmtl/nvrm610.conf`, then log out and in.
 
-**Hardware H.264 encoding on RTX 40 (Ada).** NullMoth's driver registers its NVENC encoders only on Blackwell (RTX 50),
-so on older cards VideoToolbox encodes H.264 in software. The overlay adds an open-source H.264 encoder for Ada NVENC
-([mickys/nvenc](https://github.com/mickys/nvenc), `libnvencvt.dylib`) for the processes you list. Parsec at 4K: about
-4.8 ms per frame. It checks the GPU first and stays off on cards without Ada NVENC (RTX 20/30 and GTX 16 keep Apple's
-encoder). HEVC is not supported yet.
+**Hardware H.264 and HEVC encoding on RTX 40 (Ada).** NullMoth's driver registers its NVENC encoders only on Blackwell
+(RTX 50), so on older cards VideoToolbox encodes in software (H.264) or not at all (HEVC). The overlay adds an
+open-source encoder for Ada NVENC ([mickys/nvenc](https://github.com/mickys/nvenc), `libnvencvt.dylib`) for the
+processes you list. Parsec at 4K: about 5 ms per frame with either codec; HEVC needs about 40 % less bitrate for the
+same quality. It checks the GPU first and stays off on cards without Ada NVENC (RTX 20/30 and GTX 16 keep Apple's
+encoder).
 
 ## Requirements
 
@@ -65,13 +66,14 @@ Then log out and back in. Updating NullMoth's driver also replaces the overlay (
 
 - `codesign -dv /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver` and compare the hash with
   `SHA256SUMS`, or `shasum -a 256` the file.
-- Encoder: a listed app shows "nvenc H.264 (NVIDIA pre-Blackwell)" / `org.nvenc.videoencoder.avc` as its encoder;
+- Encoder: a listed app shows "nvenc H.264 (NVIDIA pre-Blackwell)" / `org.nvenc.videoencoder.avc` or "nvenc HEVC
+  (NVIDIA pre-Blackwell)" / `org.nvenc.videoencoder.hevc` as its encoder;
   Parsec's host log (`~/.parsec/log.txt`) says `encoder = Hardware`.
 
 ## Source
 
 - Plugin: `plugin/` of [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) at the tag named in
-  `VERSION` (NullMoth 2.3.6 plus the overlay's commits), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
-- Encoder: [mickys/nvenc](https://github.com/mickys/nvenc) at the commit named in `VERSION`.
+  `SOURCE` (NullMoth 2.3.6 plus the overlay's commits), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
+- Encoder: [mickys/nvenc](https://github.com/mickys/nvenc) at the commit named in `SOURCE`.
 - The plugin source is under the PolyForm Noncommercial License 1.0.0 (`LICENSE`), like NullMoth's. The encoder is MIT
   (`LICENSE-nvenc`).
