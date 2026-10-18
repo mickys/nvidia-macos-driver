@@ -1212,24 +1212,43 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         return monitor;
     }
 }
-// Surface-in experiment (branch surface-upload): /tmp/nvmtl-surfin-mode holds a bit mask, re-read every 250 ms
-// (non-release builds; release builds cannot open /tmp/nvmtl-* and stay at 0).
-//   1: keep the last 32 uploaded IOSurfaces retained in this process, so their mapping (and its page tables) survives
-//      from one frame to the next instead of being faulted in again
-//   2: upload through the GPU: import the surface's locked pages as host memory and copy them on the GPU (no CPU copy)
-static int nvmtl_surfin_mode(void) { static uint64_t next; static int mode; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-    if (now >= next) { next = now + 250000000ull; int m = 0; FILE *f = fopen("/tmp/nvmtl-surfin-mode", "r");
-        if (f) { if (fscanf(f, "%d", &m) != 1) m = 0; fclose(f); }
-        if (m != mode) nvlog("surface-in mode %d -> %d (1 keep surfaces mapped, 2 GPU upload from the surface's pages)", mode, m);
-        mode = m; }
-    return mode; }
+// How surface-in uploads an IOSurface's pages into its GPU image (bit mask):
+//   2: through the GPU: the locked surface pages are imported as host memory and the GPU copies them (no CPU copy, no
+//      CPU touch of the pages); falls back to the CPU copy. Default on; NVMTL_SURFIN_UPLOAD=cpu turns it off.
+//   1: keep the last uploaded IOSurfaces retained (32, at most 384 MB), so their pages stay mapped from one frame to the
+//      next: WindowServer drops a client's surface every frame, and the pages were faulted in again at each upload
+//      (~15 ms for a 22 MB window in a VM). Default on in WindowServer only; NVMTL_SURFIN_KEEP=1/0 overrides.
+// Non-release builds: /tmp/nvmtl-surfin-mode (re-read every 250 ms) overrides both while it exists.
+static int nvmtl_surfin_mode(void) {
+    static int base = -1;
+    if (base < 0) {
+        const char *u = getenv("NVMTL_SURFIN_UPLOAD"), *k = getenv("NVMTL_SURFIN_KEEP");
+        const int keep = k && *k ? k[0] != '0' : !strcmp(getprogname(), "WindowServer");
+        base = ((u && !strcmp(u, "cpu")) ? 0 : 2) | (keep ? 1 : 0);
+        nvlog("surface-in: %s upload%s in %s", (base & 2) ? "GPU" : "CPU", (base & 1) ? ", uploaded surfaces kept mapped" : "", getprogname());
+    }
+    static uint64_t next; static int file = -1; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= next) { next = now + 250000000ull; int m = -1; FILE *f = fopen("/tmp/nvmtl-surfin-mode", "r");
+        if (f) { if (fscanf(f, "%d", &m) != 1) m = -1; fclose(f); }
+        if (m != file) nvlog("surface-in mode override %d -> %d (-1 = none, 1 keep surfaces mapped, 2 GPU upload)", file, m);
+        file = m; }
+    return file >= 0 ? file : base; }
 static void nvmtl_surfin_keep(IOSurfaceRef surf) {
-    static IOSurfaceRef ring[32]; static unsigned at; static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    enum { KEEP_N = 32 }; static const size_t KEEP_BYTES = 384u << 20;
+    static IOSurfaceRef ring[KEEP_N]; static size_t sz[KEEP_N], total; static unsigned at; static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    const size_t n = IOSurfaceGetAllocSize(surf);
+    if (n > KEEP_BYTES / 4) return;
+    IOSurfaceRef drop[KEEP_N]; unsigned nd = 0;
     pthread_mutex_lock(&lk);
-    for (unsigned i = 0; i < 32; i++) if (ring[i] == surf) { pthread_mutex_unlock(&lk); return; }
-    IOSurfaceRef old = ring[at]; ring[at] = (IOSurfaceRef)CFRetain(surf); at = (at + 1) % 32;
+    for (unsigned i = 0; i < KEEP_N; i++) if (ring[i] == surf) { pthread_mutex_unlock(&lk); return; }
+    // make room: the slot we take, then the oldest ones until the bytes fit
+    for (unsigned i = 0; i < KEEP_N && (ring[at] || total + n > KEEP_BYTES); i++) {
+        const unsigned v = (at + i) % KEEP_N;
+        if (ring[v] && (v == at || total + n > KEEP_BYTES)) { drop[nd++] = ring[v]; total -= sz[v]; ring[v] = NULL; sz[v] = 0; }
+    }
+    ring[at] = (IOSurfaceRef)CFRetain(surf); sz[at] = n; total += n; at = (at + 1) % KEEP_N;
     pthread_mutex_unlock(&lk);
-    if (old) CFRelease(old);
+    for (unsigned i = 0; i < nd; i++) CFRelease(drop[i]);
 }
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
