@@ -412,6 +412,18 @@ static void nvmtl_nvenc_register(void)
         if (!dladdr((const void *)nvmtl_nvenc_register, &di) || !di.dli_fname) { nvlog("nvenc: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
         strlcpy(dir, di.dli_fname, sizeof dir);
+        // NVMTL_NVENC_IMPL=nvenc (nvrm610.conf): register the open-source nvenc encoder (libnvencvt.dylib next to the
+        // codec libraries; https://github.com/mickys/nvenc) instead of libnvenc_h264. Falls back to libnvenc_h264.
+        const char *impl = getenv("NVMTL_NVENC_IMPL");
+        if (impl && !strcmp(impl, "nvenc")) {
+            snprintf(path, sizeof path, "%s/libnvencvt.dylib", dirname(dir));
+            void *hv = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            int32_t (*vreg)(int) = hv ? (int32_t (*)(int))dlsym(hv, "NVEncVT_Register") : NULL;
+            int32_t vst = vreg ? vreg(1000) : -1;
+            nvlog("nvenc: nvenc H.264 encoder %s in %s (%s%s)", vst ? "NOT registered" : "REGISTERED", me, path, hv ? "" : " - dlopen failed");
+            if (!vst) return;
+            strlcpy(dir, di.dli_fname, sizeof dir);
+        }
         snprintf(path, sizeof path, "%s/libnvenc_h264.dylib", dirname(dir));
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { nvlog("nvenc: dlopen %s FAILED: %s", path, dlerror()); return; }
