@@ -29,8 +29,8 @@ Turn it off with `NVMTL_SURFIN_UPLOAD=cpu` (GPU copy) and `NVMTL_SURFIN_KEEP=0` 
 ([mickys/nvenc](https://github.com/mickys/nvenc), `libnvencvt.dylib`), available to every app that uses
 VideoToolbox (Parsec, OBS, ffmpeg, AVFoundation apps, ...). Parsec at 4K: about 5 ms per frame with either codec; HEVC needs about 40 % less bitrate for the
 same quality. It checks the GPU first and stays off on cards without Ada NVENC (RTX 20/30 and GTX 16 keep Apple's
-encoder). Limits: 8-bit 4:2:0 only (H.264 Baseline/Main/High, HEVC Main) and no B-frames; an app that asks for
-10-bit HEVC (Main10) gets 8-bit Main from it, so use `--nvenc=off` or a process list if you export 10-bit HDR video.
+encoder). HEVC Main 10 (10-bit) too: Parsec's "prefer 10-bit color" at 4K takes about 7 ms per frame. Profiles: H.264
+Baseline/Main/High, HEVC Main and Main 10, 4:2:0; no B-frames.
 
 ## Requirements
 
