@@ -273,6 +273,41 @@ static void nvmtl_nvenc_register(void)
               st ? "NOT registered" : "REGISTERED", me, (int)st, path);
     });
 }
+// NVMTL_NVENCVT (nvrm610.conf; release builds drop inherited NVMTL_* variables): on GPUs before Blackwell, where the
+// package's own encoders are not registered, load the open-source H.264 encoder libnvencvt.dylib
+// (https://github.com/mickys/nvenc) from this bundle and let it register itself with VideoToolbox. "1" = every process,
+// otherwise a comma-separated list of process names (getprogname), so other apps keep Apple's encoder.
+static bool nvmtl_nvencvt_wanted(const char *me)
+{
+    const char *v = getenv("NVMTL_NVENCVT");
+    if (!v || !*v || !me) return false;
+    if (!strcmp(v, "1")) return true;
+    size_t n = strlen(me);
+    for (const char *p = v; *p; ) {
+        const char *e = strchr(p, ','); size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l == n && !strncmp(p, me, n)) return true;
+        if (!e) break; p = e + 1;
+    }
+    return false;
+}
+static void nvmtl_nvencvt_register(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *me = getprogname();
+        if (nvmtl_video_is_blackwell() || !strcmp(me, "WindowServer") || !nvmtl_nvencvt_wanted(me)) return;
+        Dl_info di;
+        if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }
+        char dir[1024], path[1200];
+        strlcpy(dir, di.dli_fname, sizeof dir);
+        snprintf(path, sizeof path, "%s/libnvencvt.dylib", dirname(dir));
+        void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        int32_t (*reg)(int) = h ? (int32_t (*)(int))dlsym(h, "NVEncVT_Register") : NULL;
+        int32_t st = reg ? reg(1000) : -1;
+        nvlog("nvencvt: open-source H.264 encoder %s in %s (%s%s)", st ? "NOT registered" : "REGISTERED", me, path,
+              h ? (reg ? "" : " - no NVEncVT_Register") : " - dlopen failed");
+    });
+}
 static void nvmtl_nvdec_hevc_register(void)
 {
     static dispatch_once_t once;
@@ -488,6 +523,7 @@ static void nvmtl_install_hw_resource_pools(id dev)
     if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
         nvmtl_nvdec_register();
         nvmtl_nvenc_register();
+        nvmtl_nvencvt_register();
         nvmtl_nvdec_hevc_register();
         nvmtl_nvenc_hevc_register();
     }
