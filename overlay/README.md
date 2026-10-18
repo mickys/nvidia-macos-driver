@@ -68,8 +68,9 @@ Then log out and back in. Updating NullMoth's driver also replaces the overlay (
 
 - `codesign -dv /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver` and compare the hash with
   `SHA256SUMS`, or `shasum -a 256` the file.
-- Encoder: a listed app shows "nvenc H.264 (NVIDIA pre-Blackwell)" / `org.nvenc.videoencoder.avc` or "nvenc HEVC
-  (NVIDIA pre-Blackwell)" / `org.nvenc.videoencoder.hevc` as its encoder;
+- Encoder: apps list it as "NVENC - H.264 - (NVIDIA <your card>) - mickys/nvenc - <version>" /
+  `org.nvenc.videoencoder.avc` and "NVENC - HEVC - (NVIDIA <your card>) - mickys/nvenc - <version>" /
+  `org.nvenc.videoencoder.hevc` (for example "NVENC - H.264 - (NVIDIA RTX 4090) - mickys/nvenc - 0.7.0");
   Parsec's host log (`~/.parsec/log.txt`) says `encoder = Hardware`.
 
 ## Source
