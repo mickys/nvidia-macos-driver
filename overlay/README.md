@@ -32,7 +32,10 @@ encoder). HEVC is not supported yet.
 
 ## Requirements
 
-- NullMoth's driver **2.3.6** installed and working (the overlay refuses other versions unless `--force`).
+- NullMoth's driver **2.3.6** installed and running. The installer refuses anything else: it checks NullMoth's version
+  record, the version of the NVRM, NVAccel and NVRMFB kernel extensions on disk, and the version of the ones running
+  (after a NullMoth update, restart before installing the overlay). The plugin and the kernel driver share interfaces,
+  so an overlay is built for one NullMoth version (`COMPATIBLE-DRIVERS` in the package).
 - An x86_64 Mac (Intel or AMD hackintosh) running macOS 15 or 26, as NullMoth's driver requires. Tested only on
   macOS 26.7.1 with an RTX 4090 so far.
 - The encoder part needs an RTX 40 card. The desktop part works on every card the driver supports.
@@ -70,4 +73,5 @@ Then log out and back in. Updating NullMoth's driver also replaces the overlay (
 - Plugin: `plugin/` of [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) at the tag named in
   `VERSION` (NullMoth 2.3.6 plus the overlay's commits), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
 - Encoder: [mickys/nvenc](https://github.com/mickys/nvenc) at the commit named in `VERSION`.
-- The plugin source is under the PolyForm Noncommercial License 1.0.0 (`LICENSE`), like NullMoth's.
+- The plugin source is under the PolyForm Noncommercial License 1.0.0 (`LICENSE`), like NullMoth's. The encoder is MIT
+  (`LICENSE-nvenc`).
