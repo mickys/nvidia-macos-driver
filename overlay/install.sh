@@ -1,26 +1,31 @@
 #!/bin/bash
 # Install the mickys overlay on top of NullMoth's NVIDIA driver: replaces the Metal plugin binary in
 # /Library/GPUBundles/NVMTLDriver.bundle with the overlay's build and adds libnvencvt.dylib next to it.
-#   sudo ./install.sh [--nvenc=<process list>|--nvenc=1|--nvenc=off]
-#     --nvenc   which processes get the open-source H.264/HEVC encoder (RTX 40 only): 1 = every app (default), a
-#               comma-separated list of process names to limit it to those, off = none
+#   sudo ./install.sh [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases]
+#     --nvenc        which processes get the open-source H.264/HEVC encoder (RTX 40 only): 1 = every app (default), a
+#                    comma-separated list of process names to limit it to those, off = none
+#     --cli-aliases  also make ffmpeg, HandBrakeCLI and avconvert run through nvenc-run in interactive zsh/bash shells
+# Unless --nvenc=off, it also installs /usr/local/bin/nvenc-run, which gives command-line tools the encoder.
 # It installs only over a NullMoth driver version listed in COMPATIBLE-DRIVERS, and only when the kernel extensions
 # on disk and the ones running are that version too (the plugin and the kernel driver share interfaces).
 # Undo: sudo ./uninstall.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-NVENC=1
+NVENC=1; ALIASES=0
 for a in "$@"; do case $a in
   --nvenc=*) NVENC=${a#--nvenc=} ;;
+  --cli-aliases) ALIASES=1 ;;
   *) echo "unknown option $a"; exit 2 ;;
 esac; done
 die() { echo "STOP: $*" >&2; exit 1; }
 ok() { echo "   ok  $*"; }
 [ "$(id -u)" = 0 ] || die "run with sudo"
 case $NVENC in off|1) ;; *) [[ $NVENC =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] || die "--nvenc: process names separated by commas, 1 or off" ;; esac
+[ "$NVENC" != off ] || [ $ALIASES = 0 ] || die "--cli-aliases needs the encoder (not --nvenc=off)"
 
 OV=$(cat "$HERE/VERSION")
 B=/Library/GPUBundles/NVMTLDriver.bundle; X=$B/Contents/MacOS; C=/Library/GPUBundles/nvmtl/nvrm610.conf
+RUN=/usr/local/bin/nvenc-run; SH=/usr/local/share/mickys-overlay; RC="/etc/zshrc /etc/bashrc"; MARK='# mickys overlay --cli-aliases'
 echo "== mickys overlay $OV (for NullMoth driver $(paste -sd ' ' "$HERE/COMPATIBLE-DRIVERS"))"
 
 echo "== 1. checks"
@@ -50,6 +55,7 @@ for k in NVRM NVAccel NVRMFB; do
   [ "$v" = "$HAVE" ] || die "the running com.nullmoth.$k is version $v, the installed one $HAVE: restart the Mac first, then run this again"
 done
 ok "running kernel driver: $HAVE"
+[ ! -e "$RUN" ] || grep -q '^# nvenc-run (mickys overlay)' "$RUN" || die "$RUN exists and is not the overlay's; move it away first"
 
 echo "== 2. back up what is there now"
 L=/Library/NullMoth/overlay-backup-latest
@@ -83,6 +89,32 @@ printf '# mickys overlay %s (uninstall.sh puts the original file back)\n' "$OV" 
 chown root:wheel "$C.new"; chmod 644 "$C.new"; mv "$C.new" "$C"
 ok "NVMTL_NVENCVT=${NVENC/off/(not set)}"
 
+echo "== 5. command-line tools"
+for f in $RC; do   # drop an earlier --cli-aliases hook; rewrite in place to keep the file's owner and mode
+  [ -f "$f" ] && grep -qF "$MARK" "$f" || continue
+  grep -vF "$MARK" "$f" > "$f.mickys" || true; cat "$f.mickys" > "$f"; rm -f "$f.mickys"
+done
+rm -rf "$SH"
+if [ "$NVENC" = off ]; then
+  rm -f "$RUN"; ok "no nvenc-run (--nvenc=off)"
+else
+  install -d -o root -g wheel -m 755 /usr/local/bin
+  install -o root -g wheel -m 755 "$HERE/payload/nvenc-run" "$RUN"
+  xattr -d com.apple.quarantine "$RUN" 2>/dev/null || true
+  ok "$RUN (example: nvenc-run ffmpeg -i in.mov -c:v hevc_videotoolbox out.mp4)"
+  if [ $ALIASES = 1 ]; then
+    install -d -o root -g wheel -m 755 "$SH"
+    install -o root -g wheel -m 644 "$HERE/payload/nvenc-cli-aliases.sh" "$SH/nvenc-cli-aliases.sh"
+    xattr -d com.apple.quarantine "$SH/nvenc-cli-aliases.sh" 2>/dev/null || true
+    for f in $RC; do
+      [ -f "$f" ] || continue
+      printf '[ -r %s/nvenc-cli-aliases.sh ] && . %s/nvenc-cli-aliases.sh  %s\n' "$SH" "$SH" "$MARK" >> "$f"
+      ok "$f: ffmpeg, HandBrakeCLI, avconvert run through nvenc-run (new shells)"
+    done
+  fi
+fi
+
 echo
 echo "Done. Log out and back in (or restart) so WindowServer and running apps load the new plugin."
+[ "$NVENC" = off ] || echo "Command-line tools (ffmpeg, HandBrakeCLI, avconvert) see the encoder only through nvenc-run:   nvenc-run ffmpeg ...$([ $ALIASES = 1 ] || echo "   (sudo ./install.sh --cli-aliases does that for you in zsh/bash)")"
 echo "Undo: sudo $HERE/uninstall.sh   (backup: $BK)"

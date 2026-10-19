@@ -1,0 +1,21 @@
+#!/bin/sh
+# nvenc-run (mickys overlay): run a command-line tool with the NVENC hardware encoder (mickys/nvenc) available.
+#   nvenc-run <tool> [arguments ...]     e.g. nvenc-run ffmpeg -i in.mov -c:v hevc_videotoolbox -b:v 20M out.mp4
+# VideoToolbox lists the encoder only in processes that load libnvencvt.dylib. Apps get it from the Metal plugin when
+# they first use Metal; command-line tools (ffmpeg, HandBrakeCLI, avconvert) never do, so this loads it into the tool
+# with DYLD_INSERT_LIBRARIES. Installed by the overlay's install.sh, removed by its uninstall.sh.
+LIB=/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib
+case ${1-} in
+  -h|--help) sed -n '2,6p' "$0"; exit 0 ;;
+  "") sed -n '3p' "$0" >&2; exit 2 ;;
+esac
+if [ ! -f "$LIB" ]; then
+  echo "nvenc-run: $LIB is missing (overlay not installed?); running $1 without the NVENC encoder" >&2
+  exec "$@"
+fi
+case :${DYLD_INSERT_LIBRARIES-}: in
+  *:"$LIB":*) ;;
+  *) DYLD_INSERT_LIBRARIES=$LIB${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES} ;;
+esac
+export DYLD_INSERT_LIBRARIES
+exec "$@"
