@@ -22,6 +22,10 @@ install -o root -g wheel -m 755 "$BK/NVMTLDriver" "$X/NVMTLDriver"
 if [ -f "$BK/libnvencvt.dylib" ]; then install -o root -g wheel -m 755 "$BK/libnvencvt.dylib" "$X/libnvencvt.dylib"
 else rm -f "$X/libnvencvt.dylib"; fi
 install -o root -g wheel -m 644 "$BK/nvrm610.conf" "$C"
-codesign -f -s - --preserve-metadata=identifier "$B" 2>&1 | grep -v "replacing existing signature" || true
+if [ -f "$BK/CodeResources" ]; then   # the bundle exactly as it was, signature included
+  install -o root -g wheel -m 644 "$BK/CodeResources" "$B/Contents/_CodeSignature/CodeResources"
+else                                  # backup from an older overlay: re-sign instead
+  codesign -f -s - --preserve-metadata=identifier "$B" 2>&1 | grep -v "replacing existing signature" || true
+fi
 codesign -v "$B" || die "the bundle signature does not verify"
 echo "Restored the plugin and nvrm610.conf from $BK, removed nvenc-run. Log out and back in (or restart) to load it."

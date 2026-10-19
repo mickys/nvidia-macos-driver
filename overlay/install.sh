@@ -1,7 +1,9 @@
 #!/bin/bash
 # Install the mickys overlay on top of NullMoth's NVIDIA driver: replaces the Metal plugin binary in
 # /Library/GPUBundles/NVMTLDriver.bundle with the overlay's build and adds libnvencvt.dylib next to it.
-#   sudo ./install.sh [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases]
+#   sudo ./install.sh [--encoder-only] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases]
+#     --encoder-only keep NullMoth's plugin as it is (no desktop change) and only add the encoder: NullMoth's plugin
+#                    loads libnvencvt.dylib by itself since 2.3.7 (NVMTL_NVENCVT); nothing of NullMoth's is modified
 #     --nvenc        which processes get the open-source H.264/HEVC encoder (RTX 40 only): 1 = every app (default), a
 #                    comma-separated list of process names to limit it to those, off = none
 #     --cli-aliases  also make ffmpeg, HandBrakeCLI and avconvert run through nvenc-run in interactive zsh/bash shells
@@ -11,8 +13,9 @@
 # Undo: sudo ./uninstall.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-NVENC=1; ALIASES=0
+NVENC=1; ALIASES=0; ENCONLY=0
 for a in "$@"; do case $a in
+  --encoder-only) ENCONLY=1 ;;
   --nvenc=*) NVENC=${a#--nvenc=} ;;
   --cli-aliases) ALIASES=1 ;;
   *) echo "unknown option $a"; exit 2 ;;
@@ -22,9 +25,11 @@ ok() { echo "   ok  $*"; }
 [ "$(id -u)" = 0 ] || die "run with sudo"
 case $NVENC in off|1) ;; *) [[ $NVENC =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] || die "--nvenc: process names separated by commas, 1 or off" ;; esac
 [ "$NVENC" != off ] || [ $ALIASES = 0 ] || die "--cli-aliases needs the encoder (not --nvenc=off)"
+[ "$NVENC" != off ] || [ $ENCONLY = 0 ] || die "--encoder-only with --nvenc=off would install nothing"
 
 OV=$(cat "$HERE/VERSION")
 B=/Library/GPUBundles/NVMTLDriver.bundle; X=$B/Contents/MacOS; C=/Library/GPUBundles/nvmtl/nvrm610.conf
+CR=$B/Contents/_CodeSignature/CodeResources
 RUN=/usr/local/bin/nvenc-run; SH=/usr/local/share/mickys-overlay; RC="/etc/zshrc /etc/bashrc"; MARK='# mickys overlay --cli-aliases'
 echo "== mickys overlay $OV (for NullMoth driver $(paste -sd ' ' "$HERE/COMPATIBLE-DRIVERS"))"
 
@@ -66,6 +71,7 @@ else
   BK=/Library/NullMoth/overlay-backup-$(date +%Y%m%d-%H%M%S)
   mkdir -p "$BK"
   cp -p "$X/NVMTLDriver" "$BK/" && cp -p "$C" "$BK/" || die "backup to $BK failed"
+  [ ! -f "$CR" ] || cp -p "$CR" "$BK/CodeResources" || die "backup to $BK failed"   # lets uninstall.sh put the bundle back without re-signing
   [ ! -f "$X/libnvencvt.dylib" ] || cp -p "$X/libnvencvt.dylib" "$BK/"
   echo "$HAVE" > "$BK/driver-version"
   ln -sfn "$BK" "$L"
@@ -73,14 +79,26 @@ else
 fi
 
 echo "== 3. install"
-install -o root -g wheel -m 755 "$HERE/payload/NVMTLDriver" "$X/NVMTLDriver"
-install -o root -g wheel -m 755 "$HERE/payload/libnvencvt.dylib" "$X/libnvencvt.dylib"
-# a browser-downloaded package carries com.apple.quarantine onto the extracted files; system binaries should not have it
-xattr -d com.apple.quarantine "$X/NVMTLDriver" "$X/libnvencvt.dylib" 2>/dev/null || true
-codesign -f -s - "$X/libnvencvt.dylib" 2>&1 | grep -v "replacing existing signature" || true
-codesign -f -s - --preserve-metadata=identifier "$B" 2>&1 | grep -v "replacing existing signature" || true
-codesign -v "$B" || die "the bundle signature does not verify (undo: sudo ./uninstall.sh)"
-ok "plugin and libnvencvt.dylib installed, bundle re-signed"
+if [ $ENCONLY = 1 ]; then
+  # NullMoth's own plugin, as the backup holds it (puts it back after a full install of the overlay)
+  install -o root -g wheel -m 755 "$BK/NVMTLDriver" "$X/NVMTLDriver"
+  [ ! -f "$BK/CodeResources" ] || install -o root -g wheel -m 644 "$BK/CodeResources" "$CR"
+  install -o root -g wheel -m 755 "$HERE/payload/libnvencvt.dylib" "$X/libnvencvt.dylib"
+  xattr -d com.apple.quarantine "$X/libnvencvt.dylib" 2>/dev/null || true
+  # NullMoth's plugin refuses the library unless it and its directory are root-owned and not group/world-writable
+  rootonly() { [ "$(stat -f %u "$1")" = 0 ] && [ -z "$(find "$1" -maxdepth 0 -perm +022)" ]; }
+  rootonly "$X/libnvencvt.dylib" && rootonly "$X" || die "$X or libnvencvt.dylib is writable by others; NullMoth's plugin would refuse it"
+  ok "libnvencvt.dylib installed next to NullMoth's plugin (plugin and its signature unchanged)"
+else
+  install -o root -g wheel -m 755 "$HERE/payload/NVMTLDriver" "$X/NVMTLDriver"
+  install -o root -g wheel -m 755 "$HERE/payload/libnvencvt.dylib" "$X/libnvencvt.dylib"
+  # a browser-downloaded package carries com.apple.quarantine onto the extracted files; system binaries should not have it
+  xattr -d com.apple.quarantine "$X/NVMTLDriver" "$X/libnvencvt.dylib" 2>/dev/null || true
+  codesign -f -s - "$X/libnvencvt.dylib" 2>&1 | grep -v "replacing existing signature" || true
+  codesign -f -s - --preserve-metadata=identifier "$B" 2>&1 | grep -v "replacing existing signature" || true
+  codesign -v "$B" || die "the bundle signature does not verify (undo: sudo ./uninstall.sh)"
+  ok "plugin and libnvencvt.dylib installed, bundle re-signed"
+fi
 
 echo "== 4. settings (nvrm610.conf)"
 grep -v -E '^NVMTL_NVENCVT=|^# mickys overlay' "$C" > "$C.new" || true
@@ -115,6 +133,7 @@ else
 fi
 
 echo
-echo "Done. Log out and back in (or restart) so WindowServer and running apps load the new plugin."
+if [ $ENCONLY = 1 ]; then echo "Done. Apps you open from now on get the encoder (quit and reopen running ones)."
+else echo "Done. Log out and back in (or restart) so WindowServer and running apps load the new plugin."; fi
 [ "$NVENC" = off ] || echo "Command-line tools (ffmpeg, HandBrakeCLI, avconvert) see the encoder only through nvenc-run:   nvenc-run ffmpeg ...$([ $ALIASES = 1 ] || echo "   (sudo ./install.sh --cli-aliases does that for you in zsh/bash)")"
 echo "Undo: sudo $HERE/uninstall.sh   (backup: $BK)"
