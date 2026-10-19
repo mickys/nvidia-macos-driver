@@ -1,30 +1,17 @@
 # mickys overlay for NullMoth's NVIDIA driver
 
-An **unofficial** test build of the Metal plugin from [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver)
-(branch `dev`), installed on top of [NullMoth's driver](https://github.com/nullmoth/nvidia-macos-driver). It is not made,
-reviewed or supported by NullMoth. Report problems with it at
+An **unofficial** add-on for [NullMoth's driver](https://github.com/nullmoth/nvidia-macos-driver): an open-source hardware
+video encoder for RTX 40 cards, and optionally a test build of the Metal plugin from
+[mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) (branch `dev`). It is not made, reviewed or
+supported by NullMoth. Report problems with it at
 [mickys/nvidia-macos-driver issues](https://github.com/mickys/nvidia-macos-driver/issues), not upstream.
 
-It replaces one file, the Metal plugin binary (`NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver`), and adds
-`libnvencvt.dylib` next to it. The kernel extensions, firmware and everything else stay NullMoth's. With
-`--encoder-only` it replaces nothing: NullMoth's plugin loads `libnvencvt.dylib` by itself since 2.3.7, so the overlay only
-adds the library, one line in `nvrm610.conf` and `nvenc-run`.
+By default it replaces nothing: NullMoth's plugin loads `libnvencvt.dylib` by itself since 2.3.7, so the overlay adds the
+library next to it, one line in `nvrm610.conf` and `/usr/local/bin/nvenc-run`. With `--desktop` it also replaces the Metal
+plugin binary (`NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver`) with this fork's build. The kernel extensions, firmware
+and everything else always stay NullMoth's.
 
 ## What it changes
-
-**Faster desktop with CPU-drawn windows.** When WindowServer composites a window that an app drew with the CPU
-(every WebKit view, including Safari, and CoreGraphics apps), the plugin copied the window's pages into video memory
-with the CPU, and the pages were faulted in again for every frame. The overlay lets the GPU copy them, and
-WindowServer keeps the surfaces it uploads mapped. Measured on an RTX 4090 (macOS 26.7.1, in a VM) with a full-screen
-CSS animation in Safari, for a 3158x1816 window:
-
-| | per frame | WindowServer CPU (user) | screen updates/s |
-|---|---|---|---|
-| NullMoth plugin (2.3.6) | 15.0 ms | 128 % of a core | 24 |
-| overlay | 5.3 ms | 30 % of a core | 30 |
-
-Turn it off with `NVMTL_SURFIN_UPLOAD=cpu` (GPU copy) and `NVMTL_SURFIN_KEEP=0` (keep mapped) in
-`/Library/GPUBundles/nvmtl/nvrm610.conf`, then log out and in.
 
 **Hardware H.264 and HEVC encoding on RTX 40 (Ada).** NullMoth's driver registers its NVENC encoders only on Blackwell
 (RTX 50), so on older cards VideoToolbox encodes in software. The overlay adds an open-source encoder for Ada NVENC
@@ -37,6 +24,25 @@ same quality. It checks the GPU first and stays off on cards without Ada NVENC (
 encoder). HEVC Main 10 (10-bit) too: Parsec's "prefer 10-bit color" at 4K takes about 7 ms per frame. H.264 uses High profile with
 CABAC by default (much better quality at the same bitrate; apps that ask for Baseline get Main with CAVLC). Full-range
 input is signalled as full range. Profiles: H.264 Baseline/Main/High, HEVC Main and Main 10, 4:2:0; no B-frames.
+
+**Optional, `--desktop`: faster desktop with large CPU-drawn windows.** When WindowServer composites a window that an
+app drew with the CPU (every WebKit view, including Safari and Mail, and CoreGraphics apps), NullMoth's plugin copies
+the window's pages into video memory with the CPU, and the pages are faulted in again for every frame. This fork's
+plugin lets the GPU copy them, and WindowServer keeps the surfaces it uploads mapped. Measured on an RTX 4090 with
+NullMoth 2.3.7 (macOS 26.7.1, in a VM), Safari playing a CSS animation:
+
+| window | plugin | per upload | screen updates/s | WindowServer CPU (user + system) | Safari's painting process |
+|---|---|---|---|---|---|
+| 3840x2110 (full screen, 4K) | NullMoth 2.3.7 | 19.7 ms | 21 | 73 % of a core | 470 % |
+| 3840x2110 (full screen, 4K) | `--desktop` | 7.8 ms | 34 | 55 % | 265 % |
+| 3200x1800 | NullMoth 2.3.7 | ~7 ms | 38.6 | 59 % | 220 % |
+| 3200x1800 | `--desktop` | ~6.4 ms | 41.1 | 55 % | 200 % |
+
+Worth it on a 4K (or larger) display with big Safari, Mail or other WebKit windows; with smaller windows the difference
+is small since 2.3.7. It replaces NullMoth's plugin binary, so a problem in it affects the whole desktop: try it, and go
+back with `sudo ./install.sh` (without `--desktop`) or `sudo ./uninstall.sh`. Its two parts can be turned off with
+`NVMTL_SURFIN_UPLOAD=cpu` (GPU copy) and `NVMTL_SURFIN_KEEP=0` (keep mapped) in `/Library/GPUBundles/nvmtl/nvrm610.conf`,
+then log out and in.
 
 ## Command-line tools
 
@@ -76,16 +82,16 @@ also for hardened and Apple binaries such as `/usr/bin/avconvert`; on a stock Ma
 
 ```bash
 tar -xzf mickys-overlay-<version>.tar.gz && cd mickys-overlay-<version>
-sudo ./install.sh                      # encoder for every app, and the faster desktop
-sudo ./install.sh --encoder-only       # encoder only; NullMoth's plugin stays exactly as it is
+sudo ./install.sh                      # encoder for every app; NullMoth's plugin stays exactly as it is
 sudo ./install.sh --nvenc=parsecd,obs  # encoder only for these processes
-sudo ./install.sh --nvenc=off          # desktop change only (no nvenc-run either)
-sudo ./install.sh --cli-aliases        # encoder for every app, and ffmpeg/HandBrakeCLI/avconvert through nvenc-run
+sudo ./install.sh --cli-aliases        # and ffmpeg/HandBrakeCLI/avconvert through nvenc-run in Terminal
+sudo ./install.sh --desktop            # also this fork's plugin build (see "What it changes")
+sudo ./install.sh --desktop --nvenc=off  # the plugin build only, no encoder
 ```
 
-Then log out and back in (or restart); with `--encoder-only`, apps opened afterwards get the encoder. The installer checks
-every file against `SHA256SUMS`, backs up the current plugin, its signature and `nvrm610.conf` to
-`/Library/NullMoth/overlay-backup-<date>`, installs, re-signs the bundle (not with `--encoder-only`) and sets
+Apps you open afterwards get the encoder; with `--desktop`, log out and back in (or restart) so WindowServer loads the
+plugin. The installer checks every file against `SHA256SUMS`, backs up the current plugin, its signature and
+`nvrm610.conf` to `/Library/NullMoth/overlay-backup-<date>`, installs, re-signs the bundle (only with `--desktop`) and sets
 `NVMTL_NVENCVT` in `nvrm610.conf`, and installs `/usr/local/bin/nvenc-run` (unless `--nvenc=off`).
 
 ## Undo

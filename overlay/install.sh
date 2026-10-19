@@ -1,9 +1,9 @@
 #!/bin/bash
-# Install the mickys overlay on top of NullMoth's NVIDIA driver: replaces the Metal plugin binary in
-# /Library/GPUBundles/NVMTLDriver.bundle with the overlay's build and adds libnvencvt.dylib next to it.
-#   sudo ./install.sh [--encoder-only] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases]
-#     --encoder-only keep NullMoth's plugin as it is (no desktop change) and only add the encoder: NullMoth's plugin
-#                    loads libnvencvt.dylib by itself since 2.3.7 (NVMTL_NVENCVT); nothing of NullMoth's is modified
+# Install the mickys overlay on top of NullMoth's NVIDIA driver: adds the open-source encoder libnvencvt.dylib next to
+# NullMoth's Metal plugin in /Library/GPUBundles/NVMTLDriver.bundle, which loads it by itself since 2.3.7
+# (NVMTL_NVENCVT in nvrm610.conf). NullMoth's files stay as they are.
+#   sudo ./install.sh [--desktop] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases]
+#     --desktop      also replace the plugin binary with this fork's build (CPU-drawn windows uploaded by the GPU)
 #     --nvenc        which processes get the open-source H.264/HEVC encoder (RTX 40 only): 1 = every app (default), a
 #                    comma-separated list of process names to limit it to those, off = none
 #     --cli-aliases  also make ffmpeg, HandBrakeCLI and avconvert run through nvenc-run in interactive zsh/bash shells
@@ -13,9 +13,10 @@
 # Undo: sudo ./uninstall.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-NVENC=1; ALIASES=0; ENCONLY=0
+NVENC=1; ALIASES=0; ENCONLY=1
 for a in "$@"; do case $a in
-  --encoder-only) ENCONLY=1 ;;
+  --desktop) ENCONLY=0 ;;
+  --encoder-only) ENCONLY=1 ;;   # the default since 2.3.7-2; kept so older instructions still work
   --nvenc=*) NVENC=${a#--nvenc=} ;;
   --cli-aliases) ALIASES=1 ;;
   *) echo "unknown option $a"; exit 2 ;;
@@ -25,7 +26,7 @@ ok() { echo "   ok  $*"; }
 [ "$(id -u)" = 0 ] || die "run with sudo"
 case $NVENC in off|1) ;; *) [[ $NVENC =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] || die "--nvenc: process names separated by commas, 1 or off" ;; esac
 [ "$NVENC" != off ] || [ $ALIASES = 0 ] || die "--cli-aliases needs the encoder (not --nvenc=off)"
-[ "$NVENC" != off ] || [ $ENCONLY = 0 ] || die "--encoder-only with --nvenc=off would install nothing"
+[ "$NVENC" != off ] || [ $ENCONLY = 0 ] || die "--nvenc=off without --desktop would install nothing"
 
 OV=$(cat "$HERE/VERSION")
 B=/Library/GPUBundles/NVMTLDriver.bundle; X=$B/Contents/MacOS; C=/Library/GPUBundles/nvmtl/nvrm610.conf
