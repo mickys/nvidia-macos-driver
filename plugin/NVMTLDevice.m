@@ -834,124 +834,6 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
 typedef struct { uint32_t magic, seed, gen; } nvmtl_vram_tag;
 #define NVMTL_VRAM_MAGIC 0x564d5634u
 static unsigned long long g_surf_vram, g_surf_private, g_surfin_skip, g_surfin_copy;
-
-// plugin-logging: per-process statistics of IOSurface texture placement and of the CPU copies between an IOSurface's
-// system pages and its GPU image (surface-in: pages -> GPU, surface-out: GPU -> pages). Every 2 s one block goes to
-// $TMPDIR/nvmtl-surfstat-<pid>.log (/tmp when TMPDIR is unset), bypassing nvlog's per-site limit. Non-release builds only.
-_Atomic uint64_t g_imgw_cpu_ns;   // plugin-logging: time nvmtl_vk_image_write spends copying surface pages into its staging buffer
-enum { NVMTL_WHY_UNKNOWN, NVMTL_WHY_SHARED, NVMTL_WHY_PLANE, NVMTL_WHY_MULTIPLANE, NVMTL_WHY_SHARE_OFF, NVMTL_WHY_PITCH,
-       NVMTL_WHY_SIZE, NVMTL_WHY_VRAM, NVMTL_WHY_ALIAS, NVMTL_WHY_N };
-#if !NVMTL_RELEASE
-static const char *const nvmtl_why_name[NVMTL_WHY_N] = { "unknown", "shared VRAM", "plane > 0", "multi-plane", "share off",
-    "pitch % 32", "image > surface", "no family VRAM", "alias failed" };
-typedef struct { uint64_t created, in_copies, in_bytes, in_ns, in_skips, in_unchanged, out_copies, out_bytes, out_ns, out_nocopy; } nvmtl_surfstat_row;
-typedef struct { uint32_t id, w, h, row, planes, fmt, cache; int why; uint64_t in_copies, in_bytes, in_ns, in_cpu_ns, out_copies, out_ns; const void *base; uint64_t base_moves; } nvmtl_surfstat_surf;
-#define NVMTL_SURFSTAT_SURFS 64
-static pthread_mutex_t g_surfstat_lock = PTHREAD_MUTEX_INITIALIZER;
-static nvmtl_surfstat_row g_surfstat[NVMTL_WHY_N];
-static nvmtl_surfstat_surf g_surfstat_s[NVMTL_SURFSTAT_SURFS];
-static uint64_t g_surfstat_t0;
-static FILE *g_surfstat_f; static long g_surfstat_bytes;
-static void nvmtl_surfstat_dump_locked(uint64_t now)
-{
-    if (!g_surfstat_f) {
-        char fp[512]; const char *td = getenv("TMPDIR");
-        snprintf(fp, sizeof fp, "%s/nvmtl-surfstat-%d.log", td && *td ? td : "/tmp", (int)getpid());
-        g_surfstat_f = fopen(fp, "a"); if (!g_surfstat_f) return;
-    }
-    if (g_surfstat_bytes > (8l << 20)) return;
-    const double secs = (double)(now - g_surfstat_t0) / 1e9;
-    time_t tt = time(NULL); struct tm lt; localtime_r(&tt, &lt);
-    long b = fprintf(g_surfstat_f, "%02d:%02d:%02d %s[%d] %.1f s (textures: %llu shared VRAM, %llu private)\n", lt.tm_hour, lt.tm_min,
-                     lt.tm_sec, getprogname(), (int)getpid(), secs, g_surf_vram, g_surf_private);
-    for (int i = 0; i < NVMTL_WHY_N; i++) {
-        nvmtl_surfstat_row *r = &g_surfstat[i];
-        if (!r->created && !r->in_copies && !r->in_skips && !r->in_unchanged && !r->out_copies && !r->out_nocopy) continue;
-        b += fprintf(g_surfstat_f, "  %-15s new %4llu | in: %5llu copies %8.1f MB %8.1f ms, %5llu skipped (VRAM current), %6llu unchanged"
-                     " | out: %5llu copies %8.1f MB %8.1f ms, %5llu no copy\n", nvmtl_why_name[i], r->created, r->in_copies, r->in_bytes / 1048576.0,
-                     r->in_ns / 1e6, r->in_skips, r->in_unchanged, r->out_copies, r->out_bytes / 1048576.0, r->out_ns / 1e6, r->out_nocopy);
-    }
-    // the surfaces copied most in this interval
-    for (int k = 0; k < 8; k++) {
-        int best = -1;
-        for (int i = 0; i < NVMTL_SURFSTAT_SURFS; i++)
-            if (g_surfstat_s[i].id && (g_surfstat_s[i].in_copies || g_surfstat_s[i].out_copies) && g_surfstat_s[i].why >= 0 &&
-                (best < 0 || g_surfstat_s[i].in_ns + g_surfstat_s[i].out_ns > g_surfstat_s[best].in_ns + g_surfstat_s[best].out_ns)) best = i;
-        if (best < 0) break;
-        nvmtl_surfstat_surf *x = &g_surfstat_s[best];
-        b += fprintf(g_surfstat_f, "    surface %u %ux%u pitch %u planes %u fmt '%c%c%c%c' cache 0x%x %s: in %llu x (%.1f MB, %.1f ms, CPU copy %.1f ms, mapped at a new address %llu x), out %llu x (%.1f ms)\n",
-                     x->id, x->w, x->h, x->row, x->planes, (char)(x->fmt >> 24), (char)(x->fmt >> 16), (char)(x->fmt >> 8), (char)x->fmt,
-                     x->cache, nvmtl_why_name[x->why < NVMTL_WHY_N ? x->why : 0], x->in_copies, x->in_bytes / 1048576.0, x->in_ns / 1e6,
-                     x->in_cpu_ns / 1e6, x->base_moves, x->out_copies, x->out_ns / 1e6);
-        x->why = -1 - x->why;   // printed; restored below
-    }
-    for (int i = 0; i < NVMTL_SURFSTAT_SURFS; i++) {
-        nvmtl_surfstat_surf *x = &g_surfstat_s[i];
-        if (x->why < 0) x->why = -1 - x->why;
-        x->in_copies = x->in_bytes = x->in_ns = x->in_cpu_ns = x->out_copies = x->out_ns = x->base_moves = 0;
-    }
-    fflush(g_surfstat_f); g_surfstat_bytes += b;
-    memset(g_surfstat, 0, sizeof g_surfstat); g_surfstat_t0 = now;
-}
-static nvmtl_surfstat_surf *nvmtl_surfstat_surf_locked(IOSurfaceRef surf, int why)
-{
-    const uint32_t id = (uint32_t)IOSurfaceGetID(surf);
-    int slot = -1, idle = -1;
-    for (int i = 0; i < NVMTL_SURFSTAT_SURFS; i++) {
-        if (g_surfstat_s[i].id == id) { slot = i; break; }
-        if (idle < 0 && (!g_surfstat_s[i].id || (!g_surfstat_s[i].in_copies && !g_surfstat_s[i].out_copies))) idle = i;
-    }
-    if (slot < 0) {
-        if (idle < 0) return NULL;
-        slot = idle; nvmtl_surfstat_surf *x = &g_surfstat_s[slot]; memset(x, 0, sizeof *x);
-        x->id = id; x->w = (uint32_t)IOSurfaceGetWidth(surf); x->h = (uint32_t)IOSurfaceGetHeight(surf);
-        x->row = (uint32_t)IOSurfaceGetBytesPerRow(surf); x->planes = (uint32_t)IOSurfaceGetPlaneCount(surf);
-        x->fmt = (uint32_t)IOSurfaceGetPixelFormat(surf);
-        { CFTypeRef v = IOSurfaceCopyValue(surf, kIOSurfaceCacheMode); uint32_t m = 0;   // kIOMap*Cache >> 8; 0 = default
-          if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberSInt32Type, &m);
-          if (v) CFRelease(v); x->cache = m; }
-    }
-    g_surfstat_s[slot].why = why;
-    return &g_surfstat_s[slot];
-}
-// what: 0 created, 1 surface-in copy, 2 surface-in skipped (shared VRAM current), 3 surface-in unchanged (synced),
-//       4 surface-out copy, 5 surface-out without a copy (shared VRAM marked dirty)
-static void nvmtl_surfstat_cpu(IOSurfaceRef surf, int why, int what, uint64_t bytes, uint64_t ns, uint64_t cpu_ns);
-static void nvmtl_surfstat(IOSurfaceRef surf, int why, int what, uint64_t bytes, uint64_t ns) { nvmtl_surfstat_cpu(surf, why, what, bytes, ns, 0); }
-static void nvmtl_surfstat_cpu(IOSurfaceRef surf, int why, int what, uint64_t bytes, uint64_t ns, uint64_t cpu_ns)
-{
-    if (why < 0 || why >= NVMTL_WHY_N) why = NVMTL_WHY_UNKNOWN;
-    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-    pthread_mutex_lock(&g_surfstat_lock);
-    if (!g_surfstat_t0) g_surfstat_t0 = now;
-    nvmtl_surfstat_row *r = &g_surfstat[why];
-    nvmtl_surfstat_surf *x = (surf && (what == 1 || what == 4)) ? nvmtl_surfstat_surf_locked(surf, why) : NULL;
-    switch (what) {
-    case 0: r->created++; break;
-    case 1: r->in_copies++; r->in_bytes += bytes; r->in_ns += ns; if (x) { x->in_copies++; x->in_bytes += bytes; x->in_ns += ns; x->in_cpu_ns += cpu_ns; } break;
-    case 2: r->in_skips++; break;
-    case 3: r->in_unchanged++; break;
-    case 4: r->out_copies++; r->out_bytes += bytes; r->out_ns += ns; if (x) { x->out_copies++; x->out_ns += ns; } break;
-    case 5: r->out_nocopy++; break;
-    }
-    if (now - g_surfstat_t0 >= 2000000000ull) nvmtl_surfstat_dump_locked(now);
-    pthread_mutex_unlock(&g_surfstat_lock);
-}
-// the address the surface is mapped at in this process, at each surface-in: a new one means fresh page tables
-static void nvmtl_surfstat_base(IOSurfaceRef surf, const void *base)
-{
-    pthread_mutex_lock(&g_surfstat_lock);
-    const uint32_t id = (uint32_t)IOSurfaceGetID(surf);
-    for (int i = 0; i < NVMTL_SURFSTAT_SURFS; i++) if (g_surfstat_s[i].id == id) {
-        if (g_surfstat_s[i].base && g_surfstat_s[i].base != base) g_surfstat_s[i].base_moves++;
-        g_surfstat_s[i].base = base; break; }
-    pthread_mutex_unlock(&g_surfstat_lock);
-}
-#else
-#define nvmtl_surfstat_base(surf, base) ((void)0)
-#define nvmtl_surfstat(surf, why, what, bytes, ns) ((void)0)
-#define nvmtl_surfstat_cpu(surf, why, what, bytes, ns, cpu_ns) ((void)0)
-#endif
 static CFStringRef nvmtl_vram_tag_key(NSUInteger plane) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLVramAt:p%lu"), (unsigned long)plane); }
 static int nvmtl_vram_tag_current(IOSurfaceRef surf, NSUInteger plane, uint32_t seed)
 {
@@ -989,20 +871,13 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
-    int why = !surf ? NVMTL_WHY_UNKNOWN : plane != 0 ? NVMTL_WHY_PLANE : IOSurfaceGetPlaneCount(surf) > 1 ? NVMTL_WHY_MULTIPLANE
-            : !nvmtl_vk_surface_share_on() ? NVMTL_WHY_SHARE_OFF : NVMTL_WHY_SIZE;
-    (void)why;
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
-        if (row % 32) why = NVMTL_WHY_PITCH;
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
             nvk_buffer vb;
-            why = NVMTL_WHY_VRAM;
             if (!nvmtl_vk_surface_vram(IOSurfaceGetID(surf), 0, row * h, &vb)) {
-                why = NVMTL_WHY_ALIAS;
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
                     t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
-                    t->_shareWhy = NVMTL_WHY_SHARED; nvmtl_surfstat(surf, NVMTL_WHY_SHARED, 0, 0, 0);
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = nvmtl_vram_tag_current(surf, 0, seed);
                     if (current) { t->_surfSeed = seed; t->_surfSynced = YES; }
@@ -1016,7 +891,6 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
         }
     }
     g_surf_private++;
-    t->_shareWhy = why; nvmtl_surfstat(surf, why, 0, 0, 0);
     // A private image stands for the whole surface: wrappers that read it and wrappers that write it must share ONE image
     // (nvmtlNewSurfaceTexture caches it), or what one writes the other never sees. So it is made writable whenever the
     // format can be, whatever the first wrapper asked for.

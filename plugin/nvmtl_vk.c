@@ -6169,18 +6169,22 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
     memcpy(dst, src, n);
 }
 
-// Surface-in without a CPU copy: the IOSurface's own pages (locked by the caller for the whole call) are imported as
-// host memory (VK_EXT_external_memory_host) and the GPU copies them into the image. Uncompressed formats only; the
-// caller falls back to nvmtl_vk_image_write when this returns non-zero. base/alloc: the plane's base address and the
-// page-rounded bytes from it to the end of the surface.
-int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t alloc)
+// Surface-in from the IOSurface's own pages. nvmtl_vk_image_write reads every byte of the surface with the CPU, and
+// WindowServer lets go of a client's surface after each frame, so for a large window most of that copy is page faults:
+// a full-screen 4K Safari window took ~20 ms per upload against ~7 ms for a 3200x1800 one. Importing the locked pages as
+// host memory (VK_EXT_external_memory_host) lets the copy engine read them, and the CPU never touches them (~8 ms at 4K).
+// The caller holds the surface lock across the call, and the import is released before it returns.
+// Non-zero when the pages cannot be imported (block-compressed format, base or length not a multiple of the import
+// alignment, no host import on this device); the caller then uses nvmtl_vk_image_write.
+int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
+    // bufferRowLength counts texels, so the row pitch has to be a whole number of them
     if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
-    if (g_host_align) alloc = (alloc + g_host_align - 1) & ~(g_host_align - 1);
-    if ((size_t)img->h * row_bytes > alloc) return -1;
+    if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
+    if ((size_t)img->h * row_bytes > bytes) return -1;
     nvk_buffer hb;
-    if (nvmtl_vk_buffer_import_host(base, alloc, &hb)) return -1;
+    if (nvmtl_vk_buffer_import_host(base, bytes, &hb)) return -1;
     nvk_cmdbuf c;
     if (nvmtl_vk_cmd_begin(q, &c)) { nvmtl_vk_buffer_destroy(&hb); return -1; }
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
@@ -6196,7 +6200,7 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
     pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
     img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    const int rc = nvmtl_vk_submit_wait_at(&c, "surface upload (host pages)");
+    const int rc = nvmtl_vk_submit_wait_at(&c, "surface upload (imported pages)");
     nvmtl_vk_buffer_destroy(&hb);
     return rc;
 }
@@ -6209,11 +6213,9 @@ int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t r
     nvmtl_upstage *sl = nvmtl_upstage_get(tight * (size_t)rows);
     if (!sl) return -1;
     uint8_t *dst = (uint8_t *)sl->buf.map;
-    const uint64_t tcp = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (row_bytes == tight) nvmtl_copy_from_surface(dst, src, tight * (size_t)rows);   /* a 4K surface is 2160 rows of 15 KB: one pass, not 2160 calls */
     else for (uint32_t y = 0; y < rows; y++)
         nvmtl_copy_from_surface(dst + (size_t)y * tight, (const uint8_t *)src + (size_t)y * row_bytes, tight);
-    g_imgw_cpu_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - tcp;   /* plugin-logging: CPU part of a surface-in */
     nvk_cmdbuf *const c = &sl->cb;
     if (nvmtl_vk_cmd_begin(q, c)) return -1;
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
