@@ -48,12 +48,11 @@ __private_extern__ int _kext_apple_cc = __APPLE_CC__;
 
 #define LOG(fmt, ...) do { kprintf("NVRM-xnu: " fmt "\n", ##__VA_ARGS__); IOLog("NVRM-xnu: " fmt "\n", ##__VA_ARGS__); } while (0)
 
-struct nvkms_per_open;
-extern "C" { NvBool nvkms_xnu_load(void); struct nvkms_per_open *nvkms_xnu_open(int pid); void nvkms_xnu_close(struct nvkms_per_open *);
-             int nvkms_xnu_ioctl(struct nvkms_per_open *, NvU32 cmd, void *params, size_t size); int nvkms_xnu_events_available(struct nvkms_per_open *); }
+extern "C" { NvBool nvkms_xnu_load(void); }
 static class NVRM *gNVRMService;
 extern "C" nv_state_t *nv_xnu_gpu_state(void);
 extern "C" void nv_xnu_log_init(void);
+extern "C" bool nv_xnu_maps_init(void);
 extern "C" void *nvkms_xnu_kapi_table(void);
 extern "C" NvU64 nv_xnu_phys_for_kernel_va(const void *va);
 class NVRMDisplay : public IOService { OSDeclareDefaultStructors(NVRMDisplay) };
@@ -275,6 +274,7 @@ class NVRMUserClient : public IOUserClient {
 public:
     bool start(IOService *provider) override;
     IOReturn clientClose(void) override;
+    void free(void) override;
     IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                             IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override;
     bool initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties) override;
@@ -293,15 +293,22 @@ private:
     int  fPid = 0;
     bool fEverBound = false;
     int  fBound = -1;
-    bool fCleaned = false;
-    struct nvkms_per_open *fKms = nullptr;
+    SInt32 fCleaned = 0;
+    IOLock *fGate = nullptr;      // serialises this client's methods against its own teardown
+    // Held across esc() and clientMemoryForType() and across the teardown in clientClose. The RM
+    // callbacks below it (nv_add_mapping_context_to_file and friends) must NOT take it: they run
+    // nested inside esc() for this same client and IOLock is not recursive.
+    struct Gate {
+        IOLock *l;
+        explicit Gate(IOLock *g) : l(g) { if (l) IOLockLock(l); }
+        ~Gate() { if (l) IOLockUnlock(l); }
+    };
     IOReturn esc(uint32_t cmd, void *data, uint32_t size);
     static IOReturn sGo(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sEsc(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sGetFd(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sBindFd(OSObject *target, void *reference, IOExternalMethodArguments *args);
-    static IOReturn sKms(OSObject *target, void *reference, IOExternalMethodArguments *args);
-    static IOReturn sKmsEvents(OSObject *target, void *reference, IOExternalMethodArguments *args);
+    static IOReturn sRetired(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sWaitEvent(OSObject *target, void *reference, IOExternalMethodArguments *args);
 public:
     volatile UInt32 fEvtSeq = 0;
@@ -337,7 +344,7 @@ extern "C" nv_alloc_mapping_context_t *nv_xnu_mmap_context(void *priv)
     return c ? c->mmapContext() : NULL;
 }
 extern "C" IOMemoryDescriptor *nv_xnu_alloc_md(void *priv, NvU64 *bytes, NvU32 *cache);
-extern "C" { IOMemoryDescriptor *nv_pm_ram_submd(NvU64, NvU64, int); bool nv_pm_is_gpu(NvU64, NvU64); void nv_pm_dev_refused(NvU64, NvU64); bool nv_xnu_chat(void); }
+extern "C" { IOMemoryDescriptor *nv_pm_ram_submd(NvU64, NvU64, int); bool nv_pm_is_gpu(NvU64, NvU64); bool nv_pm_is_gpu_fb(NvU64, NvU64); void nv_pm_dev_refused(NvU64, NvU64); bool nv_xnu_chat(void); }
 
 #define super IOService
 OSDefineMetaClassAndStructors(NVRM, IOService)
@@ -390,6 +397,8 @@ bool NVRM::start(IOService *provider)
     if (!fPCI) return false;
     gNVRMService = this;
     nv_xnu_log_init();
+    // The kernel mapping table is serialised, so its lock has to exist before RM maps anything.
+    if (!nv_xnu_maps_init()) { LOG("IOLockAlloc FAILED for the kernel mapping table"); return false; }
     // Say which build is running, first thing. A machine reported "2.3.2" from the app while the kernel collection still
     // held a kext from before 2.1.0 (its BAR1 line used wording that version had replaced), and nothing in the log said
     // so: the installed bundle and the loaded kext can differ, and only the loaded one knows what it is. The loader
@@ -1680,6 +1689,8 @@ bool NVRMUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 ty
     // by the real-privilege check in _os_is_administrator and the root requirement on first init.
     if (type > 1) return false;
     fIsCtl = (type == 0);
+    fGate = IOLockAlloc();
+    if (!fGate) return false;
     nvu_memset(&fNvfp, 0, sizeof fNvfp);
     fNvfp.ctl_nvfp_priv = this;
     if (!gNvClientsLock) gNvClientsLock = IOLockAlloc();
@@ -1725,19 +1736,31 @@ bool NVRMUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 ty
 nv_state_t *NVRMUserClient::nvState() { return fIsCtl ? nv_get_ctl_state() : &fOwner->fNv; }
 IOReturn NVRMUserClient::clientClose(void)
 {
-    if (!fCleaned) {
-        fCleaned = true;
+    // One winner only: this was a plain bool test-and-set, so two closes could both run the teardown.
+    if (OSCompareAndSwap(0, 1, &fCleaned)) {
+        Gate g(fGate);
         if (gNvClientsLock && fFd >= 0) { IOLockLock(gNvClientsLock); gNvClients[fFd] = NULL; nv_pm_close(fPm); IOLockUnlock(gNvClientsLock); }
-        if (fKms) { nvkms_xnu_close(fKms); fKms = nullptr; }
         if (fOwner) { NvXnuPmUse pmUse; rm_cleanup_file_private(NULL, nvState(), &fNvfp); }
-        if (fMmap.memArea.pRanges) { kern_os_free(fMmap.memArea.pRanges); fMmap.memArea.pRanges = NULL; }
+        // The ranges are NOT freed here. clientClose can run while another thread is inside
+        // clientMemoryForType, which reads this array and hands its entries to
+        // IOMemoryDescriptor::withPhysicalAddress - so freeing it here let a process map whatever
+        // landed in the reused block. Marking the context dead is enough; free() does the release,
+        // and IOKit only gets there once no method can still be running.
+        fMmap.valid = NV_FALSE;
         if (nv_xnu_chat()) kprintf("NVRM-xnu: client fd %d closed\n", fFd);
     }
     terminate();
     return kIOReturnSuccess;
 }
+void NVRMUserClient::free(void)
+{
+    if (fMmap.memArea.pRanges) { kern_os_free(fMmap.memArea.pRanges); fMmap.memArea.pRanges = NULL; }
+    if (fGate) { IOLockFree(fGate); fGate = nullptr; }
+    super::free();
+}
 IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 {
+    Gate g(fGate);
     nv_alloc_mapping_context_t *c = &fMmap;
     if (!c->valid) { kprintf("NVRM-xnu: map on fd %d with no mapping context\n", fFd); return kIOReturnBadArgument; }
     IOMemoryDescriptor *md = NULL;
@@ -1748,14 +1771,27 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
         NvU64 off = c->page_index * PAGE_SIZE;
         if (!base) return kIOReturnBadArgument;
         if (off >= bytes) { base->release(); return kIOReturnBadArgument; }
+        // Subtract, never add: access_size arrives verbatim from RM (nv_add_mapping_context_to_file) and a
+        // near-2^64 value made off+len wrap below bytes, skipping this clamp - and IOSubMemoryDescriptor's own
+        // offset+length test wraps identically, so nothing downstream caught it either.
         NvU64 len = c->access_size ? c->access_size : (bytes - off);
-        if (off + len > bytes) len = bytes - off;
+        if (len > bytes - off) { base->release(); return kIOReturnBadArgument; }
         md = IOSubMemoryDescriptor::withSubRange(base, (IOByteCount)off, (IOByteCount)len, kIODirectionInOut);
         base->release();
         caching = cache;
         if (nv_xnu_chat()) kprintf("NVRM-xnu: map fd %d: sysmem +0x%llx len 0x%llx cache %u\n", fFd, off, len, caching);
     } else {
         NvU64 n = c->memArea.numRanges;
+        // A range that is not card memory goes down the system-RAM path below, which checks the owner.
+        // A range that IS card memory must still land inside one of this card's bars, which is what stops
+        // a caller handing us an arbitrary physical address and getting it mapped.
+        // ⛔ This was narrowed to the framebuffer bar alone, on the reasoning that a user process has no
+        // business holding a writable mapping of the register file. The display stack disagrees: measured
+        // on the test Mac, CoreDisplay maps phys 0x80bb0000 +0x10000 and +0x1000, which live in bar0, and
+        // refusing them made WindowServer abort in CoreDisplay_CreateDisplayForCGXDisplayDevice and
+        // crash-loop every ten seconds from 21 s after boot (7 reports, 23 refusals). Keeping the bar bound
+        // and nothing tighter is therefore the shipping behaviour; narrowing it needs a way to tell the
+        // display path's own mapping from a caller's, which we do not have here.
         if (n == 1 && !nv_pm_is_gpu(c->memArea.pRanges[0].start, c->memArea.pRanges[0].size)) {
             md = nv_pm_ram_submd(c->memArea.pRanges[0].start, c->memArea.pRanges[0].size, fPid);
             if (!md) return kIOReturnNotPermitted;
@@ -1787,8 +1823,9 @@ IOReturn NVRMUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
         { sEsc,   1, kIOUCVariableStructureSize, 0, kIOUCVariableStructureSize },
         { sGetFd, 0, 0, 1, 0 },
         { sBindFd, 1, 0, 0, 0 },
-        { sKms,   1, kIOUCVariableStructureSize, 0, kIOUCVariableStructureSize },
-        { sKmsEvents, 0, 0, 1, 0 },
+        // 4 and 5 opened an NVKMS kernel-space session from user space; retired, kept so sWaitEvent stays 6
+        { sRetired, 0, 0, 0, 0 },
+        { sRetired, 0, 0, 0, 0 },
         { sWaitEvent, 2, 0, 1, 0 },
     };
     if (selector >= sizeof tbl / sizeof tbl[0]) return kIOReturnBadArgument;
@@ -1798,48 +1835,10 @@ IOReturn NVRMUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 extern "C" nv_state_t *nv_xnu_gpu_state(void) { return gNVRMService ? &gNVRMService->fNv : NULL; }
 extern "C" void *nv_xnu_gpu_os_device(void) { return gNVRMService; }
 
-IOReturn NVRMUserClient::sKms(OSObject *target, void *reference, IOExternalMethodArguments *args)
-{
-    NVRMUserClient *me = OSDynamicCast(NVRMUserClient, target);
-    if (!me || !me->fOwner) return kIOReturnNotAttached;
-    // The session this opens is an NVKMS kernel-space client, and NVKMS trusts a kernel client's embedded pointers
-    // (flip heads, LUT ramps, clip lists) as kernel addresses. Nothing the driver ships calls this: the display path
-    // reaches NVKMS through its in-kernel API and the Vulkan driver never uses this selector. So it is root-only;
-    // an unprivileged caller would otherwise hand NVKMS pointers it dereferences in the kernel.
-    if (kauth_getuid() != 0) return kIOReturnNotPrivileged;
-    uint32_t cmd = (uint32_t)args->scalarInput[0];
-    uint32_t size = args->structureInputDescriptor ? (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
-    if (size == 0 || size > (1u << 20)) return kIOReturnBadArgument;
-    if (!me->fKms) { me->fKms = nvkms_xnu_open(me->fPid); if (!me->fKms) { kprintf("NVRM-xnu: nvkms open failed (loaded? pass 2 done?)\n"); return kIOReturnNotReady; } }
-    void *buf = kern_os_malloc(size);
-    if (!buf) return kIOReturnNoMemory;
-    if (args->structureInputDescriptor) {
-        if (args->structureInputDescriptor->prepare() != kIOReturnSuccess) { kern_os_free(buf); return kIOReturnVMError; }
-        args->structureInputDescriptor->readBytes(0, buf, size);
-        args->structureInputDescriptor->complete();
-    } else nvu_memcpy(buf, args->structureInput, size);
-    int rc = nvkms_xnu_ioctl(me->fKms, cmd, buf, size);
-    if (rc) kprintf("NVRM-xnu: nvkms ioctl cmd %u size %u -> FALSE\n", cmd, size);
-    if (args->structureOutputDescriptor) {
-        if (args->structureOutputDescriptor->prepare() == kIOReturnSuccess) {
-            args->structureOutputDescriptor->writeBytes(0, buf, size);
-            args->structureOutputDescriptor->complete();
-        }
-    } else if (args->structureOutput && args->structureOutputSize >= size) {
-        nvu_memcpy(args->structureOutput, buf, size);
-        args->structureOutputSize = size;
-    }
-    kern_os_free(buf);
-    return rc == 0 ? kIOReturnSuccess : kIOReturnError;
-}
-IOReturn NVRMUserClient::sKmsEvents(OSObject *target, void *reference, IOExternalMethodArguments *args)
-{
-    NVRMUserClient *me = OSDynamicCast(NVRMUserClient, target);
-    if (!me) return kIOReturnNotAttached;
-    if (kauth_getuid() != 0) return kIOReturnNotPrivileged;   // the NVKMS session sKms opens is root-only
-    args->scalarOutput[0] = nvkms_xnu_events_available(me->fKms);
-    return kIOReturnSuccess;
-}
+// Selectors 4 and 5 handed a caller's buffer to NVKMS as a kernel-space client, which trusts the pointers inside it
+// (flip heads, LUT ramps, clip lists) as kernel addresses: root could make the kernel read and write where it chose.
+// Nothing the driver ships used them; the display path reaches NVKMS through its in-kernel API.
+IOReturn NVRMUserClient::sRetired(OSObject *, void *, IOExternalMethodArguments *) { return kIOReturnUnsupported; }
 IOReturn NVRMUserClient::sGetFd(OSObject *target, void *reference, IOExternalMethodArguments *args)
 {
     NVRMUserClient *me = OSDynamicCast(NVRMUserClient, target);
@@ -1953,6 +1952,7 @@ IOReturn NVRMUserClient::sEsc(OSObject *target, void *reference, IOExternalMetho
 }
 IOReturn NVRMUserClient::esc(uint32_t cmd, void *data, uint32_t size)
 {
+    Gate g(fGate);
     if (!fOwner || fOwner->fPassDone < 2) { static bool once; if (!once) { once = true; kprintf("NVRM-xnu: esc 0x%x refused: adapter not up (run nvrmctl go 2)\n", cmd); } return kIOReturnNotReady; }
     nv_state_t *nv = nvState();
     NvXnuPmUse pmUse;

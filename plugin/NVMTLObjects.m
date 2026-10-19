@@ -1427,7 +1427,19 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
 - (id<MTLTexture>)remoteStorageTexture { return nil; }
 - (id<MTLTexture>)newRemoteTextureViewForDevice:(id<MTLDevice>)d {
     return nil; }
+// An app's region, level and slice are 64-bit; the copy path below takes 32-bit. A value that does not fit
+// describes no texture, and narrowing it produces a DIFFERENT region that then passes every bounds check that
+// follows: an origin of 2^32 reads as 0, so the copy lands at the start of the texture instead of being
+// refused. The texture-buffer paths also add origin and width together, which wraps for an origin near 2^64
+// and would memcpy far outside the buffer. Apple raises an exception on a region like this; refuse it here,
+// before anything is narrowed.
+static BOOL nvmtl_region_fits(MTLRegion r, NSUInteger level, NSUInteger slice) {
+    return r.origin.x <= UINT32_MAX && r.origin.y <= UINT32_MAX && r.origin.z <= UINT32_MAX
+        && r.size.width <= UINT32_MAX && r.size.height <= UINT32_MAX && r.size.depth <= UINT32_MAX
+        && level <= UINT32_MAX && slice <= UINT32_MAX;
+}
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level {
+    if (!nvmtl_region_fits(region, level, 0)) { nvlog("getBytes: the region does not fit the copy path — REFUSED"); return; }
     if (level >= [self mipmapLevelCount]) { nvlog("getBytes: mip level %lu — this texture has %lu", (unsigned long)level, (unsigned long)[self mipmapLevelCount]); return; }
     [self nvmtlSurfaceIn];
     nvmtl_census("getBytes", (uint32_t)region.size.width, (uint32_t)region.size.height, _surf != NULL);
@@ -1437,9 +1449,10 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
 }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)img
       fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
+    if (!nvmtl_region_fits(region, level, slice)) { nvlog("getBytes:slice: the region does not fit the copy path — REFUSED"); return; }
     if (_tbView) {
         uint8_t *src = (uint8_t *)[(id<MTLBuffer>)_backBuf contents];
-        if (!src || region.origin.x + region.size.width > _i.w) { nvlog("getBytes: texture buffer is not CPU-visible or the region is outside it"); return; }
+        if (!src || region.origin.x > _i.w || region.size.width > _i.w - region.origin.x) { nvlog("getBytes: texture buffer is not CPU-visible or the region is outside it"); return; }
         memcpy(bytes, src + _backOff + region.origin.x * _i.bpp, region.size.width * _i.bpp); return; }
     if (level >= [self mipmapLevelCount]) { nvlog("getBytes: mip level %lu — this texture has %lu", (unsigned long)level, (unsigned long)[self mipmapLevelCount]); return; }
     [self nvmtlSurfaceIn];
@@ -1482,6 +1495,7 @@ static void nvmtl_mip_autofill(NVMTLTexture *t, const void *bytes, size_t row, M
     free(cur); free(nxt);
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
+    if (!nvmtl_region_fits(region, level, 0)) { nvlog("replaceRegion: the region does not fit the copy path — REFUSED"); return; }
     if (level >= [self mipmapLevelCount]) { nvlog("replaceRegion: mip level %lu — this texture has %lu", (unsigned long)level, (unsigned long)[self mipmapLevelCount]); return; }
     if (region.size.depth > 1 || region.origin.z) { [self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row * region.size.height]; return; }
     { int was = nvtrace_scope([self nvi]->w, [self nvi]->h);
@@ -1499,9 +1513,10 @@ static void nvmtl_mip_autofill(NVMTLTexture *t, const void *bytes, size_t row, M
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
             withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)img {
+    if (!nvmtl_region_fits(region, level, slice)) { nvlog("replaceRegion:slice: the region does not fit the copy path — REFUSED"); return; }
     if (_tbView) {
         id<MTLBuffer> bb = (id<MTLBuffer>)_backBuf; uint8_t *dst = (uint8_t *)[bb contents];
-        if (!dst || region.origin.x + region.size.width > _i.w) { nvlog("replaceRegion: texture buffer is not CPU-visible or the region is outside it"); return; }
+        if (!dst || region.origin.x > _i.w || region.size.width > _i.w - region.origin.x) { nvlog("replaceRegion: texture buffer is not CPU-visible or the region is outside it"); return; }
         const NSUInteger at = _backOff + region.origin.x * _i.bpp, len = region.size.width * _i.bpp; memcpy(dst + at, bytes, len);
         if (bb.storageMode == MTLStorageModeManaged) [bb didModifyRange:NSMakeRange(at, len)];
         return; }
@@ -1628,6 +1643,8 @@ static uint32_t nvmtl_tex_attach_vkfmt(NVMTLTexture *t, int *a8) {
 
 NSArray<NSDictionary *> *nvmtl_argbuf_fields(NVMTLFunction *function, NSUInteger ownerBufferIndex);
 NSArray<NSDictionary *> *nvmtl_air_argbuf_layout(NVMTLFunction *fn, NSUInteger bufferIndex, NSUInteger *size, NSUInteger *align);
+BOOL nvmtl_needs_visible_link(NSString *air, NSString *why);
+void nvmtl_fc_expect_link(int on);
 NSData *nvmtl_translate_with_fc(NSString *air, NSString *stage, const uint32_t *idx, const uint32_t *sizes,
                                 const uint8_t *const *payloads, size_t n, NSString **err);
 NSData *nvmtl_translate_with_fc_cached(NSString *air, NSString *stage, NSString *name, NSDictionary *constants,
@@ -2244,6 +2261,13 @@ NSDictionary *nvmtl_index_argument_fields(NSArray *fields) {
     if (!_dst || !nvmtl_buf_cpu(_dst)) { nvlog("argument encoder: no argument buffer set (or it is not host-visible)"); return; }
     NSDictionary *f = [self nvmtlFieldAt:index];
     if (!f) { nvlog("argument encoder: this function has no [[id(%lu)]] field — REFUSED", (unsigned long)index); return; }
+    // The binding path checks the offset against the buffer length (nvmtl_vk_bind_buffer); this path
+    // computes an address the shader will dereference, so it has to check the same thing.
+    if (nb && off > nb->_b.size) {
+        nvlog("argument encoder: offset %lu is past the %zu-byte buffer at [[id(%lu)]] - REFUSED",
+              (unsigned long)off, nb->_b.size, (unsigned long)index);
+        return;
+    }
     uint64_t addr = nb ? nvmtl_vk_buffer_address(&nb->_b) + off : 0;
     const NSUInteger fieldOffset = [f[@"field_offset"] unsignedLongValue];
     const size_t size = _dst->_b.size;
@@ -2376,8 +2400,7 @@ extern NSData *nvmtl_compile_library_entry(NSData *, NSString *, NSString *, NSS
         f->_air = _airs[name]; f->_lib = self; f->_needsLink = YES; return f;
     }
     if (spv) { NSError *te = nil; NSData *es = [self nvmtlEntrySpirv:name error:&te];
-        if (!es && _airs[name] && ([te.localizedDescription rangeOfString:@"Metal visible function table"].location != NSNotFound
-                                   || [te.localizedDescription rangeOfString:@"visible function reference"].location != NSNotFound)) {
+        if (!es && _airs[name] && nvmtl_needs_visible_link(_airs[name], te.localizedDescription)) {
             nvlog("library: \"%s\" calls a visible function (by reference or table) - DEFERRED to pipeline creation", name.UTF8String);
             NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = nil; f->_fname = name; f->_stage = (_stages[name] ?: @"");
             f->_air = _airs[name]; f->_lib = self; f->_needsLink = YES; return f;
@@ -2501,8 +2524,10 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
         NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = nil; f->_fc = [constants copy]; f->_fname = name; f->_stage = _stages[name];
         f->_air = _airs[name]; f->_lib = self; f->_fcv = cv; return f;
     }
+    nvmtl_fc_expect_link(1);
     NSData *spec = nvmtl_translate_with_fc_cached(_airs[name], _stages[name], name, constants, idx, sz, pay, n, &e);
-    if (!spec && ([e rangeOfString:@"visible function reference"].location != NSNotFound || [e rangeOfString:@"Metal visible function table"].location != NSNotFound) && _airs[name]) {
+    nvmtl_fc_expect_link(0);
+    if (!spec && _airs[name] && nvmtl_needs_visible_link(_airs[name], e)) {
         nvlog("newFunctionWithName:constantValues: \"%s\" has visible-function references - DEFERRED to pipeline creation (%zu constant(s))", name.UTF8String, n);
         if (error) *error = nil;
         NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = nil; f->_fc = [constants copy]; f->_fname = name; f->_stage = (_stages[name] ?: @"");

@@ -8,7 +8,7 @@ if [ "${1:-}" = --payload ]; then
   HERE=$(cd "$2" && pwd) || exit 2
 elif [ "$#" != 0 ]; then echo "STOP: expected --payload directory or no arguments" >&2; exit 2; fi
 KEXTS="NVRM NVAccel NVRMFB NVRMAGDC"
-EXT=/Library/Extensions; GB=/Library/GPUBundles; FW=/Users/Shared/nvfw
+EXT=/Library/Extensions; GB=/Library/GPUBundles; FW=/Library/NullMoth/nvfw; FWOLD=/Users/Shared/nvfw
 KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc
 K=/System/Library/Kernels/kernel
 # macOS 13+ kmutil refuses to build any kernel collection without a Kernel Debug Kit matching the build unless it is told
@@ -17,7 +17,7 @@ KARG=(--allow-missing-kdk); [ -f "$K" ] && KARG+=(--kernel "$K")
 KB=/System/Library/KernelCollections/BootKernelExtensions.kc
 KS=/System/Library/KernelCollections/SystemKernelExtensions.kc
 BK=""; LOCKDIR=/Library/NullMoth/install.lock; LOCK_HELD=0; LOCK_RELEASE_OK=1; LOCK_ID=""
-INSTALLING=0; NEWKC=""
+INSTALLING=0; NEWKC=""; STAGE=""
 release_install_lock() {
   if [ "$LOCK_HELD" = 1 ] && [ "$LOCK_RELEASE_OK" = 1 ]; then
     if [ -z "$LOCK_ID" ] || [ -L "$LOCKDIR" ] || [ ! -d "$LOCKDIR" ] ||
@@ -46,7 +46,10 @@ rollback_install() {
   done
   rm -rf /Library/NullMoth/kexts "$FW" || failed=1
   [ ! -d "$BK/kexts" ] || ditto "$BK/kexts" /Library/NullMoth/kexts || failed=1
+  # Restore the firmware to both locations: a driver older than this one looks for it in /Users/Shared,
+  # and root writing that directory is harmless (root-owned, inside a sticky parent).
   [ ! -d "$BK/nvfw" ] || ditto "$BK/nvfw" "$FW" || failed=1
+  [ ! -d "$BK/nvfw" ] || { mkdir -p "$FWOLD" && ditto "$BK/nvfw" "$FWOLD"; } || failed=1
   if [ -f "$BK/AuxiliaryKernelExtensions.kc" ]; then cp -p "$BK/AuxiliaryKernelExtensions.kc" "$KC" || failed=1
   else rm -f "$KC" || failed=1; fi
   if [ -f "$BK/os-major" ]; then cp -p "$BK/os-major" /Library/NullMoth/os-major || failed=1
@@ -111,7 +114,8 @@ backup_copy() {
     die "back up $component"
   fi
 }
-trap release_install_lock EXIT
+finish_install() { [ -z "$STAGE" ] || rm -rf "$STAGE"; release_install_lock; }
+trap finish_install EXIT
 trap 'die "installer interrupted (signal HUP)"' HUP
 trap 'die "installer interrupted (signal INT)"' INT
 trap 'die "installer interrupted (signal TERM)"' TERM
@@ -155,6 +159,20 @@ CARD=""; for i in $NV_IDS; do case " $(echo $SUPPORTED_IDS) " in *" $i "*) CARD=
 ok "macOS $v, x86_64, NVIDIA GPU present"
 
 step "2. package integrity"
+# The extracted package is usually writable by the logged-in user, so a process running as that user could swap a kext
+# between this check and the copy into /Library/Extensions. Check and install a root-owned private copy instead.
+SELF=$(cd "$(dirname "$0")" && pwd)
+STAGE=$(mktemp -d /var/tmp/nullmoth-package.XXXXXX) && [ -n "$STAGE" ] && [ -d "$STAGE" ] || die "create private package copy"
+cp -cR "$HERE" "$STAGE/pkgroot" 2>/dev/null || { rm -rf "$STAGE/pkgroot"; ditto "$HERE" "$STAGE/pkgroot"; } && chown -R root:wheel "$STAGE" && chmod -R go-w "$STAGE" || die "copy package to $STAGE"
+# shasum follows links: a link to an identical file outside the copy passes the check and can still change later.
+while IFS= read -r -d '' link; do
+  case "$(readlink "$link")" in /*|..|../*|*/..|*/../*) die "package holds a link that leaves the package: ${link#"$STAGE/pkgroot/"}";; esac
+done < <(find "$STAGE/pkgroot" -type l -print0)
+[ "$SELF" = "$HERE" ] && SELF="$STAGE/pkgroot"
+HERE="$STAGE/pkgroot"
+# VAR was set from the original folder before this step, and kpath reads the accelerator kext through it. Point it
+# at the private copy too, or that one kernel extension is still taken from the folder the check no longer covers.
+VAR="$HERE/Library/NullMoth/kexts/$MAJ"
 # --strict: without it shasum skips a malformed line and still reports success
 (cd "$HERE" && shasum -a 256 --strict -c SHA256SUMS --quiet) || die "SHA256SUMS mismatch: re-download the package"
 for target in 15 26; do
@@ -162,7 +180,7 @@ for target in 15 26; do
     [ -f "$HERE/Library/NullMoth/kexts/$target/NVAccel.kext/Contents/Info.plist" ] || die "this package lacks the complete macOS $target accelerator"
 done
 ok "every file matches SHA256SUMS and both OS accelerators are present"
-RUNTIME_PREFLIGHT="$(cd "$(dirname "$0")" && pwd)/nullmoth-runtime-check.sh"
+RUNTIME_PREFLIGHT="$SELF/nullmoth-runtime-check.sh"
 [ -x "$RUNTIME_PREFLIGHT" ] || die "runtime compatibility checker is missing"
 /bin/bash "$RUNTIME_PREFLIGHT" "$HERE" "$v" || die "userland runtime cannot load on this macOS version"
 
@@ -224,7 +242,14 @@ for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl nvmtl-allow.txt; do [ ! -e
 [ ! -d /Library/NullMoth/kexts ] || backup_copy "cached accelerators" ditto /Library/NullMoth/kexts "$BK/kexts"
 [ ! -f /Library/NullMoth/os-major ] || backup_copy "OS record" cp -p /Library/NullMoth/os-major "$BK/os-major"
 [ ! -f /Library/NullMoth/driver-version ] || backup_copy "version record" cp -p /Library/NullMoth/driver-version "$BK/driver-version"
-[ ! -d "$FW" ] || backup_copy firmware ditto "$FW" "$BK/nvfw"
+# Back up the firmware from wherever it actually is. This version reads it from $FW, but a release
+# before the move kept it in $FWOLD, so on an upgrade $FW does not exist yet and backing up only $FW
+# saved nothing. Both restore paths (rollback_install and the boot-guard fallback) are gated on
+# $BK/nvfw, so an empty backup made them no-ops: the fallback put the previous driver back with NO
+# firmware at all and the Mac came up with no display and no way out. Measured on the test Mac.
+if [ -d "$FW" ]; then backup_copy firmware ditto "$FW" "$BK/nvfw"
+elif [ -d "$FWOLD" ]; then backup_copy firmware ditto "$FWOLD" "$BK/nvfw"
+fi
 ok "backup written"
 
 step "5. install"
@@ -239,7 +264,16 @@ for target in 15 26; do
 done
 chown -R root:wheel /Library/NullMoth/kexts && chmod -R go-w /Library/NullMoth/kexts || die "cached accelerator permissions"
 echo "$MAJ" > /Library/NullMoth/os-major || die "record selected OS"
-mkdir -p "$GB" "$FW" || die "create bundle and firmware directories"
+mkdir -p "$GB" || die "create the bundle directory"
+# The card runs these images and the kernel reads them, so this directory must be ours. It used to live in
+# /Users/Shared, which is world-writable (1777): a directory left there by anyone else was adopted as-is,
+# because the only permission step was a chmod that adds read bits and never takes write away. Refuse
+# anything we did not make, the way the shader caches already refuse a cache someone else could have written.
+if [ -e "$FW" ] && [ -n "$(find "$FW" -maxdepth 0 \( ! -user root -o -perm -o+w -o -perm -g+w \) -print -quit 2>/dev/null)" ]; then
+  rm -rf "$FW" || die "clear a firmware directory that was not root-owned"
+  echo "   note: the firmware folder was writable by other users; it has been replaced"
+fi
+mkdir -p "$FW" || die "create the firmware directory"
 # $GB/nvmtl is replaced wholesale below, so move the shared shader caches aside first. NVMTLLibraryLoad.m
 # reads them from NVMTL_AIRCACHE_DIR (/Library/GPUBundles/nvmtl/aircache) and uses that path whenever it is
 # writable, which is what lets every process - WindowServer included - share one persistent cache instead of
@@ -266,8 +300,11 @@ if [ -d "$EXT/NMXGPU.kext" ] && [ -d /Library/NullMoth/gpu-userland ]; then
 fi
 cp "$HERE/Library/GPUBundles/nvmtl-allow.txt" "$GB/" || die "copy bundle allow list"
 ditto "$HERE/Users/Shared/nvfw" "$FW" || die "copy firmware"
+chown -R root:wheel "$FW" && chmod -R go-w,a+rX "$FW" || die "firmware permissions"
+# nothing reads the old location any more; leaving it behind leaves a writable folder with our name on it
+rm -rf "$FWOLD" 2>/dev/null || true
 for k in $KEXTS; do chown -R root:wheel "$EXT/$k.kext" && chmod -R 755 "$EXT/$k.kext" || die "permissions for $k"; done
-chown -R root:wheel "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" "$GB/nvmtl-allow.txt" && chmod -R a+rX "$FW" || die "bundle or firmware permissions"
+chown -R root:wheel "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" "$GB/nvmtl-allow.txt" || die "bundle permissions"
 # WindowServer runs as _windowserver and must read the bundles and the allow list. WAS: cp under the app's privileged
 # helper (umask 077) left nvmtl-allow.txt at 0600, WindowServer got no Metal device, and CoreDisplay aborted
 # ("Failed to create MetalDevice") on every start: the crash loop after install on many machines.
@@ -341,6 +378,8 @@ for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl nvmtl-allow.txt; do rm -rf
 rm -rf /Library/NullMoth/kexts "$FW"
 [ ! -d "\$BK/kexts" ] || ditto "\$BK/kexts" /Library/NullMoth/kexts
 [ ! -d "\$BK/nvfw" ] || ditto "\$BK/nvfw" "$FW"
+# the previous driver may be one that reads the old location
+[ ! -d "\$BK/nvfw" ] || { mkdir -p "$FWOLD" && ditto "\$BK/nvfw" "$FWOLD"; }
 if [ -f "\$BK/AuxiliaryKernelExtensions.kc" ]; then cp -p "\$BK/AuxiliaryKernelExtensions.kc" "$KC"; else rm -f "$KC"; fi
 [ ! -f "\$BK/os-major" ] || cp -p "\$BK/os-major" /Library/NullMoth/os-major
 if [ -f "\$BK/driver-version" ]; then cp -p "\$BK/driver-version" /Library/NullMoth/driver-version; else rm -f /Library/NullMoth/driver-version; fi
