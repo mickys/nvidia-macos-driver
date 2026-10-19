@@ -2565,14 +2565,20 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
         // come from macOS's own scaled modes on the native raster.
         const bool larger = fBootW && k.hVisible >= fBootW && k.vVisible >= fBootH && (k.hVisible > fBootW || k.vVisible > fBootH);
         const bool bootRaster = fBootW && k.hVisible == fBootW && k.vVisible == fBootH;
-        if (!raster && !have && (bootRaster || larger) && fMemBytes && k.hVisible <= fRasterMaxW && k.vVisible <= fScalerMaxH) {
+        // nvfbsmall=1 offers the smaller ones as well: where NVKMS refuses macOS's scaled modes on the native raster (a
+        // 4K-only firmware raster on an HDMI dummy plug), they are the only way to a desktop below the boot size.
+        static int small = -1;
+        if (small < 0) { uint32_t v = 0; small = PE_parse_boot_argn("nvfbsmall", &v, sizeof v) && v;
+                         if (small) FBLOG("nvfbsmall: rasters smaller than the boot raster are offered too"); }
+        const bool smaller = small && fBootW && !bootRaster && !larger;
+        if (!raster && !have && (bootRaster || larger || smaller) && fMemBytes && k.hVisible <= fRasterMaxW && k.vVisible <= fScalerMaxH) {
             NvU32 pitch = 0;
             if (nvrmCheckedPitch(k.hVisible, fPitchAlign, &pitch) && (NvU64)pitch * k.vVisible <= fMemBytes) raster = true;
         }
         if (have || !raster) {
             if (!fromMac && !fKmsModesLogged)
                 FBLOG("fb%u NVKMS mode %u: not offered (%s)", fIndex, i, have ? "already listed at this rate"
-                      : !fBootW ? "no boot raster yet" : (!bootRaster && !larger) ? "smaller than the boot raster (desktops that size come from macOS's scaled modes)"
+                      : !fBootW ? "no boot raster yet" : (!bootRaster && !larger && !smaller) ? "smaller than the boot raster (desktops that size come from macOS's scaled modes; nvfbsmall=1 offers it)"
                       : "does not fit the scanout memory or the scaler");
             continue;
         }
