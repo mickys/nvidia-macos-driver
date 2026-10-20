@@ -6,6 +6,8 @@
 
 #include "nvrm_off.h"
 #include "nv-xnu.h"
+
+extern "C" void nv_xnu_power_refresh(void);   // nv_xnu_power.cpp
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
@@ -417,6 +419,7 @@ bool NVRM::start(IOService *provider)
     }
     UInt8 bus = fPCI->getBusNumber(), dev = fPCI->getDeviceNumber(), fn = fPCI->getFunctionNumber();
     nv_xnu_register_pci(fPCI, 0, bus, dev, fn);
+    nv_xnu_power_refresh();        // read the power source here, where no firmware lock is held
     nv_xnu_register_all_pci();   // RM's chipset init needs the whole PCI tree (host bridge, root ports)
     nv_state_t *nv = &fNv;
     nv->pci_info.domain    = 0;
@@ -1427,6 +1430,7 @@ extern "C" { void nvkms_xnu_suspend(NvU32 gpuId); void nvkms_xnu_resume(NvU32 gp
 
 IOReturn NVRM::setPowerState(unsigned long ordinal, IOService *device)
 {
+    nv_xnu_power_refresh();        // a wake can be a change of power source; this runs before the firmware asks
     const SInt32 pm = OSAddAtomic(0, &fGpuPm);
     if (ordinal == 0 && pm == kGpuPmRunning && fAdapter) gpuSuspend();
     else if (ordinal != 0 && pm == kGpuPmSuspended) gpuResume();
@@ -1785,7 +1789,7 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
         // A range that is not card memory goes down the system-RAM path below, which checks the owner.
         // A range that IS card memory must still land inside one of this card's bars, which is what stops
         // a caller handing us an arbitrary physical address and getting it mapped.
-        // ⛔ This was narrowed to the framebuffer bar alone, on the reasoning that a user process has no
+        // This was narrowed to the framebuffer bar alone, on the reasoning that a user process has no
         // business holding a writable mapping of the register file. The display stack disagrees: measured
         // on the test Mac, CoreDisplay maps phys 0x80bb0000 +0x10000 and +0x1000, which live in bar0, and
         // refusing them made WindowServer abort in CoreDisplay_CreateDisplayForCGXDisplayDevice and
