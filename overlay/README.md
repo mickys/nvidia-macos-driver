@@ -1,7 +1,7 @@
 # mickys overlay for NullMoth's NVIDIA driver
 
 An **unofficial** add-on for [NullMoth's driver](https://github.com/nullmoth/nvidia-macos-driver): open-source hardware
-video encoders and decoders for RTX 40 cards, and optionally a test build of the Metal plugin from
+video encoders and decoders for RTX 40 cards and the GTX 1650, and optionally a test build of the Metal plugin from
 [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) (branch `dev`). It is not made, reviewed or
 supported by NullMoth. Report problems with it at
 [mickys/nvidia-macos-driver issues](https://github.com/mickys/nvidia-macos-driver/issues), not upstream.
@@ -13,14 +13,18 @@ and everything else always stay NullMoth's.
 
 ## What it changes
 
-**Hardware video encoding and decoding on RTX 40 (Ada).** NullMoth's driver has no NVENC encoder for Ada (it ships
-them for RTX 20, 30 and 50), so on RTX 40 VideoToolbox encodes in software. The overlay adds open-source encoders and
-decoders for Ada's NVENC and NVDEC ([mickys/nvenc](https://github.com/mickys/nvenc), `libnvencvt.dylib`). Since 2.3.7
+**Hardware video encoding and decoding on RTX 40 (Ada) and the GTX 1650 (TU117).** NullMoth's driver has no NVENC encoder
+for Ada or for the GTX 1650's older NVENC (it ships them for RTX 20, 30 and 50), so on those cards VideoToolbox encodes in
+software. The overlay adds open-source encoders and
+decoders for these cards' NVENC and NVDEC ([mickys/nvenc](https://github.com/mickys/nvenc), `libnvencvt.dylib`). Since 2.3.7
 NullMoth's plugin has a hook for exactly this: with `NVMTL_NVENCVT` set in `nvrm610.conf` it loads `libnvencvt.dylib` from
 its own bundle (never into WindowServer, and only if the library and its folder are owned by root and not writable by
 group or others), and VideoToolbox picks it over the other codecs by rating (1100). It is available to every app that
 uses VideoToolbox (Parsec, OBS, QuickTime and other AVFoundation apps), and to command-line tools through `nvenc-run`
-(see below). It checks the GPU first and stays off on cards without Ada NVENC.
+(see below). It checks the GPU first and stays off on other cards (RTX 20 / 30 / 50 keep NullMoth's encoders).
+
+On the GTX 1650 (TU117) the hardware has no AV1 and no HEVC B pictures, so the overlay offers H.264 (with B pictures) and
+HEVC (P only) encoders and every decoder but AV1; VP9 from 65x65 up.
 
 - **Encoders:** H.264 (Baseline / Main / High with CABAC, 4:4:4), HEVC (Main, Main 10, 4:4:4) and AV1 (8 / 10-bit, up to 8K).
   Two B pictures between anchors when the app allows frame reordering and is not real time (recordings and exports;
@@ -85,8 +89,8 @@ also for hardened and Apple binaries such as `/usr/bin/avconvert`; on a stock Ma
   (after a NullMoth update, restart before installing the overlay). The plugin and the kernel driver share interfaces,
   so an overlay is built for one NullMoth version (`COMPATIBLE-DRIVERS` in the package).
 - An x86_64 Mac (Intel or AMD hackintosh) running macOS 15 or 26, as NullMoth's driver requires. Tested only on
-  macOS 26.7.1 with an RTX 4090 so far.
-- The encoder part needs an RTX 40 card. The desktop part works on every card the driver supports.
+  macOS 26.7.1 with an RTX 4090 and a GTX 1650 so far.
+- The encoder part needs an RTX 40 card or a GTX 1650 (TU117: GTX 1650, T400 / T600 / T1000). The desktop part works on every card the driver supports.
 
 ## Install
 
