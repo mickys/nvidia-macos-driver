@@ -48,7 +48,7 @@ alternating; 2.3.7 gave the same):
 | 3200x1800 | NullMoth 2.4.3 | 40.3 | 58 % | 215 % |
 | 3200x1800 | `--desktop` | 42.9 (+6 %) | 55 % | 198 % |
 
-Per upload of the full-screen window: 19.7 ms with the CPU copy, 7.7 ms from the imported pages. Worth it on a 4K (or
+Per upload of the full-screen window (diagnostic build on 2.3.7): 19.7 ms with the CPU copy, 7.7 ms from the imported pages. Worth it on a 4K (or
 larger) display with big Safari, Mail or other WebKit windows; with smaller windows NullMoth's plugin is as fast. It
 replaces NullMoth's plugin binary, so a problem in it affects the whole desktop: try it, and go back with
 `sudo ./install.sh` (without `--desktop`) or `sudo ./uninstall.sh`. `NVMTL_SURFIN_UPLOAD=cpu` in
