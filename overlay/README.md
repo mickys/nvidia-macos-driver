@@ -1,7 +1,7 @@
 # mickys overlay for NullMoth's NVIDIA driver
 
-An **unofficial** add-on for [NullMoth's driver](https://github.com/nullmoth/nvidia-macos-driver): an open-source hardware
-video encoder for RTX 40 cards, and optionally a test build of the Metal plugin from
+An **unofficial** add-on for [NullMoth's driver](https://github.com/nullmoth/nvidia-macos-driver): open-source hardware
+video encoders and decoders for RTX 40 cards, and optionally a test build of the Metal plugin from
 [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) (branch `dev`). It is not made, reviewed or
 supported by NullMoth. Report problems with it at
 [mickys/nvidia-macos-driver issues](https://github.com/mickys/nvidia-macos-driver/issues), not upstream.
@@ -13,25 +13,33 @@ and everything else always stay NullMoth's.
 
 ## What it changes
 
-**Hardware H.264 and HEVC encoding on RTX 40 (Ada).** NullMoth's driver registers its NVENC encoders only on Blackwell
-(RTX 50), so on older cards VideoToolbox encodes in software. The overlay adds an open-source encoder for Ada NVENC
-([mickys/nvenc](https://github.com/mickys/nvenc), `libnvencvt.dylib`). Since 2.3.7 NullMoth's plugin has a hook for exactly
-this: with `NVMTL_NVENCVT` set in `nvrm610.conf` it loads `libnvencvt.dylib` from its own bundle (never into WindowServer,
-and only if the library and its folder are owned by root and not writable by group or others), and VideoToolbox picks
-it over NullMoth's encoders by rating (1100). The encoder is available to every app that uses
-VideoToolbox (Parsec, OBS, AVFoundation apps, ...), and to command-line tools through `nvenc-run` (see below). Parsec at 4K: about 5 ms per frame with either codec; HEVC needs about 40 % less bitrate for the
-same quality. It checks the GPU first and stays off on cards without Ada NVENC (RTX 20/30 and GTX 16 keep Apple's
-encoder). HEVC Main 10 (10-bit) too: Parsec's "prefer 10-bit color" at 4K takes about 7 ms per frame. H.264 uses High profile with
-CABAC by default (much better quality at the same bitrate; apps that ask for Baseline get Main with CAVLC). Full-range
-input is signalled as full range. Profiles: H.264 Baseline/Main/High, HEVC Main and Main 10, 4:2:0; no B-frames.
+**Hardware video encoding and decoding on RTX 40 (Ada).** NullMoth's driver has no NVENC encoder for Ada (it ships
+them for RTX 20, 30 and 50), so on RTX 40 VideoToolbox encodes in software. The overlay adds open-source encoders and
+decoders for Ada's NVENC and NVDEC ([mickys/nvenc](https://github.com/mickys/nvenc), `libnvencvt.dylib`). Since 2.3.7
+NullMoth's plugin has a hook for exactly this: with `NVMTL_NVENCVT` set in `nvrm610.conf` it loads `libnvencvt.dylib` from
+its own bundle (never into WindowServer, and only if the library and its folder are owned by root and not writable by
+group or others), and VideoToolbox picks it over the other codecs by rating (1100). It is available to every app that
+uses VideoToolbox (Parsec, OBS, QuickTime and other AVFoundation apps), and to command-line tools through `nvenc-run`
+(see below). It checks the GPU first and stays off on cards without Ada NVENC.
+
+- **Encoders:** H.264 (Baseline / Main / High with CABAC, 4:4:4), HEVC (Main, Main 10, 4:4:4) and AV1 (8 / 10-bit, up to 8K).
+  Two B pictures between anchors when the app allows frame reordering and is not real time (recordings and exports;
+  Parsec and other streaming stays P-only, about 2 ms per 1080p and 5-6 ms per 4K frame), NVIDIA's quality settings where
+  the frame rate allows, CBR and capped VBR on target, colour description and HDR10 metadata. Quality at the same bitrate
+  (VMAF, 1080p and 4K test clips): AV1 above x265 medium, HEVC level with x265, H.264 at or above x264 medium, at 3-10x
+  their speed. [Benchmarks](https://github.com/mickys/nvenc/blob/main/docs/benchmarks.md).
+- **Decoders:** H.264, HEVC (8-12 bit), VP9, AV1, MPEG-1/2 and MPEG-4 Part 2, bit-exact against ffmpeg on the conformance
+  streams. 4K: H.264 about 210 fps (NullMoth's decoder: 40, Apple's software decoder: 24), HEVC about 350, VP9 340, AV1
+  380 (the only hardware VP9 and AV1 decoding on an Intel Mac). `--no-decoders` keeps only the encoders.
 
 **Optional, `--desktop`: faster desktop with large CPU-drawn windows.** When WindowServer composites a window that an
 app drew with the CPU (every WebKit view, including Safari and Mail, and CoreGraphics apps), NullMoth's plugin copies
 the window's pages into video memory with the CPU. WindowServer lets go of the surface after each frame, so the pages
 are faulted in again for every upload, and for a large window most of the copy is page faults. This fork's plugin
 imports the locked pages as host memory and lets the GPU copy them (falling back to the CPU copy when they cannot be
-imported); the change is 48 lines on top of NullMoth 2.3.7, the same one proposed to NullMoth. Measured on an RTX 4090
-with NullMoth 2.3.7 (macOS 26.7.1, in a VM), Safari playing a CSS animation, 3 x 20 s each:
+imported); the change is 48 lines on top of NullMoth's plugin, the same one proposed to NullMoth. Measured on an RTX 4090
+with NullMoth 2.3.7 (macOS 26.7.1, in a VM; the plugin change is the same on 2.4.3), Safari playing a CSS animation, 3 x 20
+s each:
 
 | window | plugin | screen updates/s (avg) | WindowServer CPU (user + system) | Safari's painting process |
 |---|---|---|---|---|
@@ -72,7 +80,7 @@ also for hardened and Apple binaries such as `/usr/bin/avconvert`; on a stock Ma
 
 ## Requirements
 
-- NullMoth's driver **2.3.7** installed and running. The installer refuses anything else: it checks NullMoth's version
+- NullMoth's driver **2.4.3** installed and running. The installer refuses anything else: it checks NullMoth's version
   record, the version of the NVRM, NVAccel and NVRMFB kernel extensions on disk, and the version of the ones running
   (after a NullMoth update, restart before installing the overlay). The plugin and the kernel driver share interfaces,
   so an overlay is built for one NullMoth version (`COMPATIBLE-DRIVERS` in the package).
@@ -87,6 +95,7 @@ tar -xzf mickys-overlay-<version>.tar.gz && cd mickys-overlay-<version>
 sudo ./install.sh                      # encoder for every app; NullMoth's plugin stays exactly as it is
 sudo ./install.sh --nvenc=parsecd,obs  # encoder only for these processes
 sudo ./install.sh --cli-aliases        # and ffmpeg/HandBrakeCLI/avconvert through nvenc-run in Terminal
+sudo ./install.sh --no-decoders        # the encoders only (NVENCVT_NO_DEC=1 in /usr/local/etc/nvencvt.conf)
 sudo ./install.sh --desktop            # also this fork's plugin build (see "What it changes")
 sudo ./install.sh --desktop --nvenc=off  # the plugin build only, no encoder
 ```
@@ -103,7 +112,7 @@ sudo ./uninstall.sh
 ```
 
 It puts the plugin, its signature and `nvrm610.conf` back exactly as they were, and removes `libnvencvt.dylib`,
-`nvenc-run` and the `--cli-aliases` lines. Then log out and back in. Updating NullMoth's driver also replaces the overlay (its installer writes the whole bundle).
+`nvenc-run`, the `--cli-aliases` lines and the `--no-decoders` setting. Then log out and back in. Updating NullMoth's driver also replaces the overlay (its installer writes the whole bundle).
 
 ## Check that it is active
 
@@ -111,7 +120,7 @@ It puts the plugin, its signature and `nvrm610.conf` back exactly as they were, 
   `SHA256SUMS`, or `shasum -a 256` the file.
 - Encoder: apps list it as "NVENC - H.264 - (NVIDIA <your card>) - mickys/nvenc - <version>" /
   `org.nvenc.videoencoder.avc` and "NVENC - HEVC - (NVIDIA <your card>) - mickys/nvenc - <version>" /
-  `org.nvenc.videoencoder.hevc` (for example "NVENC - H.264 - (NVIDIA RTX 4090) - mickys/nvenc - 0.7.0");
+  `org.nvenc.videoencoder.hevc`, and AV1 (for example "NVENC - H.264 - (NVIDIA RTX 4090) - mickys/nvenc - 0.8.0");
   Parsec's host log (`~/.parsec/log.txt`) says `encoder = Hardware`.
 - Command line: `nvenc-run ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=60 -t 5 -c:v hevc_videotoolbox -b:v 20M /tmp/t.mp4`
   writes a 5-second HEVC file (about 1.3 s on an RTX 4090); without `nvenc-run` the same command fails with
@@ -120,7 +129,7 @@ It puts the plugin, its signature and `nvrm610.conf` back exactly as they were, 
 ## Source
 
 - Plugin: `plugin/` of [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) at the tag named in
-  `SOURCE` (NullMoth 2.3.7 plus the overlay's commits), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
+  `SOURCE` (NullMoth 2.4.3 plus the overlay's commits), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
 - Encoder: [mickys/nvenc](https://github.com/mickys/nvenc) at the commit named in `SOURCE`.
 - The plugin source is under the PolyForm Noncommercial License 1.0.0 (`LICENSE`), like NullMoth's. The encoder is MIT
   (`LICENSE-nvenc`).

@@ -14,7 +14,7 @@ cp "$DRV" "$P/payload/NVMTLDriver"; cp "$LIB" "$P/payload/libnvencvt.dylib"
 cp "$HERE/nvenc-run" "$HERE/nvenc-cli-aliases.sh" "$P/payload/"; chmod 755 "$P/payload/nvenc-run"; chmod 644 "$P/payload/nvenc-cli-aliases.sh"
 cp "$HERE/install.sh" "$HERE/uninstall.sh" "$HERE/README.md" "$P/"; chmod 755 "$P/install.sh" "$P/uninstall.sh"
 cp "$ROOT/LICENSE" "$P/LICENSE"; cp "$NVLIC" "$P/LICENSE-nvenc"
-printf '2.3.7\n' > "$P/COMPATIBLE-DRIVERS"   # NullMoth versions whose kernel interfaces this plugin build matches
+printf '2.4.3\n' > "$P/COMPATIBLE-DRIVERS"   # NullMoth versions whose kernel interfaces this plugin build matches
 printf '%s\n' "$V" > "$P/VERSION"
 printf 'overlay %s\nplugin: mickys/nvidia-macos-driver %s\nencoder: mickys/nvenc %s\nfor: NullMoth driver %s (COMPATIBLE-DRIVERS)\n' "$V" "$TAG" "$NV" "$(paste -sd ' ' "$P/COMPATIBLE-DRIVERS")" > "$P/SOURCE"
 (cd "$P" && sha payload/NVMTLDriver payload/libnvencvt.dylib payload/nvenc-run payload/nvenc-cli-aliases.sh install.sh uninstall.sh README.md LICENSE LICENSE-nvenc COMPATIBLE-DRIVERS VERSION SOURCE > SHA256SUMS)

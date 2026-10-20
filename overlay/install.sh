@@ -2,23 +2,25 @@
 # Install the mickys overlay on top of NullMoth's NVIDIA driver: adds the open-source encoder libnvencvt.dylib next to
 # NullMoth's Metal plugin in /Library/GPUBundles/NVMTLDriver.bundle, which loads it by itself since 2.3.7
 # (NVMTL_NVENCVT in nvrm610.conf). NullMoth's files stay as they are.
-#   sudo ./install.sh [--desktop] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases]
+#   sudo ./install.sh [--desktop] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases] [--no-decoders]
 #     --desktop      also replace the plugin binary with this fork's build (CPU-drawn windows uploaded by the GPU)
 #     --nvenc        which processes get the open-source H.264/HEVC encoder (RTX 40 only): 1 = every app (default), a
 #                    comma-separated list of process names to limit it to those, off = none
 #     --cli-aliases  also make ffmpeg, HandBrakeCLI and avconvert run through nvenc-run in interactive zsh/bash shells
+#     --no-decoders  the library's hardware decoders off (encoders only): NVENCVT_NO_DEC=1 in /usr/local/etc/nvencvt.conf
 # Unless --nvenc=off, it also installs /usr/local/bin/nvenc-run, which gives command-line tools the encoder.
 # It installs only over a NullMoth driver version listed in COMPATIBLE-DRIVERS, and only when the kernel extensions
 # on disk and the ones running are that version too (the plugin and the kernel driver share interfaces).
 # Undo: sudo ./uninstall.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-NVENC=1; ALIASES=0; ENCONLY=1
+NVENC=1; ALIASES=0; ENCONLY=1; NODEC=0
 for a in "$@"; do case $a in
   --desktop) ENCONLY=0 ;;
   --encoder-only) ENCONLY=1 ;;   # the default since 2.3.7-2; kept so older instructions still work
   --nvenc=*) NVENC=${a#--nvenc=} ;;
   --cli-aliases) ALIASES=1 ;;
+  --no-decoders) NODEC=1 ;;
   *) echo "unknown option $a"; exit 2 ;;
 esac; done
 die() { echo "STOP: $*" >&2; exit 1; }
@@ -31,7 +33,7 @@ case $NVENC in off|1) ;; *) [[ $NVENC =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]]
 OV=$(cat "$HERE/VERSION")
 B=/Library/GPUBundles/NVMTLDriver.bundle; X=$B/Contents/MacOS; C=/Library/GPUBundles/nvmtl/nvrm610.conf
 CR=$B/Contents/_CodeSignature/CodeResources
-RUN=/usr/local/bin/nvenc-run; SH=/usr/local/share/mickys-overlay; RC="/etc/zshrc /etc/bashrc"; MARK='# mickys overlay --cli-aliases'
+RUN=/usr/local/bin/nvenc-run; SH=/usr/local/share/mickys-overlay; VC=/usr/local/etc/nvencvt.conf; VMARK='# mickys overlay --no-decoders'; RC="/etc/zshrc /etc/bashrc"; MARK='# mickys overlay --cli-aliases'
 echo "== mickys overlay $OV (for NullMoth driver $(paste -sd ' ' "$HERE/COMPATIBLE-DRIVERS"))"
 
 echo "== 1. checks"
@@ -133,8 +135,19 @@ else
   fi
 fi
 
+echo "== 6. decoders"
+# libnvencvt reads NVENCVT_* settings from $VC (root-owned, not writable by others): the overlay's line is marked;
+# other lines in the file are left alone
+if [ -f "$VC" ]; then grep -vF "$VMARK" "$VC" > "$VC.new" || true; else : > "$VC.new"; fi
+if [ $NODEC = 1 ] && [ "$NVENC" != off ]; then printf 'NVENCVT_NO_DEC=1  %s\n' "$VMARK" >> "$VC.new"; fi
+if [ -s "$VC.new" ]; then install -d -o root -g wheel -m 755 /usr/local/etc; chown root:wheel "$VC.new"; chmod 644 "$VC.new"; mv "$VC.new" "$VC"
+else rm -f "$VC.new" "$VC"; fi
+if [ "$NVENC" = off ]; then ok "no encoder, no decoders (--nvenc=off)"
+elif [ $NODEC = 1 ]; then ok "hardware decoders off ($VC: NVENCVT_NO_DEC=1)"
+else ok "hardware decoders on (H.264, HEVC, VP9, AV1, MPEG-1/2, MPEG-4 Part 2; --no-decoders turns them off)"; fi
+
 echo
-if [ $ENCONLY = 1 ]; then echo "Done. Apps you open from now on get the encoder (quit and reopen running ones)."
+if [ $ENCONLY = 1 ]; then echo "Done. Apps you open from now on get the encoders and decoders (quit and reopen running ones)."
 else echo "Done. Log out and back in (or restart) so WindowServer and running apps load the new plugin."; fi
 [ "$NVENC" = off ] || echo "Command-line tools (ffmpeg, HandBrakeCLI, avconvert) see the encoder only through nvenc-run:   nvenc-run ffmpeg ...$([ $ALIASES = 1 ] || echo "   (sudo ./install.sh --cli-aliases does that for you in zsh/bash)")"
 echo "Undo: sudo $HERE/uninstall.sh   (backup: $BK)"

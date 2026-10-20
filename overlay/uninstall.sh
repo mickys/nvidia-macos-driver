@@ -1,6 +1,6 @@
 #!/bin/bash
 # Undo the mickys overlay: put back the Metal plugin binary and nvrm610.conf saved by install.sh, remove
-# libnvencvt.dylib if it was not there before, and remove nvenc-run and the --cli-aliases hook.
+# libnvencvt.dylib if it was not there before, and remove nvenc-run, the --cli-aliases hook and the --no-decoders line.
 #   sudo ./uninstall.sh [backup dir]      default: /Library/NullMoth/overlay-backup-latest
 set -euo pipefail
 die() { echo "STOP: $*" >&2; exit 1; }
@@ -12,6 +12,11 @@ for f in /etc/zshrc /etc/bashrc; do
   grep -vF "$MARK" "$f" > "$f.mickys" || true; cat "$f.mickys" > "$f"; rm -f "$f.mickys"
 done
 rm -rf /usr/local/share/mickys-overlay
+VC=/usr/local/etc/nvencvt.conf   # the --no-decoders line (other lines stay)
+if grep -qsF '# mickys overlay --no-decoders' "$VC"; then
+  grep -vF '# mickys overlay --no-decoders' "$VC" > "$VC.new" || true
+  if [ -s "$VC.new" ]; then cat "$VC.new" > "$VC"; rm -f "$VC.new"; else rm -f "$VC.new" "$VC"; fi
+fi
 ! grep -qs '^# nvenc-run (mickys overlay)' /usr/local/bin/nvenc-run || rm -f /usr/local/bin/nvenc-run
 BK=${1:-/Library/NullMoth/overlay-backup-latest}
 [ -f "$BK/NVMTLDriver" ] && [ -f "$BK/nvrm610.conf" ] || die "no overlay backup in $BK"
