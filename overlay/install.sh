@@ -136,10 +136,10 @@ else
 fi
 
 echo "== 6. decoders"
-# libnvencvt reads NVENCVT_* settings from $VC (root-owned, not writable by others): the overlay's line is marked;
-# other lines in the file are left alone
-if [ -f "$VC" ]; then grep -vF "$VMARK" "$VC" > "$VC.new" || true; else : > "$VC.new"; fi
-if [ $NODEC = 1 ] && [ "$NVENC" != off ]; then printf 'NVENCVT_NO_DEC=1  %s\n' "$VMARK" >> "$VC.new"; fi
+# libnvencvt reads NVENCVT_* settings from $VC (root-owned, not writable by others): the overlay's setting is the line
+# after its marker comment; other lines in the file are left alone
+if [ -f "$VC" ]; then awk -v m="$VMARK" 'skip { skip = 0; next } index($0, m) == 1 { skip = 1; next } { print }' "$VC" > "$VC.new"; else : > "$VC.new"; fi
+if [ $NODEC = 1 ] && [ "$NVENC" != off ]; then printf '%s (uninstall.sh removes this line and the next)\nNVENCVT_NO_DEC=1\n' "$VMARK" >> "$VC.new"; fi
 if [ -s "$VC.new" ]; then install -d -o root -g wheel -m 755 /usr/local/etc; chown root:wheel "$VC.new"; chmod 644 "$VC.new"; mv "$VC.new" "$VC"
 else rm -f "$VC.new" "$VC"; fi
 if [ "$NVENC" = off ]; then ok "no encoder, no decoders (--nvenc=off)"
@@ -147,7 +147,8 @@ elif [ $NODEC = 1 ]; then ok "hardware decoders off ($VC: NVENCVT_NO_DEC=1)"
 else ok "hardware decoders on (H.264, HEVC, VP9, AV1, MPEG-1/2, MPEG-4 Part 2; --no-decoders turns them off)"; fi
 
 echo
-if [ $ENCONLY = 1 ]; then echo "Done. Apps you open from now on get the encoders and decoders (quit and reopen running ones)."
+WHAT="the encoders and decoders"; [ $NODEC = 0 ] || WHAT="the encoders"
+if [ $ENCONLY = 1 ]; then echo "Done. Apps you open from now on get $WHAT (quit and reopen running ones)."
 else echo "Done. Log out and back in (or restart) so WindowServer and running apps load the new plugin."; fi
 [ "$NVENC" = off ] || echo "Command-line tools (ffmpeg, HandBrakeCLI, avconvert) see the encoder only through nvenc-run:   nvenc-run ffmpeg ...$([ $ALIASES = 1 ] || echo "   (sudo ./install.sh --cli-aliases does that for you in zsh/bash)")"
 echo "Undo: sudo $HERE/uninstall.sh   (backup: $BK)"

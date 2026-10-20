@@ -14,7 +14,7 @@ done
 rm -rf /usr/local/share/mickys-overlay
 VC=/usr/local/etc/nvencvt.conf   # the --no-decoders line (other lines stay)
 if grep -qsF '# mickys overlay --no-decoders' "$VC"; then
-  grep -vF '# mickys overlay --no-decoders' "$VC" > "$VC.new" || true
+  awk -v m='# mickys overlay --no-decoders' 'skip { skip = 0; next } index($0, m) == 1 { skip = 1; next } { print }' "$VC" > "$VC.new" || true
   if [ -s "$VC.new" ]; then cat "$VC.new" > "$VC"; rm -f "$VC.new"; else rm -f "$VC.new" "$VC"; fi
 fi
 ! grep -qs '^# nvenc-run (mickys overlay)' /usr/local/bin/nvenc-run || rm -f /usr/local/bin/nvenc-run
