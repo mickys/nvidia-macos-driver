@@ -38,15 +38,15 @@ the window's pages into video memory with the CPU. WindowServer lets go of the s
 are faulted in again for every upload, and for a large window most of the copy is page faults. This fork's plugin
 imports the locked pages as host memory and lets the GPU copy them (falling back to the CPU copy when they cannot be
 imported); the change is 48 lines on top of NullMoth's plugin, the same one proposed to NullMoth. Measured on an RTX 4090
-with NullMoth 2.3.7 (macOS 26.7.1, in a VM; the plugin change is the same on 2.4.3), Safari playing a CSS animation, 3 x 20
-s each:
+with NullMoth 2.4.3 (macOS 26.7.1, in a VM), Safari playing a CSS animation, 2 x 3 x 20 s each (stock and patched passes
+alternating; 2.3.7 gave the same):
 
 | window | plugin | screen updates/s (avg) | WindowServer CPU (user + system) | Safari's painting process |
 |---|---|---|---|---|
-| 3840x2110 (full screen, 4K) | NullMoth 2.3.7 | 20.9 | 73 % of a core | 441 % |
-| 3840x2110 (full screen, 4K) | `--desktop` | 34.3 (+64 %) | 56 % | 269 % |
-| 3200x1800 | NullMoth 2.3.7 | 40.5 | 57 % | 212 % |
-| 3200x1800 | `--desktop` | 40.9 | 54 % | 202 % |
+| 3840x2110 (full screen, 4K) | NullMoth 2.4.3 | 20.6 | 73 % of a core | 459 % |
+| 3840x2110 (full screen, 4K) | `--desktop` | 34.6 (+67 %) | 55 % | 255 % |
+| 3200x1800 | NullMoth 2.4.3 | 40.3 | 58 % | 215 % |
+| 3200x1800 | `--desktop` | 42.9 (+6 %) | 55 % | 198 % |
 
 Per upload of the full-screen window: 19.7 ms with the CPU copy, 7.7 ms from the imported pages. Worth it on a 4K (or
 larger) display with big Safari, Mail or other WebKit windows; with smaller windows NullMoth's plugin is as fast. It
