@@ -238,7 +238,8 @@ id<MTLCounterSet> nvmtl_timestamp_counter_set(void);
   uint64_t _useEp;
   BOOL _texSeen;
 } @end
-@interface NVMTLTexture () { @public NSString *_label; MTLResourceOptions _ropt; BOOL _shareable; BOOL _fbo;
+@interface NVMTLTexture () { @public int _tpA8;   // texture pool (fork): a plain 2D texture from newTextureWithDescriptor: = its a8 + 1
+    NSString *_label; MTLResourceOptions _ropt; BOOL _shareable; BOOL _fbo;
   MTLTextureSwizzleChannels _swz; BOOL _hasSwz; void *_swzView;
   void *_tbView, *_tbAlias; BOOL _tbStorage;
   int _resRefs;
