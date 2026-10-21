@@ -1618,8 +1618,10 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     void *surf = (r[0x14] == 0xc0 && cache) ? *(void *volatile *)((unsigned char *)cache + 0x10) : nullptr;
     if (nvSVDiag()) {
         volatile unsigned short *vd = *(unsigned short *volatile *)(r + 0x30);
-        ALOG("SVDIAG pageoff surface %u type 0x%x vm %d rm %d scanout %d valid0 %#x valid6 %#x", surf ? _ZNK9IOSurface12getSurfaceIDEv(surf) : 0u,
-             (unsigned)r[0x14], vm ? 1 : 0, (vm && vm->fRmHandle) ? 1 : 0, vm ? (int)vm->fScanout : -1, vd ? vd[0] : 0xffff, vd ? vd[6] : 0xffff);
+        char who[32] = { 0 }; proc_selfname(who, sizeof who);   // the page-off runs on the locking process's thread (fork: named)
+        ALOG("SVDIAG pageoff surface %u type 0x%x vm %d rm %d scanout %d valid0 %#x valid6 %#x bytes %llu by %s", surf ? _ZNK9IOSurface12getSurfaceIDEv(surf) : 0u,
+             (unsigned)r[0x14], vm ? 1 : 0, (vm && vm->fRmHandle) ? 1 : 0, vm ? (int)vm->fScanout : -1, vd ? vd[0] : 0xffff, vd ? vd[6] : 0xffff,
+             vm ? vm->fBytes : 0ull, who);
     }
     if (!surf || !vm || !vm->fRmHandle || vm->fScanout || !vm->fBytes || !nvAccelRmHandles(&h)) {
         IOAccelResource2::pageoff(ev, a1, out, a3);
