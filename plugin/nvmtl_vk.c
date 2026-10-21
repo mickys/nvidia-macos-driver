@@ -6300,12 +6300,14 @@ int nvmtl_vk_buffer_fill_from_surface_async(nvk_queue *q, nvk_buffer *dst, const
     nvmtl_asyncup *au = (nvmtl_asyncup *)calloc(1, sizeof *au);
     if (!au) return -1;
     if (nvmtl_vk_buffer_import_host((void *)base, (bytes + g_host_align - 1) & ~(g_host_align - 1), &au->stage)) { free(au); return nvmtl_vk_buffer_fill_from_surface(q, dst, base, bytes); }
-    nvk_cmdbuf c;
-    if (nvmtl_vk_cmd_begin(q, &c)) { nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
-    if (nvmtl_vk_cmd_copy_buffer(&c, &au->stage, 0, dst, 0, bytes)) { nvmtl_vk_cmd_abandon(&c); nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
+    // the command buffer lives in the record: the in-flight entry refers to it until the fill is retired (a stack-local one
+    // crashed WindowServer in nvmtl_cmd_retire when a texture's dealloc finished the fill)
+    nvk_cmdbuf *c = &au->cb;
+    if (nvmtl_vk_cmd_begin(q, c)) { nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
+    if (nvmtl_vk_cmd_copy_buffer(c, &au->stage, 0, dst, 0, bytes)) { nvmtl_vk_cmd_abandon(c); nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
     VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
-    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    if (nvmtl_vk_submit_begin_at(&c, &au->infl, "multi-plane surface upload (deferred)")) { nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    if (nvmtl_vk_submit_begin_at(c, &au->infl, "multi-plane surface upload (deferred)")) { nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
     nvmtl_asyncup_store(holder, (uint64_t)(uintptr_t)au);
     return 0;
 }
