@@ -6268,6 +6268,33 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
 // kernel pages the whole allocation off, so every byte of it has to be current before any plane is marked newer).
 // From the surface's own pages when they can be imported (the copy engine reads them), else through a staging buffer.
 // The caller holds the surface lock.
+// Does a family VRAM buffer still hold what the IOSurface's pages hold (fork)? 512 chunks of 32 bytes spread over the
+// allocation are read back in one small copy (~16 KB, one fence wait) and compared with the pages. A surface another process
+// locks for writing every frame without writing (Parsec: its NV12 capture frames) moves its seed exactly like a CPU write,
+// and the driver had to upload the whole surface before WindowServer's next composite: 3 MB and a fence wait on
+// WindowServer's main thread per captured frame. After the kernel's page-off the pages equal the VRAM copy unless the CPU
+// wrote; a writer that touches none of the sampled bytes would keep stale pixels, which no real writer does.
+// 1 = identical (the VRAM copy is current), 0 = different or not checked.
+int nvmtl_vk_buffer_matches_pages(nvk_queue *q, nvk_buffer *src, const void *pages, size_t bytes)
+{
+    enum { N = 512, CH = 32 };
+    if (!src || !src->buf || !pages || bytes < (size_t)N * CH || bytes > src->size) return 0;
+    nvk_buffer stage;
+    if (nvmtl_vk_stage(q, (size_t)N * CH, &stage) || !stage.map) return 0;
+    VkBufferCopy rg[N]; const size_t step = bytes / N;
+    for (int i = 0; i < N; i++) {
+        size_t off = ((size_t)i * step + step / 2) & ~(size_t)(CH - 1);
+        if (off + CH > bytes) off = bytes - CH;
+        rg[i] = (VkBufferCopy){ off, (VkDeviceSize)i * CH, CH };
+    }
+    nvk_cmdbuf c;
+    if (nvmtl_vk_cmd_begin(q, &c)) return 0;
+    pvkCmdCopyBuffer(c.cb, (VkBuffer)src->buf, (VkBuffer)stage.buf, N, rg);
+    if (nvmtl_vk_submit_wait(&c)) return 0;
+    for (int i = 0; i < N; i++)
+        if (memcmp((const uint8_t *)stage.map + (size_t)i * CH, (const uint8_t *)pages + rg[i].srcOffset, CH)) return 0;
+    return 1;
+}
 int nvmtl_vk_buffer_fill_from_surface(nvk_queue *q, nvk_buffer *dst, const void *base, size_t bytes)
 {
     if (!dst || !dst->buf || !base || !bytes || bytes > dst->size) return -1;

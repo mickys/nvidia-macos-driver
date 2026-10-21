@@ -215,6 +215,7 @@ int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_byt
 int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
 int  nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes);
 int  nvmtl_vk_buffer_fill_from_surface(nvk_queue *q, nvk_buffer *dst, const void *base, size_t bytes);
+int  nvmtl_vk_buffer_matches_pages(nvk_queue *q, nvk_buffer *src, const void *pages, size_t bytes);
 int  nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
 int  nvmtl_vk_image_create_mips(uint32_t w, uint32_t h, int bgra, uint32_t mips, nvk_image *out);
 int  nvmtl_vk_image_create_ex(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, nvk_image *out);

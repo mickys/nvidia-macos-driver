@@ -1256,6 +1256,14 @@ static bool nvmtl_surfin_import(void) {
     if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = !(u && !strcmp(u, "cpu")); }
     return on;
 }
+// NVMTL_SURFIN_VERIFY=0: never compare a two-plane surface's VRAM copy with its pages before uploading it (fork)
+static int nvmtl_surfin_verify(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURFIN_VERIFY"); on = !(e && e[0] == '0');
+                  nvlog("two-plane surface-in: %s (NVMTL_SURFIN_VERIFY=%s)", on ? "upload skipped when sampled VRAM == pages" : "always uploaded after a seed move", e ?: "unset"); }
+    return on;
+}
+static unsigned long long g_surfin_verified;
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return;
@@ -1279,6 +1287,15 @@ static bool nvmtl_surfin_import(void) {
     if (r->_vramMulti) {   // multi-plane in family VRAM (fork): the whole allocation, all planes, in one copy
         uint32_t seed = 0;
         if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("multi-plane surface-in: IOSurfaceLock FAILED"); return; }
+        // a surface we drew before whose seed moved: compare samples of the VRAM copy with the pages first; identical means the
+        // lock that moved the seed wrote nothing (Parsec locks its capture frames for writing every frame) and the upload is skipped
+        if (nvmtl_surfin_verify() && nvmtl_vram_gen(r->_surf, 0) &&
+            nvmtl_vk_buffer_matches_pages(r->_q, &r->_vramBuf, IOSurfaceGetBaseAddress(r->_surf), IOSurfaceGetAllocSize(r->_surf))) {
+            IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
+            r->_surfSeed = seed; r->_surfSynced = YES; g_surfin_verified++; nvmtl_vram_tag_set(r->_surf, 0, seed);
+            static unsigned nv; if (nv++ < 6 || nv % 2000 == 0) nvlog("multi-plane surface-in SKIPPED, VRAM copy verified against the pages (surface %u seed %u): %llu so far", (unsigned)IOSurfaceGetID(r->_surf), seed, g_surfin_verified);
+            return;
+        }
         const int rc = nvmtl_vk_buffer_fill_from_surface(r->_q, &r->_vramBuf, IOSurfaceGetBaseAddress(r->_surf), IOSurfaceGetAllocSize(r->_surf));
         IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
         if (rc) { nvlog("multi-plane surface-in: upload FAILED (surface %u) - retried at the next use", (unsigned)IOSurfaceGetID(r->_surf)); return; }
