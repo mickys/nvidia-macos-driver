@@ -6289,6 +6289,7 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
 int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
+    nvmtl_vk_image_upload_barrier(img);   // a deferred CPU upload (#96) still pending on the image must not land after this one
     // bufferRowLength counts texels, so the row pitch has to be a whole number of them
     if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
     if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
