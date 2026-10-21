@@ -1727,6 +1727,19 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
 static IOLock *volatile gNVSVStageLock;
 static IOBufferMemoryDescriptor *gNVSVStageBuf;
 static unsigned gNVSVStaged, gNVSVStageNoBuf, gNVSVStageBackoff;
+// Page-off order (fork). NullMoth's order: the copy engine copies VRAM into one physically contiguous staging buffer, then
+// the CPU copies that into the surface's pages (8 MB: ~1.3 ms CE + ~0.8 ms CPU on the GTX 1650), all with the accelerator
+// lock held, which every other GPU client's kernel call (VRAM imports, dirty marks) then waits on. The copy engine can write
+// the surface's own pages (runs of contiguous ones coalesced, the per-page descriptor otherwise); that path was the fallback
+// and is now tried first. debug.nvaccel_pageoff_direct=0 restores the staging order. Per path: count and microseconds.
+static int gPageoffDirect = 1;
+static SInt64 gPageoffDirectN, gPageoffDirectUs, gPageoffStagedN, gPageoffStagedUs, gPageoffDirectFail;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gPageoffDirect, 0, "1 = the copy engine writes the surface's pages directly (fork); 0 = contiguous staging buffer + CPU copy (NullMoth's order)");
+NVACCEL_CNT(nvaccel_pageoff_direct_n,    gPageoffDirectN,    "page-offs copied directly into the surface's pages");
+NVACCEL_CNT(nvaccel_pageoff_direct_us,   gPageoffDirectUs,   "microseconds those took on the copy engine");
+NVACCEL_CNT(nvaccel_pageoff_direct_fail, gPageoffDirectFail, "direct page-offs that failed and fell back to the staging buffer");
+NVACCEL_CNT(nvaccel_pageoff_staged_n,    gPageoffStagedN,    "page-offs through the staging buffer");
+NVACCEL_CNT(nvaccel_pageoff_staged_us,   gPageoffStagedUs,   "microseconds those took (copy engine + CPU copy)");
 static IOLock *nvSVStageLock(void)
 {
     if (!gNVSVStageLock) {
@@ -1785,7 +1798,33 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     if (len > vm->fBytes) len = vm->fBytes;
     unsigned long long pages = (len + 4095) >> 12;
     bool ok = false; unsigned st = NVRM_SS_OFF; unsigned long long usec = 0, cpuUs = 0;
-    bool staged = false;
+    bool staged = false, direct = false;
+    // the direct copy: the copy engine writes the surface's wired pages (see gPageoffDirect)
+    auto directCopy = [&]() {
+        unsigned long long *pa = pages ? (unsigned long long *)IOMalloc(pages * sizeof *pa) : nullptr;
+        if (!pa) return;
+        unsigned long long i = 0;
+        for (IOByteCount off = 0; i < pages; ) {
+            IOByteCount seglen = 0;
+            addr64_t phys = md->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
+            if (!phys || !seglen) break;
+            for (IOByteCount k = 0; k < seglen && i < pages; k += 4096, off += 4096) pa[i++] = phys + k;
+        }
+        if (i == pages) {
+            struct NVRMSurfPageoff q; nvSVZero(&q, sizeof q);
+            q.version = NVRM_SS_RM_VERSION; q.status = NVRM_SS_OFF; q.kapiDevice = h.kapiDevice; q.kapiMemory = vm->fRmHandle;
+            q.pages = pa; q.pageCount = pages; q.length = len;
+            IOService *nvrm = nvAccelNVRM();
+            const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
+            if (nvrm && sym) nvrm->callPlatformFunction(sym, false, &q, nullptr, nullptr, nullptr);
+            if (sym) sym->release();
+            st = q.status; usec = q.usec; ok = st == 0; direct = true;
+            if (st == 0x65u) mayUnwire = false;
+        }
+        IOFree(pa, pages * sizeof *pa);
+    };
+    if (gPageoffDirect) { directCopy(); if (!ok) OSAddAtomic64(1, &gPageoffDirectFail); }
+    if (!ok && mayUnwire) {
     if (IOLock *lk = nvSVStageLock()) {
         IOLockLock(lk);
         IOBufferMemoryDescriptor *sb = nvSVStage(len);
@@ -1818,28 +1857,10 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
         }
         IOLockUnlock(lk);
     }
-    unsigned long long *pa = (!staged && pages) ? (unsigned long long *)IOMalloc(pages * sizeof *pa) : nullptr;
-    if (pa) {
-        unsigned long long i = 0;
-        for (IOByteCount off = 0; i < pages; ) {
-            IOByteCount seglen = 0;
-            addr64_t phys = md->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
-            if (!phys || !seglen) break;
-            for (IOByteCount k = 0; k < seglen && i < pages; k += 4096, off += 4096) pa[i++] = phys + k;
-        }
-        if (i == pages) {
-            struct NVRMSurfPageoff q; nvSVZero(&q, sizeof q);
-            q.version = NVRM_SS_RM_VERSION; q.status = NVRM_SS_OFF; q.kapiDevice = h.kapiDevice; q.kapiMemory = vm->fRmHandle;
-            q.pages = pa; q.pageCount = pages; q.length = len;
-            IOService *nvrm = nvAccelNVRM();
-            const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
-            if (nvrm && sym) nvrm->callPlatformFunction(sym, false, &q, nullptr, nullptr, nullptr);
-            if (sym) sym->release();
-            st = q.status; usec = q.usec; ok = st == 0;
-            if (st == 0x65u) mayUnwire = false;
-        }
-        IOFree(pa, pages * sizeof *pa);
     }
+    if (!ok && !staged && !direct && mayUnwire) directCopy();   // NullMoth's fallback when no staging buffer could be had
+    if (ok) { if (direct && !staged) { OSAddAtomic64(1, &gPageoffDirectN); OSAddAtomic64((SInt64)usec, &gPageoffDirectUs); }
+              else { OSAddAtomic64(1, &gPageoffStagedN); OSAddAtomic64((SInt64)(usec + cpuUs), &gPageoffStagedUs); } }
     if (mayUnwire) md->complete(kIODirectionNone);
     else ALOG("surfvram pageoff: res %p CE copy TIMED OUT -- surface pages stay wired (%llu B)", this, len);
     if (ok) {
@@ -1851,7 +1872,7 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     if (out) *out = ok;
     if (gNVSVPageoff + gNVSVPageoffFail <= 8 || ((gNVSVPageoff + gNVSVPageoffFail) & 1023) == 0)
         ALOG("surfvram pageoff: res %p %llu B on the copy engine -> %#x in %llu us%s + cpu %llu us (ok %u, failed %u, staged %u)",
-             this, len, st, usec, staged ? " (staged)" : " (per page)", cpuUs, gNVSVPageoff, gNVSVPageoffFail, gNVSVStaged);
+             this, len, st, usec, staged ? " (staged)" : direct ? " (direct)" : " (per page)", cpuUs, gNVSVPageoff, gNVSVPageoffFail, gNVSVStaged);
 }
 
 static IOSurface *gIopFlipFront[kNvMaxFB], *gIopFlipPrev[kNvMaxFB];
