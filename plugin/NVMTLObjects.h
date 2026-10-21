@@ -46,6 +46,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   uint32_t _baseSlice, _baseLevel;
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
   nvk_buffer _vramBuf; BOOL _vramOn;
+  BOOL _vramMulti;   // fork: one plane of a multi-plane surface aliased in the whole surface's family VRAM (kernel / tag state: plane 0)
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;

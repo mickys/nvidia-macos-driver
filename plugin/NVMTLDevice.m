@@ -1086,9 +1086,41 @@ static int nvmtl_ic_put(nvk_buffer *b)
     return found;
 }
 
+// NVMTL_SURF_MULTIPLANE=0: multi-plane surfaces keep private images per plane (copied in and out)
+static int nvmtl_mp_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_MULTIPLANE"); on = !(e && e[0] == '0');
+                  nvlog("multi-plane IOSurfaces %s (NVMTL_SURF_MULTIPLANE=%s)", on ? "share the family VRAM" : "use private images", e ?: "unset"); }
+    return on;
+}
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
+    if (surf && IOSurfaceGetPlaneCount(surf) > 1 && plane < IOSurfaceGetPlaneCount(surf) && nvmtl_vk_surface_share_on() && nvmtl_mp_on()) {
+        // Multi-plane surface (fork): plane 0's family VRAM mirrors the whole IOSurface allocation (checked: NV12 1080p /
+        // 4K / 720p import with the allocation size), and the kernel pages the whole allocation off. Each plane's image is
+        // a linear alias at the plane's offset and pitch in one import of the whole surface; kernel marks and VRAM tags
+        // use plane 0, and the whole allocation is uploaded at once (nvmtl_mp_upload) so VRAM never holds a stale plane.
+        const size_t alloc = IOSurfaceGetAllocSize(surf), prow = IOSurfaceGetBytesPerRowOfPlane(surf, plane);
+        const size_t off = (size_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(surf, plane) - (uint8_t *)IOSurfaceGetBaseAddress(surf));
+        if ((size_t)w * (bpp ? bpp : 4) <= prow && h <= IOSurfaceGetHeightOfPlane(surf, plane) && prow % 32 == 0 && off % 32 == 0
+            && off + prow * (h - 1) + (size_t)w * (bpp ? bpp : 4) <= alloc) {
+            nvk_buffer vb;
+            if (!nvmtl_ic_get(surf, alloc, &vb)) {
+                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, off, prow, &t->_i)) {
+                    t->_vramBuf = vb; t->_vramOn = YES; t->_vramMulti = YES; g_surf_vram++;
+                    uint32_t seed = IOSurfaceGetSeed(surf);
+                    if (nvmtl_vram_tag_current(surf, 0, seed)) { t->_surfSeed = seed; t->_surfSynced = YES; }
+                    static unsigned n; if (n++ < 8 || n % 2000 == 0)
+                        nvlog("multi-plane: surface %u plane %lu %ux%u at %zu pitch %zu -> the family's VRAM (%zu B surface)", (unsigned)IOSurfaceGetID(surf),
+                              (unsigned long)plane, w, h, off, prow, alloc);
+                    return 0;
+                }
+                if (!nvmtl_ic_put(&vb)) nvmtl_vk_buffer_destroy(&vb);
+            }
+        }
+    }
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
