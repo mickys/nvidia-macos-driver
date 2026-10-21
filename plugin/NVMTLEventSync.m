@@ -115,7 +115,7 @@ static BOOL nvmtl_ws_surface_wait(void) {
 }
 // What one WindowServer command buffer holds: the surfaces it marked pending in the kernel, and the textures whose shared
 // VRAM its commit marked newest. early is fixed at commit (nvmtl_ws_surface_wait): the marks are released part by part.
-@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early; } @end
+@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early, marked; } @end
 @implementation NVMTLSurfaceHolds @end
 // A texture whose part has landed while its surface is still held, published by the holder that releases it last.
 // dirtied: the commit marked its VRAM newest, so publication is bookkeeping only (nvmtlSurfaceOutDirtied:).
@@ -191,6 +191,29 @@ static BOOL nvmtl_ws_publish_settled(NSArray *settled, NVMTLCommandBuffer *cb) {
 // (nvmtl_surface_register_writes): a record stamped before the move matched nothing, every frame's read of the surface
 // still in flight took the CPU path (page-off, wait, 8 MB upload) on the compositor's thread, and a 144 Hz desktop ran
 // at 90 frames a second.
+// The kernel pending marks go in when the command buffer is submitted, not at commit. A page-off (a reader's
+// IOSurfaceLock) waits for a pending mark with the accelerator lock held, and WindowServer's submission needs that lock:
+// marked at commit, a surface whose work the execution worker had not submitted yet stalled every WindowServer kernel
+// call until the kernel's 100 ms bound (debug.nvaccel_surface_gpu_timeouts), seen as ~100 ms gaps between a capture
+// surface's commit and its GPU work, 1-7 per 20 s screen recording and 45-67 in the bad ones, with the GPU idle. The
+// holds are still counted at commit; the marks are set on the submitting thread just before it signals "scheduled",
+// so WindowServer's swap after commitAndWaitUntilSubmitted still finds them, and a page-off then only ever waits for
+// work the GPU already has. NVMTL_WS_MARK_AT=commit restores the old order.
+static BOOL nvmtl_ws_mark_at_submit(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_WS_MARK_AT"); on = !(e && !strcmp(e, "commit"));
+        nvlog("WindowServer pending marks: at %s (NVMTL_WS_MARK_AT=%s)", on ? "submission" : "commit", e ? e : "unset"); }
+    return on;
+}
+static void nvmtl_ws_mark_submitted(NVMTLCommandBuffer *cb) {
+    NVMTLSurfaceHolds *holds = objc_getAssociatedObject(cb, nvmtl_ws_marks_key);
+    if (!holds || holds->marked) return;
+    @synchronized (nvmtl_ws_lock()) {
+        if (holds->marked) return;
+        holds->marked = YES;
+        for (NSNumber *n in holds->ids) if ([nvmtl_ws_pending_holds countForObject:n]) nvmtl_ws_mark(n.unsignedIntValue, YES);
+    }
+}
 static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
     if (!nvmtl_ws_kernel_waits()) return;
     NSMutableSet *ids = nil;
@@ -213,9 +236,10 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
         }
         holds->dirtied = dirtied;
     }
+    holds->marked = !nvmtl_ws_mark_at_submit();
     @synchronized (nvmtl_ws_lock()) {
         if (!nvmtl_ws_pending_holds) nvmtl_ws_pending_holds = [NSCountedSet new];
-        for (NSNumber *n in ids) { [nvmtl_ws_pending_holds addObject:n]; nvmtl_ws_mark(n.unsignedIntValue, YES); }
+        for (NSNumber *n in ids) { [nvmtl_ws_pending_holds addObject:n]; if (holds->marked) nvmtl_ws_mark(n.unsignedIntValue, YES); }
     }
     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, holds, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -451,6 +475,7 @@ static int nvmtl_skip_empty_on(void) {
 }
 - (void)nvmtlMarkScheduled {
     if (_scheduleAfterPublish) return;
+    if (!_wasScheduled) nvmtl_ws_mark_submitted(self);   // before anyone waiting for "scheduled" (WindowServer's swap) runs
     [_completionCondition lock];
     if (!_wasScheduled) {
         _wasScheduled = YES; _cbstatus = MTLCommandBufferStatusScheduled;
