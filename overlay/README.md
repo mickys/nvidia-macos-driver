@@ -84,11 +84,29 @@ Since 2.4.3-mickys.7 the `--desktop` build also has:
   which was waiting for that lock. Nothing moved until the kernel's 100 ms safety bound ran out, a few times every
   10 seconds: the stream stopped for a moment and then jumped ahead. The plugin now sends these reports on a connection
   of its own.
-- **Upstream PR #96 (rebased onto 2.4.3), opt-in:** a CPU surface upload no longer waits for the GPU copy before the
-  next one starts (two staging slots; the pending upload is finished before the image is read, uploaded again, moved or
-  freed). `NVMTL_ASYNC_SURFIN=2` in `nvrm610.conf` turns it on (log out and in). It is off by default: on top of the GPU
-  upload it measured no gain, and during testing WindowServer once switched its GPU backend off (a failed completion
-  check right before a CPU-path upload, with Screen Sharing and a capture running), which ends the session.
+- **Upstream PR #96 (rebased onto 2.4.3):** a CPU surface upload no longer waits for the GPU copy before the next one
+  starts (two staging slots; the pending upload is finished before the image is read, uploaded again, moved or freed).
+  Opt-in in 2.4.3-mickys.7, on by default since 2.4.3-mickys.8; `NVMTL_ASYNC_SURFIN=0` in `nvrm610.conf` turns it off.
+
+Since 2.4.3-mickys.8 the `--desktop` build also has:
+
+- **Captured frames are current.** WindowServer hands a ScreenCaptureKit client (Parsec, OBS) its frame as soon as the
+  GPU work for it is scheduled, and relies on the client's CPU lock to wait for the GPU, as it does on Apple's drivers.
+  NullMoth's plugin draws two-plane (NV12) capture surfaces into a private image and copies them out after the GPU has
+  finished, and the lock did not wait for that copy: Parsec's encoder read the surface about 1 ms after WindowServer's
+  commit and before the copy-out, so it encoded the previous capture, and now and then the new one, which showed as a
+  frame jumping back in the stream. Two changes, each enough on its own: such a command buffer now counts as scheduled
+  only after its copy-out (`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0` turns it off), and two-plane surfaces now share their
+  VRAM with other processes like single-plane ones, so a CPU lock waits in the kernel (`NVMTL_SURF_MULTIPLANE=0` turns it
+  off).
+- **VRAM dirty marks on a connection of their own** (like the completion marks since 2.4.3-mickys.7), so a mark waiting
+  for the accelerator lock no longer holds up NVK's own kernel calls. With shared two-plane surfaces that wait had
+  brought back 100 ms freezes.
+- **IOSurfaces count as in use while GPU work uses them**, as on Apple's drivers (surface pools reuse only surfaces not in
+  use).
+- Parsec on a GTX 1650 at 1080p / 165 Hz now streams 50-58 fps of current frames (2.4.3-mickys.7: 80 fps, but most
+  frames one capture old and an occasional frame out of order); no freezes, encode latency 3 ms. The frame rate is lower
+  because WindowServer now finishes each captured frame before the client reads it, as on a Mac.
 
 Measured on a GTX 1650 (NullMoth 2.4.3, macOS 26.7.1), 1920x1080 at 165 Hz:
 
