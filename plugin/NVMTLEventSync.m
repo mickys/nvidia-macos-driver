@@ -647,7 +647,6 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
         nvmtl_inflight *f = nvmtl_vk_inflight_new();
         if (!f) return NO;
         for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
-        [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
         const int r = nvmtl_vk_submit_begin(&part->commands, f);
         _nextSubmit++;
@@ -656,6 +655,10 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
             part->aheadFailed = r;
             return NO;
         }
+        // scheduled after the submit's kernel call has returned: WindowServer's pending marks go in here
+        // (nvmtl_ws_mark_submitted), and a page-off waiting for one with the accelerator lock held must never find the
+        // work still on this side of that call
+        [self nvmtlMarkScheduled];
         part->inflight = f;
         nvmtl_evfold_promise_part(part);
         const unsigned long long n = atomic_fetch_add(&gsub_inflight, 1) + 1;
@@ -710,15 +713,17 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (!k || ((k + 1) & 0xFFF) == 0) nvlog("commit: %llu empty submission parts NOT submitted (no encoder, no resources) - each WAS a full submit + wait", k + 1);
     }
     if (part->commands.cb || ahead) {
-        [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
         int result;
-        if (part->inflight) result = nvmtl_gsub_finish(part);
-        else if (part->aheadFailed) result = part->aheadFailed;
+        if (part->inflight) { [self nvmtlMarkScheduled]; result = nvmtl_gsub_finish(part); }
+        else if (part->aheadFailed) { [self nvmtlMarkScheduled]; result = part->aheadFailed; }
         else {
             nvmtl_prepare_submission_copies(part);
             for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
-            result = nvmtl_vk_submit_wait(&part->commands);
+            nvmtl_inflight f;
+            result = nvmtl_vk_submit_begin(&part->commands, &f);
+            if (result == 0) { [self nvmtlMarkScheduled]; result = nvmtl_vk_submit_finish(&f); }   // scheduled after the kernel submit, as in the ahead pass
+            else [self nvmtlMarkScheduled];
         }
         if (result == -2) {
             if (!nvmtl_quarantined_parts) nvmtl_quarantined_parts = [NSMutableArray new];
