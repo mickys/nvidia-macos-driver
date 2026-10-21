@@ -6204,6 +6204,42 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
     nvmtl_vk_buffer_destroy(&hb);
     return rc;
 }
+// Surface-out into the IOSurface's own pages (fork). nvmtl_vk_image_read copies the image into a staging buffer, waits,
+// then copies it into the surface with the CPU. Importing the locked pages as host memory lets the copy engine write the
+// surface directly: no staging copy, no CPU pass (screen-capture NV12 planes: every frame, both planes). A plane that
+// does not start on an import boundary (NV12's second plane) is imported from the boundary below it, the copy starting at
+// the difference. The caller holds the surface lock (read-write) across the call; the import is released before it
+// returns. Non-zero when the pages cannot be imported; the caller then uses nvmtl_vk_image_read.
+int nvmtl_vk_image_read_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes)
+{
+    nvmtl_vk_image_upload_barrier(img);   // a readback must observe a pending async upload: finish it first
+    const size_t bpp = img->bpp ? img->bpp : 4;
+    if (!g_host_align || img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
+    const uintptr_t b = (uintptr_t)base, a = b & ~(uintptr_t)(g_host_align - 1);
+    const size_t lead = (size_t)(b - a);
+    if (lead % bpp || lead % 4) return -1;
+    if ((size_t)img->h * row_bytes > bytes) return -1;
+    const size_t span = (lead + bytes + g_host_align - 1) & ~(g_host_align - 1);
+    nvk_buffer hb;
+    if (nvmtl_vk_buffer_import_host((void *)a, span, &hb)) return -1;
+    nvk_cmdbuf c;
+    if (nvmtl_vk_cmd_begin(q, &c)) { nvmtl_vk_buffer_destroy(&hb); return -1; }
+    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
+    VkImageMemoryBarrier toSrc = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+        VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        (VkImageLayout)img->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toSrc);
+    img->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkBufferImageCopy bic = { lead, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+    pvkCmdCopyImageToBuffer(c.cb, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkBuffer)hb.buf, 1, &bic);
+    VkBufferMemoryBarrier toHost = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkBuffer)hb.buf, 0, VK_WHOLE_SIZE };
+    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &toHost, 0, NULL);
+    const int rc = nvmtl_vk_submit_wait_at(&c, "surface readback (imported pages)");
+    nvmtl_vk_buffer_destroy(&hb);
+    return rc;
+}
 int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
