@@ -319,9 +319,20 @@ static int nvmtl_skip_empty_on(void) {
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
-    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
+    // A surface whose VRAM is shared is covered by the kernel (a CPU lock's page-off waits for the pending write); one we
+    // write through a private image is copied out only after the GPU has finished, and a CPU lock does not wait for that.
+    // WindowServer hands ScreenCaptureKit clients their frame once its command buffer is scheduled (Apple's IOSurfaceLock
+    // waits for the GPU): Parsec's encoder read the two-plane NV12 capture surface ~1 ms after the commit and before the
+    // copy-out, so it encoded the surface's previous frame, and now and then the new one when the copy-out won the race
+    // (a counter in the stream read N-1, N+1, N). Such a command buffer reports "scheduled" once its writes are published.
+    // NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1 does it for every surface write, =0 for none.
+    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && *e ? e[0] - '0' : 2; }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
-    for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
+    for (NVMTLTexture *s in part->surfaces) {
+        if (s == drawable || !after) continue;
+        NVMTLTexture *r = s->_parent ? s->_parent : s;
+        if (after == 1 || (r->_surf && !r->_vramOn)) _scheduleAfterPublish = YES;
+    }
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
     part->encoders = _nEnc - _nEncSealed; _nEncSealed = _nEnc;
     if (_g79Sig.count) { part->signals = [_g79Sig copy]; [_g79Sig removeAllObjects]; }
