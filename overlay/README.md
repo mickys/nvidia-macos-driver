@@ -98,6 +98,11 @@ sudo nvfb-edid add 1920x1080@144 2560x1440@120    # up to 6 extra timings (CVT r
 sudo nvfb-edid remove                             # the display's own EDID again; restart
 ```
 
+Measured on a GTX 1650 with a 4K HDMI dummy plug (NullMoth 2.4.3, macOS 26.7.1): NullMoth's framebuffer lists 9 timings,
+all 4K (smaller desktops only as scaled modes, which NVKMS refuses on that raster); with `--resolution` 35 (1080p, 1440p,
+720p and the other sizes in the plug's EDID), and 41 with an override adding 1080p at 120 / 144 / 165 / 240 Hz and 1440p at
+120 / 144 Hz; 1080p at 144 Hz set and shown.
+
 Add only timings the display can show: a real monitor may stay black on one it does not support (remove the file over
 SSH or from safe mode to recover). Overrides are refused unless root-owned and not writable by others, valid, and for the
 same vendor and product as the display. Changing the framebuffer rebuilds the Auxiliary Kernel Collection (as NullMoth's
