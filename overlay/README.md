@@ -131,6 +131,13 @@ SSH or from safe mode to recover). Overrides are refused unless root-owned and n
 same vendor and product as the display. Changing the framebuffer rebuilds the Auxiliary Kernel Collection (as NullMoth's
 installer does) and needs a restart.
 
+**Optional, `--event-wait`: less CPU while apps wait for the GPU.** NullMoth's plugin lets ordinary apps poll for GPU
+completion (WindowServer already waits for an event). `--event-wait` writes `NVRM_EVENT_WAIT=1` into `nvrm610.conf`, a
+setting NullMoth's driver has (its `docs/EVENT-WAIT.md`), so apps sleep until the GPU signals. Measured on a GTX 1650: a
+full-screen Metal animation keeps its frame rate with 15 % less CPU; NullMoth's probe uses 79 % less CPU in a compute loop
+and 29 % less in a Core Image blur, while the synchronous elapsed time grows by 2-4 %. Apps opened afterwards use it;
+`sudo ./install.sh` without it (or `uninstall.sh`) removes the line again.
+
 ## Requirements
 
 - NullMoth's driver **2.4.3** installed and running. The installer refuses anything else: it checks NullMoth's version
@@ -153,6 +160,7 @@ sudo ./install.sh --desktop            # also this fork's plugin build (see "Wha
 sudo ./install.sh --desktop --nvenc=off  # the plugin build only, no encoder
 sudo ./install.sh --resolution         # also this fork's framebuffer build: smaller desktops, EDID overrides (restart)
 sudo ./install.sh --desktop --resolution  # both
+sudo ./install.sh --event-wait         # apps wait for the GPU with an event instead of polling (any combination)
 ```
 
 Each run installs exactly the parts named: running `sudo ./install.sh` again without `--desktop` or `--resolution` puts

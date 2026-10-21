@@ -2,8 +2,10 @@
 # Install the mickys overlay on top of NullMoth's NVIDIA driver: adds the open-source encoder libnvencvt.dylib next to
 # NullMoth's Metal plugin in /Library/GPUBundles/NVMTLDriver.bundle, which loads it by itself since 2.3.7
 # (NVMTL_NVENCVT in nvrm610.conf). NullMoth's files stay as they are.
-#   sudo ./install.sh [--desktop] [--resolution] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases] [--no-decoders]
+#   sudo ./install.sh [--desktop] [--resolution] [--event-wait] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases] [--no-decoders]
 #     --desktop      also replace the plugin binary with this fork's build (CPU-drawn windows uploaded by the GPU)
+#     --event-wait   apps wait for GPU work with an event instead of polling (NVRM_EVENT_WAIT=1 in nvrm610.conf): less CPU,
+#                    slightly more latency in synchronous work; WindowServer already waits this way
 #     --resolution   also replace the framebuffer kext's binary (NVRMFB) with this fork's build: desktop sizes below the
 #                    boot screen's (/Library/NullMoth/nvfb-small) and EDID overrides for more modes (nvfb-edid); restart
 # Each run installs exactly the parts asked for: running it again without --desktop or --resolution puts NullMoth's own
@@ -18,10 +20,11 @@
 # Undo: sudo ./uninstall.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-NVENC=1; ALIASES=0; ENCONLY=1; NODEC=0; RES=0
+NVENC=1; ALIASES=0; ENCONLY=1; NODEC=0; RES=0; EVW=0
 for a in "$@"; do case $a in
   --desktop) ENCONLY=0 ;;
   --resolution) RES=1 ;;
+  --event-wait) EVW=1 ;;
   --encoder-only) ENCONLY=1 ;;   # the default since 2.3.7-2; kept so older instructions still work
   --nvenc=*) NVENC=${a#--nvenc=} ;;
   --cli-aliases) ALIASES=1 ;;
@@ -33,7 +36,7 @@ ok() { echo "   ok  $*"; }
 [ "$(id -u)" = 0 ] || die "run with sudo"
 case $NVENC in off|1) ;; *) [[ $NVENC =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] || die "--nvenc: process names separated by commas, 1 or off" ;; esac
 [ "$NVENC" != off ] || [ $ALIASES = 0 ] || die "--cli-aliases needs the encoder (not --nvenc=off)"
-[ "$NVENC" != off ] || [ $ENCONLY = 0 ] || [ $RES = 1 ] || die "--nvenc=off without --desktop or --resolution would install nothing"
+[ "$NVENC" != off ] || [ $ENCONLY = 0 ] || [ $RES = 1 ] || [ $EVW = 1 ] || die "--nvenc=off without --desktop, --resolution or --event-wait would install nothing"
 
 OV=$(cat "$HERE/VERSION")
 B=/Library/GPUBundles/NVMTLDriver.bundle; X=$B/Contents/MacOS; C=/Library/GPUBundles/nvmtl/nvrm610.conf
@@ -153,12 +156,14 @@ if [ $RES = 1 ]; then ok "NVRMFB from this fork (smaller desktop sizes; EDID ove
 else ok "NullMoth's NVRMFB$([ $FBCHANGED = 1 ] && echo " put back, kernel collection rebuilt")"; fi
 
 echo "== 4. settings (nvrm610.conf)"
-grep -v -E '^NVMTL_NVENCVT=|^# mickys overlay' "$C" > "$C.new" || true
-PARTS=encoder; [ "$NVENC" != off ] || PARTS=; [ $ENCONLY = 1 ] || PARTS="$PARTS desktop"; [ $RES = 0 ] || PARTS="$PARTS resolution"
+EMARK='# mickys overlay --event-wait'
+awk -v m="$EMARK" 'skip { skip = 0; next } index($0, m) == 1 { skip = 1; next } { print }' "$C" | grep -v -E '^NVMTL_NVENCVT=|^# mickys overlay' > "$C.new" || true
+PARTS=encoder; [ "$NVENC" != off ] || PARTS=; [ $ENCONLY = 1 ] || PARTS="$PARTS desktop"; [ $RES = 0 ] || PARTS="$PARTS resolution"; [ $EVW = 0 ] || PARTS="$PARTS event-wait"
 printf '# mickys overlay %s: %s (uninstall.sh puts the original file back)\n' "$OV" "${PARTS# }" >> "$C.new"
 [ "$NVENC" = off ] || printf 'NVMTL_NVENCVT=%s\n' "$NVENC" >> "$C.new"
+[ $EVW = 0 ] || printf '%s (uninstall.sh removes this line and the next)\nNVRM_EVENT_WAIT=1\n' "$EMARK" >> "$C.new"
 chown root:wheel "$C.new"; chmod 644 "$C.new"; mv "$C.new" "$C"
-ok "NVMTL_NVENCVT=${NVENC/off/(not set)}"
+ok "NVMTL_NVENCVT=${NVENC/off/(not set)}$([ $EVW = 1 ] && echo ", NVRM_EVENT_WAIT=1 (--event-wait)")"
 
 echo "== 5. command-line tools"
 for f in $RC; do   # drop an earlier --cli-aliases hook; rewrite in place to keep the file's owner and mode
