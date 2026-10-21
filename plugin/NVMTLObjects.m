@@ -1161,6 +1161,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (_swzView) nvmtl_vk_image_view_destroy(_swzView);
     if (!_parent && _parkable && _subHeap && _i.img) nvmtl_heap_park(_subHeap, &_i, _pkey, _heapOffset, _pkLen);
     if (!_parent && _bparkable && _backBuf && _i.img) nvmtl_bpark_put(_backBuf, &_i, _pkey);
+    if (!_parent && _tpA8 && _i.img && !_surf && !_subHeap && !_backBuf && !_stTwin.img && !_vramOn) nvmtl_tp_put(&_i, _tpA8 - 1);
     if (!_parent) nvmtl_vk_image_destroy(&_i);
     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
     if (!_parent && _vramOn) { if (!nvmtl_ic_put(&_vramBuf)) nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
