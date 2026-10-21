@@ -76,6 +76,29 @@ Measured on a GTX 1650 (NullMoth 2.4.3, macOS 26.7.1), 1920x1080 at 144 Hz:
 Desktop benchmark (Safari animation, updates/s): full-screen 1080p 66.0 -> 71.8 (Safari's own painting limit); full-screen 4K
 HiDPI 15.3 -> 19.9 (2.4.3-mickys.5 `--desktop`: 19.4), WindowServer CPU 73 -> 60 % of a core.
 
+Since 2.4.3-mickys.7 the `--desktop` build also has:
+
+- **No more ~0.1 s freezes while the screen is captured.** When a capture (Parsec, OBS, screen recording) read a window
+  surface with the CPU, the kernel waited for WindowServer to report that surface finished, while holding the
+  accelerator lock. That report went through the same kernel connection as WindowServer's other surface calls, one of
+  which was waiting for that lock. Nothing moved until the kernel's 100 ms safety bound ran out, a few times every
+  10 seconds: the stream stopped for a moment and then jumped ahead. The plugin now sends these reports on a connection
+  of its own.
+- **Upstream PR #96 (rebased onto 2.4.3): a CPU surface upload no longer waits for the GPU copy** before the next
+  one starts (two staging slots, the pending upload finished before the image is read, uploaded again, moved or freed).
+  On by default in this build; `NVMTL_ASYNC_SURFIN=0` in `nvrm610.conf` turns it off.
+
+Measured on a GTX 1650 (NullMoth 2.4.3, macOS 26.7.1), 1920x1080 at 165 Hz:
+
+| test | 2.4.3-mickys.6 `--desktop` | 2.4.3-mickys.7 `--desktop` |
+|---|---|---|
+| Parsec streaming a full-screen GPU animation | 52-54 fps, 4-11 freezes of ~117 ms per 30 s | **80-81 fps**, no freezes (worst frame 18-28 ms), encode latency 3.0 ms |
+| Safari animation in a 1600x900 window, screen updates/s | 83.0-83.3, WindowServer 73 % of a core | 82.8-83.9, 73 % (unchanged) |
+
+#96 adds nothing measurable on top of the GPU upload in these tests: `--desktop` already uploads most windows from their own
+pages, and #96 only speeds up the CPU copy left for surfaces whose pages cannot be imported (on its own, without the GPU
+upload, it gave +8-14 % in the same benchmark).
+
 Per upload of the full-screen window (diagnostic build on 2.3.7): 19.7 ms with the CPU copy, 7.7 ms from the imported pages. Worth it on a 4K (or
 larger) display with big Safari, Mail or other WebKit windows; with smaller windows NullMoth's plugin is as fast. It
 replaces NullMoth's plugin binary, so a problem in it affects the whole desktop: try it, and go back with
