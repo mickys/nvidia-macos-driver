@@ -212,6 +212,12 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
                 if (t->_surf && t->_vramOn && !nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(t->_surf), (uint32_t)(t->_vramMulti ? 0 : t->_plane))) [dirtied addObject:t];
         }
         holds->dirtied = dirtied;
+        // Each kernel dirty mark moves the IOSurface seed (the family counts a GPU write as a write; a read-only lock and
+        // IOSurfaceSetValue do not). The completion thread's marks record the moved seed in the surface's VRAM tag; these
+        // commit marks did not, so a surface WindowServer draws every frame (the NV12 capture surfaces Parsec reads) looked
+        // CPU-written at its next use and was uploaded from system memory before each composite: 3 MB and a synchronous
+        // wait on WindowServer's main thread per captured frame, which cost one refresh of capture cadence at 165 Hz.
+        for (NVMTLTexture *t in dirtied) nvmtl_vram_tag_set(t->_surf, NVMTL_VP(t), IOSurfaceGetSeed(t->_surf));
     }
     @synchronized (nvmtl_ws_lock()) {
         if (!nvmtl_ws_pending_holds) nvmtl_ws_pending_holds = [NSCountedSet new];
