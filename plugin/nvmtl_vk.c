@@ -6222,6 +6222,7 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
 // one async upload in flight; surfin: a deferred surface upload, whose staging buffer goes back to a pool
 typedef struct nvmtl_asyncup { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; int surfin; } nvmtl_asyncup;
 static unsigned nvmtl_async_surfin(void);
+static void nvmtl_asyncup_store(nvk_image *img, uint64_t token);
 static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit);
 static void nvmtl_surfin_drop(nvmtl_asyncup *au);
 static void nvmtl_surfin_store(nvk_image *img, nvmtl_asyncup *au);
@@ -6283,6 +6284,30 @@ int nvmtl_vk_buffer_fill_from_surface(nvk_queue *q, nvk_buffer *dst, const void 
     if (nvmtl_vk_stage(q, bytes, &stage)) return -1;
     memcpy(stage.map, base, bytes);
     return nvmtl_vk_copy_buffer(q, &stage, 0, dst, 0, bytes);
+}
+// The same fill without waiting for it (fork): the copy is submitted and its host import is kept alive on `holder`'s
+// upload token (PR #96's lifetime guard: finished before that image is read back, re-uploaded, moved or freed; queue
+// order puts the copy before every later command). WindowServer uploads Parsec's NV12 capture surface before each capture
+// composite (the client's write lock moves the seed, so the system copy has to be taken as newer): the synchronous fill
+// cost its main thread a fence wait per captured frame. Falls back to the synchronous fill when the pages cannot be
+// imported or deferred uploads are off (NVMTL_ASYNC_SURFIN=0).
+int nvmtl_vk_buffer_fill_from_surface_async(nvk_queue *q, nvk_buffer *dst, const void *base, size_t bytes, nvk_image *holder)
+{
+    if (!dst || !dst->buf || !base || !bytes || bytes > dst->size) return -1;
+    if (!holder || !nvmtl_async_surfin() || !g_host_import || !g_host_align || ((uintptr_t)base & (g_host_align - 1)))
+        return nvmtl_vk_buffer_fill_from_surface(q, dst, base, bytes);
+    nvmtl_vk_image_upload_barrier(holder);   // one deferred fill per holder at a time
+    nvmtl_asyncup *au = (nvmtl_asyncup *)calloc(1, sizeof *au);
+    if (!au) return -1;
+    if (nvmtl_vk_buffer_import_host((void *)base, (bytes + g_host_align - 1) & ~(g_host_align - 1), &au->stage)) { free(au); return nvmtl_vk_buffer_fill_from_surface(q, dst, base, bytes); }
+    nvk_cmdbuf c;
+    if (nvmtl_vk_cmd_begin(q, &c)) { nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
+    if (nvmtl_vk_cmd_copy_buffer(&c, &au->stage, 0, dst, 0, bytes)) { nvmtl_vk_cmd_abandon(&c); nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    if (nvmtl_vk_submit_begin_at(&c, &au->infl, "multi-plane surface upload (deferred)")) { nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
+    nvmtl_asyncup_store(holder, (uint64_t)(uintptr_t)au);
+    return 0;
 }
 int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes)
 {

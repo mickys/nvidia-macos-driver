@@ -1279,7 +1279,7 @@ static bool nvmtl_surfin_import(void) {
     if (r->_vramMulti) {   // multi-plane in family VRAM (fork): the whole allocation, all planes, in one copy
         uint32_t seed = 0;
         if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("multi-plane surface-in: IOSurfaceLock FAILED"); return; }
-        const int rc = nvmtl_vk_buffer_fill_from_surface(r->_q, &r->_vramBuf, IOSurfaceGetBaseAddress(r->_surf), IOSurfaceGetAllocSize(r->_surf));
+        const int rc = nvmtl_vk_buffer_fill_from_surface_async(r->_q, &r->_vramBuf, IOSurfaceGetBaseAddress(r->_surf), IOSurfaceGetAllocSize(r->_surf), &r->_i);
         IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
         if (rc) { nvlog("multi-plane surface-in: upload FAILED (surface %u) - retried at the next use", (unsigned)IOSurfaceGetID(r->_surf)); return; }
         r->_surfSeed = seed; r->_surfSynced = YES; g_surfin_copy++; nvmtl_vram_tag_set(r->_surf, 0, seed);
