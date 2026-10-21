@@ -42,7 +42,7 @@ app drew with the CPU (every WebKit view, including Safari and Mail, and CoreGra
 the window's pages into video memory with the CPU. WindowServer lets go of the surface after each frame, so the pages
 are faulted in again for every upload, and for a large window most of the copy is page faults. This fork's plugin
 imports the locked pages as host memory and lets the GPU copy them (falling back to the CPU copy when they cannot be
-imported); the change is 48 lines on top of NullMoth's plugin, the same one proposed to NullMoth. Measured on an RTX 4090
+imported); that change is 48 lines on top of NullMoth's plugin, the same one proposed to NullMoth. Measured on an RTX 4090
 with NullMoth 2.4.3 (macOS 26.7.1, in a VM), Safari playing a CSS animation, 2 x 3 x 20 s each (stock and patched passes
 alternating; 2.3.7 gave the same):
 
@@ -52,6 +52,29 @@ alternating; 2.3.7 gave the same):
 | 3840x2110 (full screen, 4K) | `--desktop` | 34.6 (+67 %) | 55 % | 255 % |
 | 3200x1800 | NullMoth 2.4.3 | 40.3 | 58 % | 215 % |
 | 3200x1800 | `--desktop` | 42.9 (+6 %) | 55 % | 198 % |
+
+Since 2.4.3-mickys.6 the `--desktop` build also carries three fixes for screen capture and compositing (Parsec, OBS
+display capture, screen recording, and the desktop itself):
+
+- **NV12 capture surfaces stay in step:** WindowServer draws captured frames into two-plane (NV12) surfaces. NullMoth's
+  plugin copied each plane out with a lock that moved the whole surface's seed, so the other plane looked stale and was
+  uploaded again from the CPU before every frame, one plane at a time. The plugin now remembers the seed moves of its own
+  copy-outs. This removes the per-frame uploads and the horizontal tearing they caused in the streamed picture.
+- **One VRAM import per surface:** CoreAnimation wraps the same window surfaces in a new texture for every frame, and each
+  wrap imported the surface's VRAM again (four kernel calls, ~0.6 ms in WindowServer). The import is now shared and kept
+  briefly (`NVMTL_SURF_IMPORT_CACHE=0` turns it off).
+- **Texture pool:** CoreAnimation's per-frame intermediate textures (blur, vibrancy) reuse recently released ones of the
+  same size and format instead of a new VRAM allocation each (`NVMTL_TEX_POOL=0` turns it off).
+
+Measured on a GTX 1650 (NullMoth 2.4.3, macOS 26.7.1), 1920x1080 at 144 Hz:
+
+| test | NullMoth 2.4.3 | with the three fixes |
+|---|---|---|
+| Parsec streaming a full-screen GPU animation | 46-47 fps, encode latency 3.6 ms, tearing | **71-72 fps (+53 %)**, 3.0 ms, no tearing |
+| the same animation, no streaming | 118-132 fps | 139-142 fps (the 144 Hz limit) |
+
+Desktop benchmark (Safari animation, updates/s): full-screen 1080p 66.0 -> 71.8 (Safari's own painting limit); full-screen 4K
+HiDPI 15.3 -> 19.9 (2.4.3-mickys.5 `--desktop`: 19.4), WindowServer CPU 73 -> 60 % of a core.
 
 Per upload of the full-screen window (diagnostic build on 2.3.7): 19.7 ms with the CPU copy, 7.7 ms from the imported pages. Worth it on a 4K (or
 larger) display with big Safari, Mail or other WebKit windows; with smaller windows NullMoth's plugin is as fast. It
@@ -170,7 +193,7 @@ stay: NullMoth's framebuffer ignores them). Then log out and back in, or restart
 
 - Framebuffer (`--resolution`): `kexts/NVRMFB` at the same tag (NullMoth 2.4.3 plus three commits), built with
   `build/fb_build.sh`; `nvfb-edid` from `tools/nvfb-edid.c`.
-- Plugin: `plugin/` of [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) at the tag named in
+- Plugin (`--desktop` only): `plugin/` of [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) at the tag named in
   `SOURCE` (NullMoth 2.4.3 plus the overlay's commits), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
 - Encoder: [mickys/nvenc](https://github.com/mickys/nvenc) at the commit named in `SOURCE`.
 - The plugin source is under the PolyForm Noncommercial License 1.0.0 (`LICENSE`), like NullMoth's. The encoder is MIT
