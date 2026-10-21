@@ -1239,9 +1239,9 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_wait_max_us, CTLFLAG_RD | CTLFL
 // lock held, which every other GPU client's kernel call (VRAM imports, dirty marks) then waits on. The copy engine can write
 // the surface's own pages (runs of contiguous ones coalesced, the per-page descriptor otherwise); that path was the fallback
 // and is now tried first. debug.nvaccel_pageoff_direct=0 restores the staging order. Per path: count and microseconds.
-static int gPageoffDirect = 1;
+static int gPageoffDirect = 0;   // measured 2026-10-21 (GTX 1650): direct first gave 90 swap timeouts in 15 s of capture; staging stays the default
 static SInt64 gPageoffDirectN, gPageoffDirectUs, gPageoffStagedN, gPageoffStagedUs, gPageoffDirectFail;
-SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gPageoffDirect, 0, "1 = the copy engine writes the surface's pages directly (fork); 0 = contiguous staging buffer + CPU copy (NullMoth's order)");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gPageoffDirect, 0, "1 = the copy engine writes the surface's pages directly (fork, slow on scattered pages); 0 = contiguous staging buffer + CPU copy (NullMoth's order, default)");
 NVACCEL_CNT(nvaccel_pageoff_direct_n,    gPageoffDirectN,    "page-offs copied directly into the surface's pages");
 NVACCEL_CNT(nvaccel_pageoff_direct_us,   gPageoffDirectUs,   "microseconds those took on the copy engine");
 NVACCEL_CNT(nvaccel_pageoff_direct_fail, gPageoffDirectFail, "direct page-offs that failed and fell back to the staging buffer");
