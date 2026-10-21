@@ -209,6 +209,15 @@ static bool nvmtl_gpu_profile_string(CFStringRef key, char *out, size_t n)
     IOObjectRelease(it);
     return ok;
 }
+// True when the generation the driver published is this one, whatever family follows it. The TU11x cards publish
+// "Turing GTX 16" where the TU10x ones publish plain "Turing", so an exact compare left every GTX 16 card without a
+// hardware encoder. Both GTX 16 chips encode on the Turing libraries: measured on a GTX 1650 (TU117), H.264 and HEVC
+// 5 of 5 frames with no errors, although its profile lists no encoder class (the library allocates the class itself).
+static bool nvmtl_gen_is(const char *gen, const char *name)
+{
+    size_t n = strlen(name);
+    return !strncmp(gen, name, n) && (gen[n] == '\0' || gen[n] == ' ');
+}
 static bool nvmtl_video_is_blackwell(void)
 {
     if (g_video_blackwell >= 0) return g_video_blackwell == 1;
@@ -232,9 +241,9 @@ static const char *nvmtl_nvenc_hevc_library_for_this_gpu(void)
     char gen[32];
     if (!nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen))
         return nvmtl_video_is_blackwell() ? "libnvenc_hevc.dylib" : NULL;
-    if (!strcmp(gen, "Blackwell")) return "libnvenc_hevc.dylib";
-    if (!strcmp(gen, "Ampere")) return "libnvenc_hevc_ga10x.dylib";
-    if (!strcmp(gen, "Turing")) return "libnvenc_hevc_tu10x.dylib";
+    if (nvmtl_gen_is(gen, "Blackwell")) return "libnvenc_hevc.dylib";
+    if (nvmtl_gen_is(gen, "Ampere")) return "libnvenc_hevc_ga10x.dylib";
+    if (nvmtl_gen_is(gen, "Turing")) return "libnvenc_hevc_tu10x.dylib";
     return NULL;
 }
 static const char *nvmtl_nvenc_library_for_this_gpu(void)
@@ -244,9 +253,9 @@ static const char *nvmtl_nvenc_library_for_this_gpu(void)
         // No profile: fall back to the name test, which only recognises Blackwell.
         return nvmtl_video_is_blackwell() ? "libnvenc_h264.dylib" : NULL;
     }
-    if (!strcmp(gen, "Blackwell")) return "libnvenc_h264.dylib";
-    if (!strcmp(gen, "Ampere")) return "libnvenc_h264_ga10x.dylib";
-    if (!strcmp(gen, "Turing")) return "libnvenc_h264_tu10x.dylib";
+    if (nvmtl_gen_is(gen, "Blackwell")) return "libnvenc_h264.dylib";
+    if (nvmtl_gen_is(gen, "Ampere")) return "libnvenc_h264_ga10x.dylib";
+    if (nvmtl_gen_is(gen, "Turing")) return "libnvenc_h264_tu10x.dylib";
     return NULL;
 }
 static void nvmtl_nvdec_register(void)

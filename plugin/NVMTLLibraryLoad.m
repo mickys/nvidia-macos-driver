@@ -45,6 +45,8 @@ typedef int (*nvmtl_lower_fn)(const uint8_t *, size_t, uint8_t **, size_t *, cha
 static nvmtl_lower_fn xlate_lower;
 typedef int (*nvmtl_lower_ex_fn)(const uint8_t *, size_t, uint32_t, uint8_t **, size_t *, uint32_t *, char *, size_t);
 static nvmtl_lower_ex_fn xlate_lower_ex;
+typedef int (*nvmtl_to_uniform_fn)(const uint8_t *, size_t, uint8_t **, size_t *, char *, size_t);
+static nvmtl_to_uniform_fn xlate_to_uniform;   /* the table of an unlowered module moved to a Uniform block */
 static nvmtl_translate_fn xlate;
 static char gXlateTag[80] = "untagged";
 static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capacity) {
@@ -113,6 +115,8 @@ static int nvmtl_xlate_ready(void) {
                 xlate ? "" : " - it has NO nvmtl_translate"); }
         xlate_lower = (nvmtl_lower_fn)dlsym(h, "nvmtl_lower_buffer_addresses");
         xlate_lower_ex = (nvmtl_lower_ex_fn)dlsym(h, "nvmtl_lower_buffer_addresses_ex");
+        xlate_to_uniform = (nvmtl_to_uniform_fn)dlsym(h, "nvmtl_table_to_uniform");
+        if (!xlate_to_uniform) nvlog("translate: no nvmtl_table_to_uniform in this translator - a module that address lowering refuses is refused outright while the table is Uniform");
         xlate_free = (nvmtl_free_fn)dlsym(h, "nvmtl_translate_free");
         xlate_sampler = (nvmtl_sampler_fn)dlsym(h, "nvmtl_translate_samplers");
         xlate_tglen = (nvmtl_tglen_fn)dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
@@ -2006,7 +2010,12 @@ BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)
         if (xlate_vrefs(air.UTF8String, &out, &len, e, sizeof e) == 0) {
             id refs = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:out length:len] options:0 error:NULL];
             xlate_free(out, len);
-            if ([refs isKindOfClass:[NSArray class]]) return [(NSArray *)refs count] > 0;
+            // the query lists direct references only; a function that calls through a visible or intersection
+            // function table has none, and nvmtl_link_stage links it from the table candidates
+            if ([refs isKindOfClass:[NSArray class]])
+                return [(NSArray *)refs count] > 0
+                    || [air rangeOfString:@"!\"air.visible_function_table\""].location != NSNotFound
+                    || [air rangeOfString:@"!\"air.intersection_function_table\""].location != NSNotFound;
         }
     }
     return why && ([why rangeOfString:@"visible function reference"].location != NSNotFound

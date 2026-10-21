@@ -233,6 +233,22 @@ NvBool nvkms_output_rounding_fix(void)          { return NV_TRUE; }
 NvBool nvkms_disable_hdmi_frl(void)             { return NV_FALSE; }
 NvBool nvkms_disable_vrr_memclk_switch(void)    { return NV_FALSE; }
 NvBool nvkms_hdmi_deepcolor(void)               { return NV_TRUE; }
+// The most bits per colour NVKMS may send: NVIDIA's max_output_color_depth module parameter, here the boot-arg
+// nvmaxbpc. NVIDIA's default is 10 (DisplayPort and HDMI deep colour up to 10); nvmaxbpc=12 allows 615's 12-bit
+// HDMI deep colour on displays that report it, 8 and 6 cap lower.
+NvU32 nvkms_max_output_color_bpc(void)
+{
+    static NvU32 bpc = 0;
+    if (bpc == 0) {
+        uint32_t want = 10;
+        PE_parse_boot_argn("nvmaxbpc", &want, sizeof want);
+        bpc = (want == 6 || want == 8 || want == 12) ? want : 10;
+    }
+    return bpc;
+}
+// 615 reports HDMI and HDMI-audio plug state to Linux's extcon framework; macOS has none.
+void nvkms_extcon_report_hdmi(NvBool)            { }
+void nvkms_extcon_report_hdmi_audio(NvBool)      { }
 NvBool nvkms_opportunistic_display_sync(void)   { return NV_TRUE; }
 enum NvKmsDebugForceColorSpace nvkms_debug_force_color_space(void) { return NVKMS_DEBUG_FORCE_COLOR_SPACE_NONE; }
 NvBool nvkms_enable_overlay_layers(void)        { return NV_TRUE; }
