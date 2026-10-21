@@ -720,10 +720,13 @@ static void nvmtl_gsub_ahead_pass1(void) {
         else {
             nvmtl_prepare_submission_copies(part);
             for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
-            nvmtl_inflight f;
-            result = nvmtl_vk_submit_begin(&part->commands, &f);
-            if (result == 0) { [self nvmtlMarkScheduled]; result = nvmtl_vk_submit_finish(&f); }   // scheduled after the kernel submit, as in the ahead pass
-            else [self nvmtlMarkScheduled];
+            nvmtl_inflight *f = nvmtl_vk_inflight_new();
+            result = f ? nvmtl_vk_submit_begin(&part->commands, f) : -1;
+            if (result == 0) {
+                [self nvmtlMarkScheduled];   // scheduled after the kernel submit, as in the ahead pass
+                result = nvmtl_vk_submit_finish(f);
+                if (result == 0) nvmtl_vk_inflight_free(f);   // a lost device keeps its in-flight record, as nvmtl_gsub_finish does
+            } else { if (f) nvmtl_vk_inflight_free(f); [self nvmtlMarkScheduled]; }
         }
         if (result == -2) {
             if (!nvmtl_quarantined_parts) nvmtl_quarantined_parts = [NSMutableArray new];
