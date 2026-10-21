@@ -827,6 +827,82 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     SEL s = sel_registerName("framebufferOnly");
     return d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
 }
+// Texture pool (fork). CoreAnimation creates short-lived intermediate textures for every frame it composites (backdrop
+// captures for blur and vibrancy, flattening), and each was a new VkImage with its own VRAM allocation through RM
+// (alloc, VA, bind): 3-4 % of WindowServer's main thread during screen capture on a GTX 1650. Plain 2D textures (one
+// mip, one layer, one sample, in VRAM) are now kept for up to 1 s after release (32 entries, 256 MB at most) and handed
+// to the next texture of the same size, format and usage. A texture is released only after the command buffers that
+// used it completed (they retain it), and Metal leaves a new texture's contents undefined. NVMTL_TEX_POOL=0 turns it off.
+#include <os/lock.h>
+typedef struct { nvk_image i; int a8; uint64_t t; } nvmtl_tp_ent;
+#define NVMTL_TP_N 32
+#define NVMTL_TP_MAX_BYTES (256ull << 20)
+#define NVMTL_TP_AGE_NS 1000000000ull
+static nvmtl_tp_ent g_tp[NVMTL_TP_N];
+static os_unfair_lock g_tp_lock = OS_UNFAIR_LOCK_INIT;
+static unsigned long long g_tp_hits, g_tp_puts, g_tp_bytes;
+static int nvmtl_tp_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_TEX_POOL"); on = !(e && e[0] == '0');
+                  nvlog("texture pool %s (NVMTL_TEX_POOL=%s)", on ? "on" : "off", e ?: "unset"); }
+    return on;
+}
+static int nvmtl_tp_fits(const nvk_image *i)
+{
+    return i->img && i->mem && !i->placed && !i->sysmem && !i->vpair && i->samples <= 1 && i->mtl_type == 2 && i->layers == 1
+        && i->mips == 1 && !i->up_token && !(i->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+}
+// destroys pooled images older than NVMTL_TP_AGE_NS; call without the lock
+static void nvmtl_tp_trim(void)
+{
+    nvk_image gone[NVMTL_TP_N]; int n = 0; const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    os_unfair_lock_lock(&g_tp_lock);
+    for (int k = 0; k < NVMTL_TP_N; k++)
+        if (g_tp[k].i.img && now - g_tp[k].t > NVMTL_TP_AGE_NS) { gone[n++] = g_tp[k].i; g_tp_bytes -= g_tp[k].i.alloc; memset(&g_tp[k], 0, sizeof g_tp[k]); }
+    os_unfair_lock_unlock(&g_tp_lock);
+    for (int k = 0; k < n; k++) nvmtl_vk_image_destroy(&gone[k]);
+}
+// a pooled image for a new plain 2D texture: 1 = *out is one (fresh layout), 0 = none
+static int nvmtl_tp_get(uint32_t w, uint32_t h, uint32_t vkf, uint32_t bpp, int a8, int stex, nvk_image *out)
+{
+    if (!nvmtl_tp_on()) return 0;
+    nvmtl_tp_trim();
+    int found = 0;
+    os_unfair_lock_lock(&g_tp_lock);
+    for (int k = 0; k < NVMTL_TP_N; k++) {
+        const nvk_image *p = &g_tp[k].i;
+        if (!p->img || p->w != w || p->h != h || p->fmt != vkf || p->bpp != (bpp ? bpp : 4) || g_tp[k].a8 != a8
+            || (int)p->storage != (stex && !a8 && nvmtl_vk_format_is_storage(vkf))) continue;
+        *out = *p; g_tp_bytes -= p->alloc; memset(&g_tp[k], 0, sizeof g_tp[k]); g_tp_hits++; found = 1;
+        break;
+    }
+    os_unfair_lock_unlock(&g_tp_lock);
+    if (found) { out->layout = 0; out->up_token = 0; }
+    return found;
+}
+// a released texture's image goes to the pool: 1 = taken (*i cleared), 0 = not (destroy it)
+static int nvmtl_tp_put(nvk_image *i, int a8)
+{
+    if (!nvmtl_tp_on() || !nvmtl_tp_fits(i)) return 0;
+    nvk_image evict = { 0 }; int taken = 0;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    os_unfair_lock_lock(&g_tp_lock);
+    int slot = -1; uint64_t oldest = UINT64_MAX;
+    for (int k = 0; k < NVMTL_TP_N && slot < 0; k++) if (!g_tp[k].i.img) slot = k;
+    if (slot < 0) for (int k = 0; k < NVMTL_TP_N; k++) if (g_tp[k].t < oldest) { oldest = g_tp[k].t; slot = k; }
+    if (slot >= 0 && g_tp[slot].i.img) { evict = g_tp[slot].i; g_tp_bytes -= evict.alloc; memset(&g_tp[slot], 0, sizeof g_tp[slot]); }
+    if (slot >= 0 && g_tp_bytes + i->alloc <= NVMTL_TP_MAX_BYTES) {
+        g_tp[slot] = (nvmtl_tp_ent){ *i, a8, now }; g_tp_bytes += i->alloc; g_tp_puts++; taken = 1;
+    }
+    const unsigned long long puts = g_tp_puts, hits = g_tp_hits;
+    os_unfair_lock_unlock(&g_tp_lock);
+    if (evict.img) nvmtl_vk_image_destroy(&evict);
+    if (taken) { memset(i, 0, sizeof *i);
+                 if (puts < 4 || puts % 5000 == 0) nvlog("texture pool: %llu kept, %llu reused", puts, hits); }
+    return taken;
+}
+
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
     if (nvmtl_vk_init()) return nil;
     if (d.textureType == MTLTextureTypeTextureBuffer) {
@@ -862,7 +938,10 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
             if (!(k & (k - 1))) nvlog("newTextureWithDescriptor: %lu multisample texture(s) asked for ShaderWrite - created like Apple (M1/D300 create them); no storage view", k); }
         if (nvmtl_vk_image_create_ms_full((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)d.sampleCount, (uint32_t)d.textureType, (uint32_t)d.arrayLength, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED (multisample)"); return nil; }
     } else
-    if (nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+    if ((d.textureType == MTLTextureType2D && d.mipmapLevelCount <= 1 && d.arrayLength <= 1 && d.depth <= 1
+         && nvmtl_tp_get((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, wantStex, &t->_i)) ? (t->_tpA8 = a8 + 1, 0) :
+        nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+    if (!t->_tpA8 && d.textureType == MTLTextureType2D && d.mipmapLevelCount <= 1 && d.arrayLength <= 1 && d.depth <= 1) t->_tpA8 = a8 + 1;
     nvmtl_alloc_ok();
     t->_q = nvmtl_device_queue();
     t->_stex = t->_i.storage != 0;
