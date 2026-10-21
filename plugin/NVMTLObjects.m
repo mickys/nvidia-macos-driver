@@ -1235,6 +1235,13 @@ static BOOL nvmtl_own_bumps_cover(IOSurfaceRef s, uint32_t have, uint32_t now)
     return ok;
 }
 static unsigned long long g_surfin_own_skip;
+// stock-plus: the plane seed (c8fb686) only with NVMTL_PLANE_SEED=1
+static BOOL nvmtl_plane_seed_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_PLANE_SEED"); on = e && e[0] == '1'; nvlog("plane seed %s (NVMTL_PLANE_SEED=%s)", on ? "on" : "off", e ?: "unset"); }
+    return on;
+}
 // The plane whose kernel / VRAM-tag / lock state a texture uses: a plane of a multi-plane surface aliased in the whole
 // surface's family VRAM (fork) shares plane 0's, since the VRAM and its page-off cover the whole allocation.
 #define NVMTL_VP(r) ((r)->_vramMulti ? 0 : (r)->_plane)
@@ -1259,7 +1266,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
 // NVMTL_SURFIN_UPLOAD=cpu: surface-in copies with the CPU (nvmtl_vk_image_write) instead of importing the pages
 static bool nvmtl_surfin_import(void) {
     static int on = -1;
-    if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = !(u && !strcmp(u, "cpu")); }
+    if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = u && (!strcmp(u, "gpu") || !strcmp(u, "1")); }   // stock-plus: opt-in (NVMTL_SURFIN_UPLOAD=gpu)
     return on;
 }
 - (void)nvmtlSurfaceIn {
@@ -1270,7 +1277,7 @@ static bool nvmtl_surfin_import(void) {
     if (r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen)) return;
     if (r->_surfSynced && !r->_vramOn && vgen == r->_surfGen) {
         const uint32_t now = IOSurfaceGetSeed(r->_surf);
-        if (nvmtl_own_bumps_cover(r->_surf, r->_surfSeed, now)) {
+        if (nvmtl_plane_seed_on() && nvmtl_own_bumps_cover(r->_surf, r->_surfSeed, now)) {
             r->_surfSeed = now; g_surfin_own_skip++;
             static unsigned no; if (no++ < 6 || no % 5000 == 0) nvlog("surface-in SKIPPED (only our own writes to other planes since seed %u): %llu so far", now, g_surfin_own_skip);
             return;
@@ -1369,7 +1376,7 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     uint32_t seed = 0; IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed); if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
     if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }
     // a read-write lock moves the seed when it is taken (lock and unlock report the moved value): ours is lockSeed-1 -> lockSeed
-    if (!lockopt && lockSeed && IOSurfaceGetPlaneCount(r->_surf) > 1) nvmtl_own_bump_add(r->_surf, lockSeed - 1, seed);
+    if (nvmtl_plane_seed_on() && !lockopt && lockSeed && IOSurfaceGetPlaneCount(r->_surf) > 1) nvmtl_own_bump_add(r->_surf, lockSeed - 1, seed);
     r->_surfSeed = seed; r->_surfSynced = YES;
     r->_surfGen = r->_vramOn ? r->_surfGen : nvmtl_vram_gen(r->_surf, r->_plane);
     if (r->_vramOn && !lockopt) nvmtl_vram_tag_set(r->_surf, NVMTL_VP(r), seed);

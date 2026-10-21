@@ -284,7 +284,7 @@ static CFMutableArrayRef nvmtl_surface_use_begin(NSSet *resources, NSSet *writte
     static int mode = -1;
     if (mode < 0) {
         const char *e = getenv("NVMTL_SURF_USE_COUNT");
-        mode = e ? atoi(e) : ((getprogname() && !strcmp(getprogname(), "WindowServer")) ? 2 : 1);
+        mode = e ? atoi(e) : 0;   // stock-plus: off by default (1 every surface, 2 only the written ones)
     }
     if (!mode) return NULL;
     CFMutableArrayRef used = NULL;
@@ -366,7 +366,7 @@ static int nvmtl_skip_empty_on(void) {
     // copy-out, so it encoded the surface's previous frame, and now and then the new one when the copy-out won the race
     // (a counter in the stream read N-1, N+1, N). Such a command buffer reports "scheduled" once its writes are published.
     // NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1 does it for every surface write, =0 for none.
-    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && *e ? e[0] - '0' : 2; }
+    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && *e ? e[0] - '0' : 0; }   // stock-plus: stock's default (0); 2 = ours, 1 = every write
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) {
         if (s == drawable || !after) continue;

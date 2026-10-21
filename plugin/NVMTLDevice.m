@@ -853,7 +853,7 @@ static unsigned long long g_tp_hits, g_tp_puts, g_tp_bytes;
 static int nvmtl_tp_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_TEX_POOL"); on = !(e && e[0] == '0');
+    if (on < 0) { const char *e = getenv("NVMTL_TEX_POOL"); on = e && e[0] == '1';   /* stock-plus: opt-in */
                   nvlog("texture pool %s (NVMTL_TEX_POOL=%s)", on ? "on" : "off", e ?: "unset"); }
     return on;
 }
@@ -1015,7 +1015,7 @@ static unsigned long long g_ic_hits, g_ic_imports, g_ic_stale;
 static int nvmtl_ic_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_SURF_IMPORT_CACHE"); on = !(e && e[0] == '0');
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_IMPORT_CACHE"); on = e && e[0] == '1';   /* stock-plus: opt-in */
                   nvlog("family VRAM import cache %s (NVMTL_SURF_IMPORT_CACHE=%s)", on ? "on" : "off", e ?: "unset"); }
     return on;
 }
@@ -1099,7 +1099,7 @@ static int nvmtl_ic_put(nvk_buffer *b)
 static int nvmtl_mp_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_SURF_MULTIPLANE"); on = !(e && e[0] == '0');
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_MULTIPLANE"); on = e && e[0] == '1';   /* stock-plus: opt-in */
                   nvlog("multi-plane IOSurfaces %s (NVMTL_SURF_MULTIPLANE=%s)", on ? "share the family VRAM" : "use private images", e ?: "unset"); }
     return on;
 }

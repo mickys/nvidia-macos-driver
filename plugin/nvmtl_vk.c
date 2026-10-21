@@ -1920,8 +1920,18 @@ static void nvmtl_esc_open(int which)
 static void nvmtl_esc_open0(void) { nvmtl_esc_open(0); }
 static void nvmtl_esc_open1(void) { nvmtl_esc_open(1); }
 // 0xFFFFFFFF when the connection is missing or the call fails: the caller then uses NVK's
+// stock-plus: own connections only when switched on (3f49b2c: NVMTL_WS_MARK_CONN=1 for the completion marks, d72bbd9:
+// NVMTL_DIRTY_MARK_CONN=1 for the dirty marks); off = NVK's connection, as stock
+static int nvmtl_esc_on(int which)
+{
+    static int on[2] = { -1, -1 };
+    if (on[which] < 0) { const char *k = which ? "NVMTL_DIRTY_MARK_CONN" : "NVMTL_WS_MARK_CONN", *e = getenv(k); on[which] = e && e[0] == '1';
+        nvlog("%s %s (%s=%s)", which ? "dirty marks on an own connection" : "completion marks on an own connection", on[which] ? "on" : "off", k, e ?: "unset"); }
+    return on[which];
+}
 static uint32_t nvmtl_surf_esc(int which, uint32_t surfaceID, uint32_t plane)
 {
+    if (!nvmtl_esc_on(which)) return 0xFFFFFFFFu;
     pthread_once(&nvmtl_esc_once[which], which ? nvmtl_esc_open1 : nvmtl_esc_open0);
     const io_connect_t c = nvmtl_esc_conns[which];
     if (!c) return 0xFFFFFFFFu;
