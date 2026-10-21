@@ -6082,6 +6082,7 @@ int nvmtl_vk_image_migrate(nvk_image *i, int to_sysmem, int a8, nvk_image *old_o
 {
     if (g_state != 1 || !i || !i->img || i->placed || !i->usage || i->vpair || i->samples > 1 || i->mtl_type == 4 || i->mtl_type > 7
         || (i->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) return -1;
+    nvmtl_vk_image_upload_barrier(i);   // the old backing is freed later without a look at a pending upload: drain it first
     if (!to_sysmem == !i->sysmem) return 1;
     const uint32_t t = i->mtl_type, mips = i->mips ? i->mips : 1, nl = t == 7 ? 1 : (i->layers ? i->layers : 1);
     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, (VkImageCreateFlags)i->vkflags,
@@ -6306,33 +6307,62 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
     nvmtl_vk_buffer_destroy(&hb);
     return rc;
 }
+/* PR #96 (deferred surface-upload wait), behind NVMTL_ASYNC_SURFIN=<n> (0 or unset: the synchronous upload above).
+ * The upload is submitted without waiting and its handle is kept on the image (nvk_image.up_token), so the lifetime guard
+ * of the async texture uploads finishes it before the image is destroyed, migrated, read back or uploaded again (the
+ * use-after-free that had #96 reverted). At most n deferred uploads are in flight per process: the oldest is finished
+ * before another one starts. Their staging buffers come from a small pool, so a deferred upload allocates nothing. */
+// one async upload in flight; surfin: a deferred surface upload, whose staging buffer goes back to a pool
+typedef struct nvmtl_asyncup { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; int surfin; } nvmtl_asyncup;
+static unsigned nvmtl_async_surfin(void);
+static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit);
+static void nvmtl_surfin_drop(nvmtl_asyncup *au);
+static void nvmtl_surfin_store(nvk_image *img, nvmtl_asyncup *au);
+static uint64_t nvmtl_asyncup_take(nvk_image *img);
+static void nvmtl_asyncup_finish(uint64_t token);
+
 int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
     const uint32_t cols = nvmtl_blocks(img->w, img->bw), rows = nvmtl_blocks(img->h, img->bh);
     if (row_bytes < (size_t)cols * bpp) { nvlog("image_write: bytesPerRow %zu < %u blocks * %zu B", row_bytes, cols, bpp); return -1; }
     const size_t tight = (size_t)cols * bpp;
-    nvmtl_upstage *sl = nvmtl_upstage_get(tight * (size_t)rows);
-    if (!sl) return -1;
-    uint8_t *dst = (uint8_t *)sl->buf.map;
+    // a deferred upload to this image still in flight must land before the image is written again
+    nvmtl_asyncup_finish(nvmtl_asyncup_take(img));
+    const unsigned defer = nvmtl_async_surfin();
+    nvmtl_asyncup *au = defer ? nvmtl_surfin_rec(tight * (size_t)rows, defer) : NULL;   // NULL: synchronous upload
+    nvmtl_upstage *sl = NULL;
+    nvk_buffer *stage; nvk_cmdbuf *c;
+    if (au) { stage = &au->stage; c = &au->cb; }
+    else {
+        sl = nvmtl_upstage_get(tight * (size_t)rows);
+        if (!sl) return -1;
+        stage = &sl->buf; c = &sl->cb;
+    }
+    uint8_t *dst = (uint8_t *)stage->map;
     if (row_bytes == tight) nvmtl_copy_from_surface(dst, src, tight * (size_t)rows);   /* a 4K surface is 2160 rows of 15 KB: one pass, not 2160 calls */
     else for (uint32_t y = 0; y < rows; y++)
         nvmtl_copy_from_surface(dst + (size_t)y * tight, (const uint8_t *)src + (size_t)y * row_bytes, tight);
-    nvk_cmdbuf *const c = &sl->cb;
-    if (nvmtl_vk_cmd_begin(q, c)) return -1;
+    if (nvmtl_vk_cmd_begin(q, c)) { if (au) nvmtl_surfin_drop(au); return -1; }
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
     VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
     VkBufferImageCopy bic = { 0, 0, 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
-    pvkCmdCopyBufferToImage(c->cb, (VkBuffer)sl->buf.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    pvkCmdCopyBufferToImage(c->cb, (VkBuffer)stage->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
     img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (au) {
+        // queue order + the SHADER_READ barrier order the copy before a later draw that samples the image
+        if (nvmtl_vk_submit_begin_at(c, &au->infl, "surface upload (deferred)")) { nvmtl_surfin_drop(au); return -1; }
+        nvmtl_surfin_store(img, au);
+        return 0;
+    }
     const int rc = nvmtl_vk_submit_wait_at(c, "surface upload");
     if (sl->buf.size > NVMTL_UPSTAGE_KEEP) { nvmtl_vk_buffer_destroy(&sl->buf); memset(&sl->buf, 0, sizeof sl->buf); }
     return rc;
@@ -6441,8 +6471,47 @@ static int nvmtl_async_tex_upload(void)
     }
     return on;
 }
-typedef struct { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; } nvmtl_asyncup;
 static pthread_mutex_t g_asyncup_mutex = PTHREAD_MUTEX_INITIALIZER;
+// PR #96: the deferred surface uploads in flight, oldest first, with the image each one is recorded on, and the pool their
+// staging buffers come from (at most n + 1 buffers of up to NVMTL_UPSTAGE_KEEP bytes: n in flight, one being filled).
+// An entry is listed exactly while its image holds it as up_token; every change happens under g_asyncup_mutex.
+#define NVMTL_SURFIN_MAX 8
+static struct { nvmtl_asyncup *au; nvk_image *img; } g_surfin_pend[NVMTL_SURFIN_MAX];
+static unsigned g_surfin_npend;
+static nvk_buffer g_surfin_pool[NVMTL_SURFIN_MAX + 1];
+static unsigned g_surfin_npool;
+static unsigned nvmtl_async_surfin(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("NVMTL_ASYNC_SURFIN");
+        const long v = e && *e ? strtol(e, NULL, 10) : 0;
+        n = v <= 0 ? 0 : v > NVMTL_SURFIN_MAX ? NVMTL_SURFIN_MAX : (int)v;
+        nvlog("vk: deferred surface upload %s (NVMTL_ASYNC_SURFIN=%d, PR #96)", n ? "ON" : "OFF (default)", n);
+    }
+    return (unsigned)n;
+}
+static void nvmtl_surfin_unlist(nvmtl_asyncup *au)   // under g_asyncup_mutex
+{
+    for (unsigned k = 0; k < g_surfin_npend; k++)
+        if (g_surfin_pend[k].au == au) {
+            memmove(&g_surfin_pend[k], &g_surfin_pend[k + 1], (g_surfin_npend - k - 1) * sizeof g_surfin_pend[0]);
+            g_surfin_npend--;
+            return;
+        }
+}
+// Return a finished (or never submitted) deferred upload's staging buffer to the pool, or free it.
+static void nvmtl_surfin_drop(nvmtl_asyncup *au)
+{
+    int kept = 0;
+    if (au->stage.buf && au->stage.size <= NVMTL_UPSTAGE_KEEP) {
+        pthread_mutex_lock(&g_asyncup_mutex);
+        if (g_surfin_npool < nvmtl_async_surfin() + 1) { g_surfin_pool[g_surfin_npool++] = au->stage; kept = 1; }
+        pthread_mutex_unlock(&g_asyncup_mutex);
+    }
+    if (!kept && au->stage.buf) nvmtl_vk_buffer_destroy(&au->stage);
+    free(au);
+}
 // Atomically read and clear an image's pending async-upload handle (the consume/finish-first decision).
 static uint64_t nvmtl_asyncup_take(nvk_image *img)
 {
@@ -6451,6 +6520,7 @@ static uint64_t nvmtl_asyncup_take(nvk_image *img)
     nvmtl_up_state s = { img->up_token };
     const uint64_t token = nvmtl_up_before_consume(&s);
     img->up_token = 0;
+    if (token && ((nvmtl_asyncup *)(uintptr_t)token)->surfin) nvmtl_surfin_unlist((nvmtl_asyncup *)(uintptr_t)token);
     pthread_mutex_unlock(&g_asyncup_mutex);
     return token;
 }
@@ -6469,11 +6539,55 @@ static void nvmtl_asyncup_finish(uint64_t token)
     if (!token) return;
     nvmtl_asyncup *au = (nvmtl_asyncup *)(uintptr_t)token;
     nvmtl_vk_submit_finish(&au->infl);
+    if (au->surfin) { nvmtl_surfin_drop(au); return; }
     nvmtl_vk_buffer_destroy(&au->stage);
     free(au);
 }
 // Public guard for the consumers (readback, surface-out, migration, destroy): finish a pending upload first.
 void nvmtl_vk_image_upload_barrier(nvk_image *img) { nvmtl_asyncup_finish(nvmtl_asyncup_take(img)); }
+// A record for a deferred surface upload with a staging buffer of at least `size` bytes, or NULL for a synchronous upload.
+// With `limit` deferred uploads already in flight the oldest is finished first (taken off its image, so the image's own
+// guard finds nothing left to finish).
+static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit)
+{
+    if (size > NVMTL_UPSTAGE_KEEP) return NULL;   // a one-off larger upload stays synchronous
+    for (;;) {
+        nvmtl_asyncup *oldest = NULL;
+        pthread_mutex_lock(&g_asyncup_mutex);
+        if (g_surfin_npend >= limit) {
+            oldest = g_surfin_pend[0].au;
+            if (g_surfin_pend[0].img->up_token == (uint64_t)(uintptr_t)oldest) g_surfin_pend[0].img->up_token = 0;
+            nvmtl_surfin_unlist(oldest);
+        }
+        pthread_mutex_unlock(&g_asyncup_mutex);
+        if (!oldest) break;
+        nvmtl_asyncup_finish((uint64_t)(uintptr_t)oldest);
+    }
+    nvmtl_asyncup *au = (nvmtl_asyncup *)calloc(1, sizeof *au);
+    if (!au) return NULL;
+    au->surfin = 1;
+    nvk_buffer small; memset(&small, 0, sizeof small);
+    pthread_mutex_lock(&g_asyncup_mutex);
+    for (unsigned k = 0; k < g_surfin_npool; k++)
+        if (g_surfin_pool[k].size >= size) { au->stage = g_surfin_pool[k]; g_surfin_pool[k] = g_surfin_pool[--g_surfin_npool]; break; }
+    if (!au->stage.buf && g_surfin_npool) small = g_surfin_pool[--g_surfin_npool];   // too small: replaced, so the pool stays bounded
+    pthread_mutex_unlock(&g_asyncup_mutex);
+    if (small.buf) nvmtl_vk_buffer_destroy(&small);
+    if (!au->stage.buf && nvmtl_vk_buffer_create(size, 1, &au->stage)) { free(au); return NULL; }
+    return au;
+}
+// Record a submitted deferred surface upload on its image.
+static void nvmtl_surfin_store(nvk_image *img, nvmtl_asyncup *au)
+{
+    pthread_mutex_lock(&g_asyncup_mutex);
+    const uint64_t prev = img->up_token;   // 0: nvmtl_vk_image_write finished the image's earlier upload first
+    if (prev && ((nvmtl_asyncup *)(uintptr_t)prev)->surfin) nvmtl_surfin_unlist((nvmtl_asyncup *)(uintptr_t)prev);
+    img->up_token = (uint64_t)(uintptr_t)au;
+    // more threads than NVMTL_SURFIN_MAX at once: left off the list, still finished by the image's guard
+    if (g_surfin_npend < NVMTL_SURFIN_MAX) { g_surfin_pend[g_surfin_npend].au = au; g_surfin_pend[g_surfin_npend].img = img; g_surfin_npend++; }
+    pthread_mutex_unlock(&g_asyncup_mutex);
+    if (prev) nvmtl_asyncup_finish(prev);
+}
 
 int nvmtl_vk_image_write_region_level(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes,
                                       uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level)
@@ -6497,9 +6611,10 @@ int nvmtl_vk_image_write_region_level_layer(nvk_queue *q, nvk_image *img, const 
     nvmtl_asyncup *au = NULL;
     nvk_buffer *stageb, stage_sync;
     nvk_cmdbuf local_cb, *c;
+    // a prior async upload to THIS image must land before we overwrite the texture or its staging (on the synchronous
+    // path too: a deferred surface upload, NVMTL_ASYNC_SURFIN, can be pending on an IOSurface texture)
+    if (finish_first) nvmtl_asyncup_finish(nvmtl_asyncup_take(img));
     if (mode == NVMTL_UP_SUBMIT_ASYNC) {
-        // a prior async upload to THIS image must land before we overwrite the texture or its staging
-        if (finish_first) nvmtl_asyncup_finish(nvmtl_asyncup_take(img));
         au = (nvmtl_asyncup *)calloc(1, sizeof *au);
         if (!au || nvmtl_vk_buffer_create(bytes, 1, &au->stage)) { free(au); au = NULL; }   // fall back to sync
     }
