@@ -177,6 +177,24 @@ static NvU16 nvrmEdidOverrideRead(const NvU8 *real, NvU8 *out, NvU32 cap)
     vfs_context_rele(ctx);
     return got;
 }
+// /Library/NullMoth/nvfb-small (fork, feature/change-resolution): the file's presence turns nvfbsmall on without a boot-arg
+// (OpenCore rewrites boot-args at every boot, an installer cannot set one). Ignored unless root-owned and not writable by
+// group or others. A boot-arg nvfbsmall=0 / =1 overrides it.
+static bool nvrmRootFile(const char *path)
+{
+    vfs_context_t ctx = vfs_context_create(NULL); vnode_t vp = NULLVP; bool ok = false;
+    if (vnode_lookup(path, 0, &vp, ctx) == 0) {
+        struct vnode_attr va; VATTR_INIT(&va); VATTR_WANTED(&va, va_uid); VATTR_WANTED(&va, va_mode);
+        if (vnode_getattr(vp, &va, ctx) == 0) {
+            ok = va.va_uid == 0 && !(va.va_mode & (S_IWGRP | S_IWOTH));
+            if (!ok) OVLOG("%s: not root-owned or writable by others, ignored", path);
+        }
+        vnode_put(vp);
+    }
+    vfs_context_rele(ctx);
+    return ok;
+}
+
 // getDynamicDisplayInfo with the display's EDID override, when there is one
 static NvBool nvrmDynamicDisplayInfo(struct NvKmsKapiFunctionsTable *kms, struct NvKmsKapiDevice *dev, struct NvKmsKapiDynamicDisplayParams *dd)
 {
@@ -2640,8 +2658,9 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
         // nvfbsmall=1 offers the smaller ones as well: where NVKMS refuses macOS's scaled modes on the native raster (a
         // 4K-only firmware raster on an HDMI dummy plug), they are the only way to a desktop below the boot size.
         static int small = -1;
-        if (small < 0) { uint32_t v = 0; small = PE_parse_boot_argn("nvfbsmall", &v, sizeof v) && v;
-                         if (small) FBLOG("nvfbsmall: rasters smaller than the boot raster are offered too"); }
+        if (small < 0) { uint32_t v = 0; const bool arg = PE_parse_boot_argn("nvfbsmall", &v, sizeof v);
+                         small = arg ? v != 0 : nvrmRootFile("/Library/NullMoth/nvfb-small");
+                         if (small) FBLOG("nvfbsmall (%s): rasters smaller than the boot raster are offered too", arg ? "boot-arg" : "/Library/NullMoth/nvfb-small"); }
         const bool smaller = small && fBootW && !bootRaster && !larger;
         if (!raster && !have && (bootRaster || larger || smaller) && fMemBytes && k.hVisible <= fRasterMaxW && k.vVisible <= fScalerMaxH) {
             NvU32 pitch = 0;
