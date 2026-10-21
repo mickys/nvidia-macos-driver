@@ -1917,9 +1917,46 @@ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk
 /* the same mark, given up instead of waiting when the accelerator lock is taken (NVRM_SS_PLANE_TRYLOCK; only an NVAccel
    that publishes NVAccelSurfaceWait is asked): 0 marked, 1 the lock was taken, -1 refused */
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, 0x40000000u); }
-// WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape: 0 = the kernel took it
+// WindowServer completion marks go through a connection of their own. NVRM's user client holds a per-connection gate
+// across every escape, and NVK's connection also carries the VRAM dirty marks, which wait for the accelerator lock. A CPU
+// lock of a surface WindowServer is still drawing (a screen capture: ScreenCaptureKit, Parsec) pages the surface off with
+// that lock held and waits for the surface's ready mark; with the ready mark queued on NVK's connection behind a dirty
+// mark that waits for the same lock, nothing moved until NVAccel's 100 ms bound ran out, and that swap and the app's
+// frame stalled ~117 ms, several times a minute while a capture ran (debug.nvaccel_surface_gpu_timeouts, one per stall).
+// The mark escape touches no RM state, so the connection needs no RM client or bound fd. Falls back to NVK's connection
+// when it cannot be opened.
+// kexts/NVRM/nvrm_surfshare_abi.h (version 2), which the plugin build does not see
+struct nvmtl_surfshare_esc {
+    uint32_t version, surfaceID, plane, hClient, hSrcClient, hSrcMemory, status, pad;
+    uint64_t size;
+};
+static io_connect_t nvmtl_ws_conn;
+static pthread_once_t nvmtl_ws_conn_once = PTHREAD_ONCE_INIT;
+static void nvmtl_ws_conn_open(void)
+{
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    if (!s) return;
+    io_connect_t c = 0;
+    if (IOServiceOpen(s, mach_task_self(), 0x4E560000u, &c) == KERN_SUCCESS) nvmtl_ws_conn = c;
+    IOObjectRelease(s);
+    nvlog("WindowServer completion marks: %s", nvmtl_ws_conn ? "own NVRM connection" : "NVK's connection (own one refused)");
+}
+static io_connect_t nvmtl_ws_mark_conn(void)
+{
+    pthread_once(&nvmtl_ws_conn_once, nvmtl_ws_conn_open);
+    return nvmtl_ws_conn;
+}
+// WindowServer completion mark (NVAccel nvSurfGpuEscape), on the surface escape: 0 = the kernel took it
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
 {
+    const io_connect_t c = nvmtl_ws_mark_conn();
+    if (c) {
+        struct nvmtl_surfshare_esc e = { .version = 2u, .surfaceID = surfaceID, .plane = 0x80000000u | (pending ? 1u : 0u),
+                                      .status = 0x80000002u };
+        uint64_t cmd = 0xE3u;   // NVRM_ESC_SURF_DIRTY
+        size_t out = sizeof e;
+        if (IOConnectCallMethod(c, 1, &cmd, 1, &e, sizeof e, NULL, NULL, &e, &out) == KERN_SUCCESS) return e.status;
+    }
     if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
     return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
 }
