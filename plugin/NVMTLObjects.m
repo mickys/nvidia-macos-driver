@@ -5099,12 +5099,40 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 // cannot order that swap after an NVK fence, so wait for the pixels to finish
 // before allowing the surface to become scanout. Other applications keep the
 // normal submission-only contract.
+// With the swap waiting in NVAccel, nothing here paces WindowServer any more: it commits composite after composite as fast
+// as its CPU side allows, and when the GPU falls behind (a screen capture adds a second composite and an NV12 conversion per
+// frame) the queue grows until swaps wait over 100 ms (debug.nvaccel_surface_gpu_timeouts) and every app's drawables come
+// back late. Up to 2.4.3-mickys.8 the IOSurface use counts on the app drawables had hidden it by throttling the apps to
+// WindowServer's completion, at the cost of one vblank per app frame. So WindowServer keeps at most NVMTL_WS_INFLIGHT
+// (default 2) of these submissions in flight: after submitting this one it waits for the one two back to finish, like a
+// triple-buffered swap chain. 0 = no limit (the pre-.9 behaviour); 1 = each composite waits for the previous one.
+static unsigned nvmtl_ws_inflight_cap(void) {
+    static int cap = -1;
+    if (cap < 0) { const char *e = getenv("NVMTL_WS_INFLIGHT"); int v = e && *e ? atoi(e) : 2;
+        cap = v < 0 ? 0 : v > 8 ? 8 : v;
+        nvlog("WindowServer submissions in flight: %s%d (NVMTL_WS_INFLIGHT=%s)", cap ? "at most " : "unlimited, ", cap, e ? e : "unset"); }
+    return (unsigned)cap;
+}
 - (BOOL)commitAndWaitUntilSubmitted {
     static int ws = -1;
     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
     [self commit];
     // nvmtl_ws_kernel_waits: the swap waits for this composite in NVAccel instead (nvmtl_ws_mark_pending at commit)
-    if (ws && !nvmtl_ws_kernel_waits()) [self waitUntilCompleted]; else [self waitUntilScheduled];
+    if (ws && !nvmtl_ws_kernel_waits()) [self waitUntilCompleted];
+    else {
+        [self waitUntilScheduled];
+        const unsigned cap = ws ? nvmtl_ws_inflight_cap() : 0;
+        if (cap) {
+            static NSMutableArray *ring; static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+            NSMutableArray *older = nil;
+            os_unfair_lock_lock(&lock);
+            if (!ring) ring = [NSMutableArray new];
+            [ring addObject:self];
+            while (ring.count > cap) { if (!older) older = [NSMutableArray new]; [older addObject:ring.firstObject]; [ring removeObjectAtIndex:0]; }
+            os_unfair_lock_unlock(&lock);
+            for (NVMTLCommandBuffer *old in older) [old waitUntilCompleted];
+        }
+    }
     return self.status != MTLCommandBufferStatusError;
 }
 - (void)commit {
