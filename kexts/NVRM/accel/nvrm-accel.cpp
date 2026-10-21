@@ -1386,6 +1386,12 @@ static bool nvSurfWaitReady(unsigned int id)
         uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
         if ((int)(ns / 1000) > gSurfWaitMaxUs) gSurfWaitMaxUs = (int)(ns / 1000);
         OSAddAtomic64(1, ready ? &gCntSurfWaits : &gCntSurfTimeouts);
+        // Diagnostic (2026-10-22): a swap or page-off that waited over 50 ms names itself, so the kernel log can be read
+        // beside the plugin's two-plane surface trace (which shows ~100 ms commit-to-completion gaps for the same stalls).
+        if (ns > 50000000ull) {
+            char nm[32] = { 0 }; proc_selfname(nm, sizeof nm);
+            ALOG("SVWAIT surface %u by %s: %llu us, %s", id, nm, (unsigned long long)(ns / 1000), ready ? "ready" : "TIMEOUT (mark dropped)");
+        }
     }
     return ready;
 }
