@@ -174,6 +174,14 @@ SSH or from safe mode to recover). Overrides are refused unless root-owned and n
 same vendor and product as the display. Changing the framebuffer rebuilds the Auxiliary Kernel Collection (as NullMoth's
 installer does) and needs a restart.
 
+**Not part of the overlay, but worth more than any of it: boot without `-nvrmnoflip`.** With that boot-arg (the copy-path
+scan-out; some guides and this VM's own setup used it because screen capture read black with zero-copy on driver 2.3.3) the
+kernel copies every display frame to the panel from the composite's system memory, so it first pages the whole 8 MB
+composite off VRAM, ~2 ms with the accelerator lock held, ~100 times a second. Since the kernel's page-off waits for the GPU
+(2.3.7+), capture works with zero-copy scan-out. Measured on a GTX 1650 at 1080p/165 Hz (2.4.3, 2026-10-21): a full-screen
+GPU app 140-150 -> 157-164 fps, Parsec 55-60 -> 60-66 fps, screencapture recordings correct. Check: `sysctl
+debug.nvaccel_iop_flip` is 1; try it live with `sudo sysctl -w debug.nvaccel_iop_flip=1`.
+
 **Optional, `--event-wait`: less CPU while apps wait for the GPU.** NullMoth's plugin lets ordinary apps poll for GPU
 completion (WindowServer already waits for an event). `--event-wait` writes `NVRM_EVENT_WAIT=1` into `nvrm610.conf`, a
 setting NullMoth's driver has (its `docs/EVENT-WAIT.md`), so apps sleep until the GPU signals. Measured on a GTX 1650: a
