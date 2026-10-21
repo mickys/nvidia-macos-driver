@@ -8,8 +8,9 @@ supported by NullMoth. Report problems with it at
 
 By default it replaces nothing: NullMoth's plugin loads `libnvencvt.dylib` by itself since 2.3.7, so the overlay adds the
 library next to it, one line in `nvrm610.conf` and `/usr/local/bin/nvenc-run`. With `--desktop` it also replaces the Metal
-plugin binary (`NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver`) with this fork's build. The kernel extensions, firmware
-and everything else always stay NullMoth's.
+plugin binary (`NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver`) with this fork's build, and with `--resolution` the
+framebuffer kernel extension's binary (`NVRMFB.kext/Contents/MacOS/NVRMFB`). Either, both or neither; NVRM, NVAccel,
+the firmware and everything else always stay NullMoth's.
 
 ## What it changes
 
@@ -82,6 +83,26 @@ for encoders. `nvenc-run` sets `DYLD_INSERT_LIBRARIES` for the one tool. That wo
 from evermeet.cx or Homebrew) and, with the boot settings NullMoth's driver needs (relaxed SIP, `amfi_get_out_of_my_way`),
 also for hardened and Apple binaries such as `/usr/bin/avconvert`; on a stock Mac those would drop the variable.
 
+**Optional, `--resolution`: more desktop sizes and refresh rates.** NullMoth's framebuffer offers only display timings at
+least as large as the boot screen, and leaves smaller desktops to macOS's scaled modes. Where those cannot be shown (NVKMS
+refuses scaled modes on some rasters, for example the 4K-only boot raster of an HDMI dummy plug), the desktop cannot go
+below the boot size. This fork's framebuffer build also offers the smaller timings the display lists and NVKMS validates
+(turned on by `/Library/NullMoth/nvfb-small`; a boot-arg `nvfbsmall=0` / `=1` overrides the file). It also reads EDID
+overrides: `/Library/NullMoth/edid-override/<vendor>-<product>.bin`, the display's own EDID plus extra detailed timings,
+handed to NVKMS with every display query, so NVKMS validates them against the link and macOS lists them. The
+`nvfb-edid` tool writes them:
+
+```bash
+nvfb-edid list                                    # connected displays, their timings, override state
+sudo nvfb-edid add 1920x1080@144 2560x1440@120    # up to 6 extra timings (CVT reduced blanking v2); restart
+sudo nvfb-edid remove                             # the display's own EDID again; restart
+```
+
+Add only timings the display can show: a real monitor may stay black on one it does not support (remove the file over
+SSH or from safe mode to recover). Overrides are refused unless root-owned and not writable by others, valid, and for the
+same vendor and product as the display. Changing the framebuffer rebuilds the Auxiliary Kernel Collection (as NullMoth's
+installer does) and needs a restart.
+
 ## Requirements
 
 - NullMoth's driver **2.4.3** installed and running. The installer refuses anything else: it checks NullMoth's version
@@ -90,7 +111,7 @@ also for hardened and Apple binaries such as `/usr/bin/avconvert`; on a stock Ma
   so an overlay is built for one NullMoth version (`COMPATIBLE-DRIVERS` in the package).
 - An x86_64 Mac (Intel or AMD hackintosh) running macOS 15 or 26, as NullMoth's driver requires. Tested only on
   macOS 26.7.1 with an RTX 4090 and a GTX 1650 so far.
-- The encoder part needs an RTX 40 card or a GTX 1650 (TU117: GTX 1650, T400 / T600 / T1000). The desktop part works on every card the driver supports.
+- The encoder part needs an RTX 40 card or a GTX 1650 (TU117: GTX 1650, T400 / T600 / T1000). The desktop and resolution parts work on every card the driver supports.
 
 ## Install
 
@@ -102,12 +123,20 @@ sudo ./install.sh --cli-aliases        # and ffmpeg/HandBrakeCLI/avconvert throu
 sudo ./install.sh --no-decoders        # the encoders only (NVENCVT_NO_DEC=1 in /usr/local/etc/nvencvt.conf)
 sudo ./install.sh --desktop            # also this fork's plugin build (see "What it changes")
 sudo ./install.sh --desktop --nvenc=off  # the plugin build only, no encoder
+sudo ./install.sh --resolution         # also this fork's framebuffer build: smaller desktops, EDID overrides (restart)
+sudo ./install.sh --desktop --resolution  # both
 ```
+
+Each run installs exactly the parts named: running `sudo ./install.sh` again without `--desktop` or `--resolution` puts
+NullMoth's plugin or framebuffer back (the backup stays the one from the first install).
 
 Apps you open afterwards get the encoder; with `--desktop`, log out and back in (or restart) so WindowServer loads the
 plugin. The installer checks every file against `SHA256SUMS`, backs up the current plugin, its signature and
 `nvrm610.conf` to `/Library/NullMoth/overlay-backup-<date>`, installs, re-signs the bundle (only with `--desktop`) and sets
-`NVMTL_NVENCVT` in `nvrm610.conf`, and installs `/usr/local/bin/nvenc-run` (unless `--nvenc=off`).
+`NVMTL_NVENCVT` in `nvrm610.conf`, and installs `/usr/local/bin/nvenc-run` (unless `--nvenc=off`). With `--resolution`
+it also backs up NullMoth's NVRMFB binary, installs this fork's, rebuilds the Auxiliary Kernel Collection (about a minute;
+it keeps the old collection unless all of NullMoth's kernel extensions made it into the new one) and installs
+`/usr/local/bin/nvfb-edid`; restart afterwards.
 
 ## Undo
 
@@ -116,7 +145,9 @@ sudo ./uninstall.sh
 ```
 
 It puts the plugin, its signature and `nvrm610.conf` back exactly as they were, and removes `libnvencvt.dylib`,
-`nvenc-run`, the `--cli-aliases` lines and the `--no-decoders` setting. Then log out and back in. Updating NullMoth's driver also replaces the overlay (its installer writes the whole bundle).
+`nvenc-run`, the `--cli-aliases` lines and the `--no-decoders` setting; after `--resolution` it also puts NullMoth's
+NVRMFB back (kernel collection rebuilt) and removes `nvfb-edid` and `/Library/NullMoth/nvfb-small` (EDID override files
+stay: NullMoth's framebuffer ignores them). Then log out and back in, or restart after `--resolution`. Updating NullMoth's driver also replaces the overlay (its installer writes the whole bundle).
 
 ## Check that it is active
 
@@ -132,6 +163,8 @@ It puts the plugin, its signature and `nvrm610.conf` back exactly as they were, 
 
 ## Source
 
+- Framebuffer (`--resolution`): `kexts/NVRMFB` at the same tag (NullMoth 2.4.3 plus three commits), built with
+  `build/fb_build.sh`; `nvfb-edid` from `tools/nvfb-edid.c`.
 - Plugin: `plugin/` of [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) at the tag named in
   `SOURCE` (NullMoth 2.4.3 plus the overlay's commits), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
 - Encoder: [mickys/nvenc](https://github.com/mickys/nvenc) at the commit named in `SOURCE`.
