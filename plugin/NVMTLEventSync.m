@@ -275,12 +275,25 @@ static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
 // read (Parsec converting the captured frame to NV12) raced WindowServer's next composite into the same surface: the
 // encoder got a frame from two captures later in place of the one it was given (a counter drawn on the desktop read
 // N-1, N+1, N), about 6 times in 30 s at 80 frames a second on the GTX 1650.
-static CFMutableArrayRef nvmtl_surface_use_begin(NSSet *resources) {
+// WindowServer counts only the surfaces its work writes (the captured frames). Counting the ones it reads held every
+// app's drawable in use until the composite that read it had finished on the GPU, and CAMetalLayer hands a drawable
+// out only when IOSurfaceIsInUse is false: the app's present cycle gained a frame, and at 144 Hz a full-screen Metal
+// app ran at exactly 72 fps (165 Hz: 130-160 instead of 150-160; 120 Hz unaffected). NVMTL_SURF_USE_COUNT=0 turns
+// the counting off, 1 counts every surface the work touches, 2 (WindowServer's default) only the written ones.
+static CFMutableArrayRef nvmtl_surface_use_begin(NSSet *resources, NSSet *written) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("NVMTL_SURF_USE_COUNT");
+        mode = e ? atoi(e) : ((getprogname() && !strcmp(getprogname(), "WindowServer")) ? 2 : 1);
+    }
+    if (!mode) return NULL;
     CFMutableArrayRef used = NULL;
     for (id o in resources) {
         if (![o isKindOfClass:[NVMTLTexture class]]) continue;
-        IOSurfaceRef sf = ((NVMTLTexture *)o)->_surf;
+        NVMTLTexture *t = (NVMTLTexture *)o, *root = t->_parent ?: t;
+        IOSurfaceRef sf = root->_surf;
         if (!sf) continue;
+        if (mode == 2 && ![written containsObject:root]) continue;
         if (!used) used = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
         else if (CFArrayContainsValue(used, CFRangeMake(0, CFArrayGetCount(used)), sf)) continue;
         CFArrayAppendValue(used, sf);
@@ -344,7 +357,7 @@ static int nvmtl_skip_empty_on(void) {
     part->commands = _c;
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
-    part->inUse = nvmtl_surface_use_begin(part->resources);
+    part->inUse = nvmtl_surface_use_begin(part->resources, part->surfaces);
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
     // A surface whose VRAM is shared is covered by the kernel (a CPU lock's page-off waits for the pending write); one we
     // write through a private image is copied out only after the GPU has finished, and a CPU lock does not wait for that.
