@@ -1897,6 +1897,39 @@ int nvmtl_vk_surface_share_on(void)
     }
     return on;
 }
+// kexts/NVRM/nvrm_surfshare_abi.h (version 2), which the plugin build does not see
+struct nvmtl_surfshare_esc {
+    uint32_t version, surfaceID, plane, hClient, hSrcClient, hSrcMemory, status, pad;
+    uint64_t size;
+};
+// Connections of the plugin's own to NVAccel's RM bridge for the surface escape, which needs no RM client or bound fd.
+// NVRM's user client holds a per-connection gate across every escape, so an escape that waits (a VRAM dirty mark waits
+// for the accelerator lock) holds up every other escape on its connection. 0: WindowServer's completion marks, 1: VRAM
+// dirty marks; NVK's own connection then never waits for the accelerator lock in an escape of ours.
+static io_connect_t nvmtl_esc_conns[2];
+static pthread_once_t nvmtl_esc_once[2] = { PTHREAD_ONCE_INIT, PTHREAD_ONCE_INIT };
+static void nvmtl_esc_open(int which)
+{
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    if (!s) return;
+    io_connect_t c = 0;
+    if (IOServiceOpen(s, mach_task_self(), 0x4E560000u, &c) == KERN_SUCCESS) nvmtl_esc_conns[which] = c;
+    IOObjectRelease(s);
+    nvlog("surface %s: %s", which ? "dirty marks" : "completion marks", nvmtl_esc_conns[which] ? "own NVRM connection" : "NVK's connection (own one refused)");
+}
+static void nvmtl_esc_open0(void) { nvmtl_esc_open(0); }
+static void nvmtl_esc_open1(void) { nvmtl_esc_open(1); }
+// 0xFFFFFFFF when the connection is missing or the call fails: the caller then uses NVK's
+static uint32_t nvmtl_surf_esc(int which, uint32_t surfaceID, uint32_t plane)
+{
+    pthread_once(&nvmtl_esc_once[which], which ? nvmtl_esc_open1 : nvmtl_esc_open0);
+    const io_connect_t c = nvmtl_esc_conns[which];
+    if (!c) return 0xFFFFFFFFu;
+    struct nvmtl_surfshare_esc e = { .version = 2u, .surfaceID = surfaceID, .plane = plane, .status = 0x80000002u };
+    uint64_t cmd = 0xE3u;   // NVRM_ESC_SURF_DIRTY
+    size_t out = sizeof e;
+    return IOConnectCallMethod(c, 1, &cmd, 1, &e, sizeof e, NULL, NULL, &e, &out) == KERN_SUCCESS ? e.status : 0xFFFFFFFFu;
+}
 static int nvmtl_vk_surface_mark_newest(uint32_t surfaceID, uint32_t plane, uint32_t flags)
 {
     static int on = -1;
@@ -1908,7 +1941,8 @@ static int nvmtl_vk_surface_mark_newest(uint32_t surfaceID, uint32_t plane, uint
               pnvk_surface_dirty ? "present" : "ABSENT", e ?: "unset");
     }
     if (!on || !g_dev) return -1;
-    uint32_t st = pnvk_surface_dirty(g_dev, surfaceID, plane | flags);
+    uint32_t st = nvmtl_surf_esc(1, surfaceID, plane | flags);
+    if (st == 0xFFFFFFFFu) st = pnvk_surface_dirty(g_dev, surfaceID, plane | flags);
     if (st == 0x80000007u) return 1;    /* NVRM_SS_BUSY: a try that found the accelerator lock taken */
     if (st) { static unsigned n; if (n++ < 8 || n % 2000 == 0) nvlog("surface %u dirty refused (%#x) - copy-out (%u so far)", surfaceID, st, n); }
     return st ? -1 : 0;
@@ -1925,38 +1959,11 @@ int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane) { return nvmt
 // frame stalled ~117 ms, several times a minute while a capture ran (debug.nvaccel_surface_gpu_timeouts, one per stall).
 // The mark escape touches no RM state, so the connection needs no RM client or bound fd. Falls back to NVK's connection
 // when it cannot be opened.
-// kexts/NVRM/nvrm_surfshare_abi.h (version 2), which the plugin build does not see
-struct nvmtl_surfshare_esc {
-    uint32_t version, surfaceID, plane, hClient, hSrcClient, hSrcMemory, status, pad;
-    uint64_t size;
-};
-static io_connect_t nvmtl_ws_conn;
-static pthread_once_t nvmtl_ws_conn_once = PTHREAD_ONCE_INIT;
-static void nvmtl_ws_conn_open(void)
-{
-    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
-    if (!s) return;
-    io_connect_t c = 0;
-    if (IOServiceOpen(s, mach_task_self(), 0x4E560000u, &c) == KERN_SUCCESS) nvmtl_ws_conn = c;
-    IOObjectRelease(s);
-    nvlog("WindowServer completion marks: %s", nvmtl_ws_conn ? "own NVRM connection" : "NVK's connection (own one refused)");
-}
-static io_connect_t nvmtl_ws_mark_conn(void)
-{
-    pthread_once(&nvmtl_ws_conn_once, nvmtl_ws_conn_open);
-    return nvmtl_ws_conn;
-}
 // WindowServer completion mark (NVAccel nvSurfGpuEscape), on the surface escape: 0 = the kernel took it
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
 {
-    const io_connect_t c = nvmtl_ws_mark_conn();
-    if (c) {
-        struct nvmtl_surfshare_esc e = { .version = 2u, .surfaceID = surfaceID, .plane = 0x80000000u | (pending ? 1u : 0u),
-                                      .status = 0x80000002u };
-        uint64_t cmd = 0xE3u;   // NVRM_ESC_SURF_DIRTY
-        size_t out = sizeof e;
-        if (IOConnectCallMethod(c, 1, &cmd, 1, &e, sizeof e, NULL, NULL, &e, &out) == KERN_SUCCESS) return e.status;
-    }
+    const uint32_t st = nvmtl_surf_esc(0, surfaceID, 0x80000000u | (pending ? 1u : 0u));
+    if (st != 0xFFFFFFFFu) return st;
     if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
     return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
 }
