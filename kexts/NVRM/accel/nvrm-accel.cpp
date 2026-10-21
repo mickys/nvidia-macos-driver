@@ -1395,6 +1395,19 @@ NVACCEL_CNT(nvaccel_surface_gpu_marks,    gCntSurfMarks,    "pending/ready marks
 NVACCEL_CNT(nvaccel_surface_gpu_waits,    gCntSurfWaits,    "swaps that waited here for their composite to finish");
 NVACCEL_CNT(nvaccel_surface_gpu_timeouts, gCntSurfTimeouts, "swaps whose composite did not finish within 100 ms");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_wait_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gSurfWaitMaxUs, 0, "longest swap wait for a composite, us");
+// Page-off order (fork). NullMoth's order: the copy engine copies VRAM into one physically contiguous staging buffer, then
+// the CPU copies that into the surface's pages (8 MB: ~1.3 ms CE + ~0.8 ms CPU on the GTX 1650), all with the accelerator
+// lock held, which every other GPU client's kernel call (VRAM imports, dirty marks) then waits on. The copy engine can write
+// the surface's own pages (runs of contiguous ones coalesced, the per-page descriptor otherwise); that path was the fallback
+// and is now tried first. debug.nvaccel_pageoff_direct=0 restores the staging order. Per path: count and microseconds.
+static int gPageoffDirect = 1;
+static SInt64 gPageoffDirectN, gPageoffDirectUs, gPageoffStagedN, gPageoffStagedUs, gPageoffDirectFail;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gPageoffDirect, 0, "1 = the copy engine writes the surface's pages directly (fork); 0 = contiguous staging buffer + CPU copy (NullMoth's order)");
+NVACCEL_CNT(nvaccel_pageoff_direct_n,    gPageoffDirectN,    "page-offs copied directly into the surface's pages");
+NVACCEL_CNT(nvaccel_pageoff_direct_us,   gPageoffDirectUs,   "microseconds those took on the copy engine");
+NVACCEL_CNT(nvaccel_pageoff_direct_fail, gPageoffDirectFail, "direct page-offs that failed and fell back to the staging buffer");
+NVACCEL_CNT(nvaccel_pageoff_staged_n,    gPageoffStagedN,    "page-offs through the staging buffer");
+NVACCEL_CNT(nvaccel_pageoff_staged_us,   gPageoffStagedUs,   "microseconds those took (copy engine + CPU copy)");
 static SInt64 gCntIopAsync, gCntIopAsyncRefused, gCntIopAsyncDrop;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsync, 0, "1 = the swap runs on a thread call and completes through signalTransactionInterrupt (Apple's shape); 0 = the earlier synchronous flip");
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
@@ -1427,6 +1440,9 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_res_new);        sysctl_register_oid(&sysctl__debug_nvaccel_res_free);
     sysctl_register_oid(&sysctl__debug_nvaccel_map_commit);     sysctl_register_oid(&sysctl__debug_nvaccel_map_release);
     sysctl_register_oid(&sysctl__debug_nvaccel_map_free);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_direct);   sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_direct_n);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_direct_us); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_direct_fail);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_staged_n); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_staged_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
@@ -1727,19 +1743,6 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
 static IOLock *volatile gNVSVStageLock;
 static IOBufferMemoryDescriptor *gNVSVStageBuf;
 static unsigned gNVSVStaged, gNVSVStageNoBuf, gNVSVStageBackoff;
-// Page-off order (fork). NullMoth's order: the copy engine copies VRAM into one physically contiguous staging buffer, then
-// the CPU copies that into the surface's pages (8 MB: ~1.3 ms CE + ~0.8 ms CPU on the GTX 1650), all with the accelerator
-// lock held, which every other GPU client's kernel call (VRAM imports, dirty marks) then waits on. The copy engine can write
-// the surface's own pages (runs of contiguous ones coalesced, the per-page descriptor otherwise); that path was the fallback
-// and is now tried first. debug.nvaccel_pageoff_direct=0 restores the staging order. Per path: count and microseconds.
-static int gPageoffDirect = 1;
-static SInt64 gPageoffDirectN, gPageoffDirectUs, gPageoffStagedN, gPageoffStagedUs, gPageoffDirectFail;
-SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gPageoffDirect, 0, "1 = the copy engine writes the surface's pages directly (fork); 0 = contiguous staging buffer + CPU copy (NullMoth's order)");
-NVACCEL_CNT(nvaccel_pageoff_direct_n,    gPageoffDirectN,    "page-offs copied directly into the surface's pages");
-NVACCEL_CNT(nvaccel_pageoff_direct_us,   gPageoffDirectUs,   "microseconds those took on the copy engine");
-NVACCEL_CNT(nvaccel_pageoff_direct_fail, gPageoffDirectFail, "direct page-offs that failed and fell back to the staging buffer");
-NVACCEL_CNT(nvaccel_pageoff_staged_n,    gPageoffStagedN,    "page-offs through the staging buffer");
-NVACCEL_CNT(nvaccel_pageoff_staged_us,   gPageoffStagedUs,   "microseconds those took (copy engine + CPU copy)");
 static IOLock *nvSVStageLock(void)
 {
     if (!gNVSVStageLock) {
