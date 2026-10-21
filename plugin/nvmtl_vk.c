@@ -6207,7 +6207,7 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
     memcpy(dst, src, n);
 }
 
-/* PR #96 (deferred surface-upload wait), NVMTL_ASYNC_SURFIN=<n> uploads in flight (this fork: 2 when unset; 0 = the synchronous upload below).
+/* PR #96 (deferred surface-upload wait), NVMTL_ASYNC_SURFIN=<n> uploads in flight (0 or unset: the synchronous upload below).
  * The upload is submitted without waiting and its handle is kept on the image (nvk_image.up_token), so the lifetime guard
  * of the async texture uploads finishes it before the image is destroyed, migrated, read back or uploaded again (the
  * use-after-free that had #96 reverted). At most n deferred uploads are in flight per process: the oldest is finished
@@ -6421,9 +6421,9 @@ static unsigned nvmtl_async_surfin(void)
     static int n = -1;
     if (n < 0) {
         const char *e = getenv("NVMTL_ASYNC_SURFIN");
-        const long v = e && *e ? strtol(e, NULL, 10) : 2;   // this fork: on by default, 2 in flight; 0 turns it off
+        const long v = e && *e ? strtol(e, NULL, 10) : 0;   // opt-in: 2 = two uploads in flight
         n = v <= 0 ? 0 : v > NVMTL_SURFIN_MAX ? NVMTL_SURFIN_MAX : (int)v;
-        nvlog("vk: deferred surface upload %s (NVMTL_ASYNC_SURFIN=%d, PR #96)", n ? "ON" : "OFF", n);
+        nvlog("vk: deferred surface upload %s (NVMTL_ASYNC_SURFIN=%d, PR #96)", n ? "ON" : "OFF (default)", n);
     }
     return (unsigned)n;
 }
