@@ -124,7 +124,7 @@ It puts the plugin, its signature and `nvrm610.conf` back exactly as they were, 
   `SHA256SUMS`, or `shasum -a 256` the file.
 - Encoder: apps list it as "NVENC - H.264 - (NVIDIA <your card>) - mickys/nvenc - <version>" /
   `org.nvenc.videoencoder.avc` and "NVENC - HEVC - (NVIDIA <your card>) - mickys/nvenc - <version>" /
-  `org.nvenc.videoencoder.hevc`, and AV1 (for example "NVENC - H.264 - (NVIDIA RTX 4090) - mickys/nvenc - 0.9.1");
+  `org.nvenc.videoencoder.hevc`, and AV1 (for example "NVENC - H.264 - (NVIDIA RTX 4090) - mickys/nvenc - 0.9.2");
   Parsec's host log (`~/.parsec/log.txt`) says `encoder = Hardware`.
 - Command line: `nvenc-run ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=60 -t 5 -c:v hevc_videotoolbox -b:v 20M /tmp/t.mp4`
   writes a 5-second HEVC file (about 1.3 s on an RTX 4090); without `nvenc-run` the same command fails with
