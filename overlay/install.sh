@@ -2,8 +2,12 @@
 # Install the mickys overlay on top of NullMoth's NVIDIA driver: adds the open-source encoder libnvencvt.dylib next to
 # NullMoth's Metal plugin in /Library/GPUBundles/NVMTLDriver.bundle, which loads it by itself since 2.3.7
 # (NVMTL_NVENCVT in nvrm610.conf). NullMoth's files stay as they are.
-#   sudo ./install.sh [--desktop] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases] [--no-decoders]
+#   sudo ./install.sh [--desktop] [--resolution] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases] [--no-decoders]
 #     --desktop      also replace the plugin binary with this fork's build (CPU-drawn windows uploaded by the GPU)
+#     --resolution   also replace the framebuffer kext's binary (NVRMFB) with this fork's build: desktop sizes below the
+#                    boot screen's (/Library/NullMoth/nvfb-small) and EDID overrides for more modes (nvfb-edid); restart
+# Each run installs exactly the parts asked for: running it again without --desktop or --resolution puts NullMoth's own
+# plugin or framebuffer back.
 #     --nvenc        which processes get the open-source H.264/HEVC encoder (RTX 40 only): 1 = every app (default), a
 #                    comma-separated list of process names to limit it to those, off = none
 #     --cli-aliases  also make ffmpeg, HandBrakeCLI and avconvert run through nvenc-run in interactive zsh/bash shells
@@ -14,9 +18,10 @@
 # Undo: sudo ./uninstall.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-NVENC=1; ALIASES=0; ENCONLY=1; NODEC=0
+NVENC=1; ALIASES=0; ENCONLY=1; NODEC=0; RES=0
 for a in "$@"; do case $a in
   --desktop) ENCONLY=0 ;;
+  --resolution) RES=1 ;;
   --encoder-only) ENCONLY=1 ;;   # the default since 2.3.7-2; kept so older instructions still work
   --nvenc=*) NVENC=${a#--nvenc=} ;;
   --cli-aliases) ALIASES=1 ;;
@@ -28,11 +33,12 @@ ok() { echo "   ok  $*"; }
 [ "$(id -u)" = 0 ] || die "run with sudo"
 case $NVENC in off|1) ;; *) [[ $NVENC =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] || die "--nvenc: process names separated by commas, 1 or off" ;; esac
 [ "$NVENC" != off ] || [ $ALIASES = 0 ] || die "--cli-aliases needs the encoder (not --nvenc=off)"
-[ "$NVENC" != off ] || [ $ENCONLY = 0 ] || die "--nvenc=off without --desktop would install nothing"
+[ "$NVENC" != off ] || [ $ENCONLY = 0 ] || [ $RES = 1 ] || die "--nvenc=off without --desktop or --resolution would install nothing"
 
 OV=$(cat "$HERE/VERSION")
 B=/Library/GPUBundles/NVMTLDriver.bundle; X=$B/Contents/MacOS; C=/Library/GPUBundles/nvmtl/nvrm610.conf
 CR=$B/Contents/_CodeSignature/CodeResources
+FB=/Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB; SMALL=/Library/NullMoth/nvfb-small; EDT=/usr/local/bin/nvfb-edid
 RUN=/usr/local/bin/nvenc-run; SH=/usr/local/share/mickys-overlay; VC=/usr/local/etc/nvencvt.conf; VMARK='# mickys overlay --no-decoders'; RC="/etc/zshrc /etc/bashrc"; MARK='# mickys overlay --cli-aliases'
 echo "== mickys overlay $OV (for NullMoth driver $(paste -sd ' ' "$HERE/COMPATIBLE-DRIVERS"))"
 
@@ -64,6 +70,8 @@ for k in NVRM NVAccel NVRMFB; do
 done
 ok "running kernel driver: $HAVE"
 [ ! -e "$RUN" ] || grep -q '^# nvenc-run (mickys overlay)' "$RUN" || die "$RUN exists and is not the overlay's; move it away first"
+[ ! -e "$EDT" ] || grep -q 'nvfb-edid list' "$EDT" || die "$EDT exists and is not the overlay's; move it away first"
+[ -f "$FB" ] || die "$FB missing; reinstall NullMoth $HAVE"
 
 echo "== 2. back up what is there now"
 L=/Library/NullMoth/overlay-backup-latest
@@ -79,6 +87,13 @@ else
   echo "$HAVE" > "$BK/driver-version"
   ln -sfn "$BK" "$L"
   ok "backup in $BK"
+fi
+# NullMoth's framebuffer binary (a backup made by an overlay before 2.4.3-mickys.5 has none; the one on disk is NullMoth's
+# unless it is this package's)
+if [ ! -f "$BK/NVRMFB" ]; then
+  cmp -s "$FB" "$HERE/payload/NVRMFB" && die "$FB is this overlay's build but the backup has no NullMoth NVRMFB; reinstall NullMoth $HAVE"
+  cp -p "$FB" "$BK/NVRMFB" || die "backup to $BK failed"
+  ok "NullMoth's NVRMFB added to the backup"
 fi
 
 echo "== 3. install"
@@ -103,9 +118,44 @@ else
   ok "plugin and libnvencvt.dylib installed, bundle re-signed"
 fi
 
+# the Auxiliary Kernel Collection with the framebuffer binary on disk, built the way NullMoth's installer builds it; every
+# com.nullmoth kext must be in the new collection, else the old one stays
+auxkc() {
+  local KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc K=/System/Library/Kernels/kernel NEW KARG=(--allow-missing-kdk)
+  [ -f "$K" ] && KARG+=(--kernel "$K"); NEW="$KC.mickys-new"; rm -f "$NEW"
+  kmutil create -n aux --volume-root / "${KARG[@]}" -B /System/Library/KernelCollections/BootKernelExtensions.kc \
+    -S /System/Library/KernelCollections/SystemKernelExtensions.kc --repository /Library/Extensions -A "$NEW" -z >/tmp/mickys-kmutil.log 2>&1 \
+    || { tail -20 /tmp/mickys-kmutil.log; return 1; }
+  local INS; INS=$(kmutil inspect -a x86_64 -A "$NEW" 2>/dev/null || true)
+  for k in NVRM NVAccel NVRMFB; do
+    grep -oE 'com\.nullmoth\.[A-Za-z0-9]+' <<<"$INS" | grep -Fxq "com.nullmoth.$k" || { rm -f "$NEW"; echo "com.nullmoth.$k missing from the new collection"; return 1; }
+  done
+  mv -f "$NEW" "$KC"
+}
+FBWAS=$(shasum -a 256 "$FB" | cut -d' ' -f1)
+if [ $RES = 1 ]; then
+  install -o root -g wheel -m 755 "$HERE/payload/NVRMFB" "$FB"
+  : > "$SMALL"; chown root:wheel "$SMALL"; chmod 644 "$SMALL"
+  install -d -o root -g wheel -m 755 /usr/local/bin
+  install -o root -g wheel -m 755 "$HERE/payload/nvfb-edid" "$EDT"
+  xattr -d com.apple.quarantine "$FB" "$EDT" 2>/dev/null || true
+else
+  install -o root -g wheel -m 755 "$BK/NVRMFB" "$FB"
+  rm -f "$SMALL"; [ ! -e "$EDT" ] || rm -f "$EDT"
+fi
+FBCHANGED=0
+if [ "$(shasum -a 256 "$FB" | cut -d' ' -f1)" != "$FBWAS" ]; then
+  echo "   ..  rebuilding the Auxiliary Kernel Collection (about a minute)"
+  auxkc || { install -o root -g wheel -m 755 "$BK/NVRMFB" "$FB"; rm -f "$SMALL" "$EDT"; die "kmutil could not build the kernel collection; NullMoth's NVRMFB put back"; }
+  FBCHANGED=1
+fi
+if [ $RES = 1 ]; then ok "NVRMFB from this fork (smaller desktop sizes; EDID overrides: nvfb-edid list / sudo nvfb-edid add 1920x1080@144)$([ $FBCHANGED = 1 ] && echo ", kernel collection rebuilt")"
+else ok "NullMoth's NVRMFB$([ $FBCHANGED = 1 ] && echo " put back, kernel collection rebuilt")"; fi
+
 echo "== 4. settings (nvrm610.conf)"
 grep -v -E '^NVMTL_NVENCVT=|^# mickys overlay' "$C" > "$C.new" || true
-printf '# mickys overlay %s (uninstall.sh puts the original file back)\n' "$OV" >> "$C.new"
+PARTS=encoder; [ "$NVENC" != off ] || PARTS=; [ $ENCONLY = 1 ] || PARTS="$PARTS desktop"; [ $RES = 0 ] || PARTS="$PARTS resolution"
+printf '# mickys overlay %s: %s (uninstall.sh puts the original file back)\n' "$OV" "${PARTS# }" >> "$C.new"
 [ "$NVENC" = off ] || printf 'NVMTL_NVENCVT=%s\n' "$NVENC" >> "$C.new"
 chown root:wheel "$C.new"; chmod 644 "$C.new"; mv "$C.new" "$C"
 ok "NVMTL_NVENCVT=${NVENC/off/(not set)}"
@@ -148,7 +198,8 @@ else ok "hardware decoders on (H.264, HEVC, VP9, AV1, MPEG-1/2, MPEG-4 Part 2; -
 
 echo
 WHAT="the encoders and decoders"; [ $NODEC = 0 ] || WHAT="the encoders"
-if [ $ENCONLY = 1 ]; then echo "Done. Apps you open from now on get $WHAT (quit and reopen running ones)."
+if [ $FBCHANGED = 1 ]; then echo "Done. Restart the Mac to load the $([ $RES = 1 ] && echo "new framebuffer (then pick a size in System Settings > Displays)" || echo "NullMoth framebuffer again")."
+elif [ $ENCONLY = 1 ]; then echo "Done. Apps you open from now on get $WHAT (quit and reopen running ones)."
 else echo "Done. Log out and back in (or restart) so WindowServer and running apps load the new plugin."; fi
 [ "$NVENC" = off ] || echo "Command-line tools (ffmpeg, HandBrakeCLI, avconvert) see the encoder only through nvenc-run:   nvenc-run ffmpeg ...$([ $ALIASES = 1 ] || echo "   (sudo ./install.sh --cli-aliases does that for you in zsh/bash)")"
 echo "Undo: sudo $HERE/uninstall.sh   (backup: $BK)"
