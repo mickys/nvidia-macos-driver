@@ -1417,6 +1417,17 @@ NVACCEL_CNT(nvaccel_pageoff_staged_us,   gPageoffStagedUs,   "microseconds those
 static SInt64 gPageoffWaitN, gPageoffWaitUs;
 NVACCEL_CNT(nvaccel_pageoff_wait_n,      gPageoffWaitN,      "page-offs that waited for WindowServer's GPU mark first (accelerator lock held)");
 NVACCEL_CNT(nvaccel_pageoff_wait_us,     gPageoffWaitUs,     "microseconds those waits took");
+// The staged page-off's CPU half (staging buffer -> the surface's pages), with the accelerator lock held. 0 = NullMoth's
+// md->writeBytes (per physical segment); 1 = memcpy through one kernel mapping of the surface; 2 = the same with
+// non-temporal stores (no read-for-ownership of the destination); 3 / 4 = 1 / 2 split over debug.nvaccel_pageoff_threads
+// kernel threads (the caller copies one slice). A mapping that fails falls back to 0.
+static int gPageoffCpu = 0, gPageoffThreads = 4;
+static SInt64 gPageoffCpuN, gPageoffCpuUs, gPageoffCpuMapFail;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_cpu, CTLFLAG_RW | CTLFLAG_LOCKED, &gPageoffCpu, 0, "page-off CPU copy: 0 writeBytes (NullMoth), 1 mapped memcpy, 2 mapped non-temporal, 3 = 1 on threads, 4 = 2 on threads");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_threads, CTLFLAG_RW | CTLFLAG_LOCKED, &gPageoffThreads, 0, "threads for nvaccel_pageoff_cpu 3/4 (1-8, the caller included)");
+NVACCEL_CNT(nvaccel_pageoff_cpu_n,       gPageoffCpuN,       "staged page-offs' CPU copies");
+NVACCEL_CNT(nvaccel_pageoff_cpu_us,      gPageoffCpuUs,      "microseconds those CPU copies took (mapping included)");
+NVACCEL_CNT(nvaccel_pageoff_cpu_mapfail, gPageoffCpuMapFail, "CPU copies whose surface mapping failed (fell back to writeBytes)");
 static SInt64 gCntIopAsync, gCntIopAsyncRefused, gCntIopAsyncDrop;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsync, 0, "1 = the swap runs on a thread call and completes through signalTransactionInterrupt (Apple's shape); 0 = the earlier synchronous flip");
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
@@ -1453,6 +1464,9 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_direct_us); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_direct_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_staged_n); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_staged_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_wait_n);   sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_wait_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_cpu);      sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_threads);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_cpu_n);    sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_cpu_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_cpu_mapfail);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
@@ -1780,6 +1794,94 @@ static IOBufferMemoryDescriptor *nvSVStage(unsigned long long len)
     return b;
 }
 
+static void nvCopyNT(void *dst, const void *src, size_t n)
+{
+    unsigned long long *d = (unsigned long long *)dst; const unsigned long long *s = (const unsigned long long *)src;
+    size_t q = n / 64;
+    for (size_t i = 0; i < q; i++, d += 8, s += 8) {
+        const unsigned long long a0 = s[0], a1 = s[1], a2 = s[2], a3 = s[3], a4 = s[4], a5 = s[5], a6 = s[6], a7 = s[7];
+        __builtin_nontemporal_store(a0, d + 0); __builtin_nontemporal_store(a1, d + 1);
+        __builtin_nontemporal_store(a2, d + 2); __builtin_nontemporal_store(a3, d + 3);
+        __builtin_nontemporal_store(a4, d + 4); __builtin_nontemporal_store(a5, d + 5);
+        __builtin_nontemporal_store(a6, d + 6); __builtin_nontemporal_store(a7, d + 7);
+    }
+    __asm__ volatile("sfence" ::: "memory");
+    if (n % 64) memcpy((char *)dst + q * 64, (const char *)src + q * 64, n % 64);
+}
+static void nvCopySlice(void *dst, const void *src, size_t n, bool nt) { if (nt) nvCopyNT(dst, src, n); else memcpy(dst, src, n); }
+
+// Copy workers: one slice each per page-off. Page-offs that copy are serialised by the staging lock, so one job table.
+struct NVCopyJob { char *dst; const char *src; size_t n; bool nt; };
+static NVCopyJob gCpJob[8];
+static IOLock *gCpLock;
+static unsigned gCpGen, gCpStarted;
+static int gCpPending;
+static void nvCopyWorker(void *arg, wait_result_t)
+{
+    const unsigned idx = (unsigned)(uintptr_t)arg;
+    unsigned seen = 0;
+    IOLockLock(gCpLock);
+    for (;;) {
+        while (gCpGen == seen) IOLockSleep(gCpLock, &gCpGen, THREAD_UNINT);
+        seen = gCpGen;
+        const NVCopyJob j = gCpJob[idx];
+        IOLockUnlock(gCpLock);
+        if (j.n) nvCopySlice(j.dst, j.src, j.n, j.nt);
+        IOLockLock(gCpLock);
+        if (--gCpPending == 0) IOLockWakeup(gCpLock, &gCpPending, false);
+    }
+}
+// threads that exist (started once, never stopped: NVAccel stays loaded while the GPU is in use)
+static unsigned nvCopyWorkers(unsigned want)
+{
+    if (!gCpLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gCpLock)) IOLockFree(l); }
+    if (!gCpLock) return 0;
+    while (gCpStarted + 1 < want && gCpStarted < 7) {
+        thread_t th = nullptr;
+        if (kernel_thread_start(nvCopyWorker, (void *)(uintptr_t)(gCpStarted + 1), &th) != KERN_SUCCESS) break;
+        thread_deallocate(th);
+        gCpStarted++;
+    }
+    return gCpStarted + 1;
+}
+static void nvCopyParallel(char *dst, const char *src, size_t n, bool nt, unsigned want)
+{
+    const unsigned t = nvCopyWorkers(want < 1 ? 1 : want > 8 ? 8 : want);
+    if (t <= 1) { nvCopySlice(dst, src, n, nt); return; }
+    size_t per = ((n / t) + 4095) & ~(size_t)4095;
+    IOLockLock(gCpLock);
+    for (unsigned i = 0; i < 8; i++) gCpJob[i] = NVCopyJob{ nullptr, nullptr, 0, nt };
+    for (unsigned i = 1; i < t; i++) {
+        size_t off = per * i;
+        if (off < n) gCpJob[i] = NVCopyJob{ dst + off, src + off, (off + per > n) ? n - off : per, nt };
+    }
+    gCpPending = (int)gCpStarted;   // every started worker wakes for a generation, with or without a slice
+    gCpGen++;
+    IOLockWakeup(gCpLock, &gCpGen, false);
+    IOLockUnlock(gCpLock);
+    nvCopySlice(dst, src, per < n ? per : n, nt);
+    IOLockLock(gCpLock);
+    while (gCpPending > 0) IOLockSleep(gCpLock, &gCpPending, THREAD_UNINT);
+    IOLockUnlock(gCpLock);
+}
+// the CPU half of a staged page-off; returns the bytes written (len on success)
+static IOByteCount nvPageoffCpuCopy(IOMemoryDescriptor *md, const void *src, IOByteCount len)
+{
+    const int mode = gPageoffCpu;
+    if (mode < 1 || mode > 4) return md->writeBytes(0, src, len);
+    IOMemoryMap *map = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere, 0, len);
+    char *dst = map ? (char *)map->getVirtualAddress() : nullptr;
+    if (!dst || map->getLength() < len) {
+        if (map) map->release();
+        OSAddAtomic64(1, &gPageoffCpuMapFail);
+        return md->writeBytes(0, src, len);
+    }
+    if (mode <= 2) nvCopySlice(dst, src, len, mode == 2);
+    else nvCopyParallel(dst, (const char *)src, len, mode == 4, (unsigned)gPageoffThreads);
+    map->release();
+    return len;
+}
+
 void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long long a3)
 {
     volatile unsigned char *r = (volatile unsigned char *)this;
@@ -1863,8 +1965,10 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
             st = q.status; usec = q.usec;
             if (st == 0) {
                 const uint64_t t0 = mach_absolute_time();
-                const IOByteCount w = md->writeBytes(0, sb->getBytesNoCopy(), (IOByteCount)len);
-                cpuUs = (mach_absolute_time() - t0) / 1000;
+                const IOByteCount w = nvPageoffCpuCopy(md, sb->getBytesNoCopy(), (IOByteCount)len);
+                uint64_t cns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &cns);
+                cpuUs = cns / 1000;
+                OSAddAtomic64(1, &gPageoffCpuN); OSAddAtomic64((SInt64)cpuUs, &gPageoffCpuUs);
                 ok = (w == (IOByteCount)len);
                 if (!ok) st = NVRM_SS_TOO_SMALL;
                 else gNVSVStaged++;
