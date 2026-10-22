@@ -1064,13 +1064,23 @@ static int nvmtl_surfin_reader_on(void) {
     return env || nvmtl_tmp_switch("/tmp/nvmtl-surfin-reader", &next, &tmp);
 }
 static uint64_t g_surfin_reader_skip;
+static BOOL nvmtl_own_bumps_cover(IOSurfaceRef s, uint32_t have, uint32_t now);
+static BOOL nvmtl_plane_seed_on(void);
+// POff8b: a plane drawn through a private image (WindowServer's NV12 capture surfaces in 8-bit Parsec) also moves by our
+// own surface-outs of its other plane (recorded own bumps); what is left must be exactly one bump, and the plane's VRAM
+// generation must not have moved.
 static BOOL nvmtl_surfin_reader_only(NVMTLTexture *r) {
-    if (!nvmtl_surfin_reader_on() || !r->_surf || !r->_vramOn || r->_vramMulti || !r->_surfSynced) return NO;
+    if (!nvmtl_surfin_reader_on() || !r->_surf || r->_vramMulti || !r->_surfSynced) return NO;
     const uint32_t now = IOSurfaceGetSeed(r->_surf);
     if (now == r->_surfSeed) return NO;
-    if (now != r->_surfSeed + 1) { r->_readerStreak = 0; return NO; }
+    BOOL one = now == r->_surfSeed + 1;
+    if (!r->_vramOn) {
+        if (!nvmtl_plane_seed_on() || nvmtl_vram_gen(r->_surf, r->_plane) != r->_surfGen) { r->_readerStreak = 0; return NO; }
+        one = one || nvmtl_own_bumps_cover(r->_surf, r->_surfSeed, now - 1);
+    }
+    if (!one) { r->_readerStreak = 0; return NO; }
     if (r->_readerStreak < 4) { r->_readerStreak++; return NO; }
-    r->_surfSeed = now; nvmtl_vram_tag_set(r->_surf, r->_plane, now); g_surfin_reader_skip++;   // _vramMulti excluded above: the plane is NVMTL_VP
+    r->_surfSeed = now; if (r->_vramOn) nvmtl_vram_tag_set(r->_surf, r->_plane, now); g_surfin_reader_skip++;   // _vramMulti excluded above: the plane is NVMTL_VP
     static unsigned n; if (n++ < 6 || n % 5000 == 0) nvlog("surface-in SKIPPED (surface %u: seed +1, a reader's lock; %llu so far)", (unsigned)IOSurfaceGetID(r->_surf), g_surfin_reader_skip);
     return YES;
 }
@@ -2959,7 +2969,10 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
             if (sr->_surf) {
                 nvmtl_pass_log(sr, ca.loadAction, ca.storeAction, (int)i);
                 if ((ca.loadAction == MTLLoadActionClear || (ca.loadAction == MTLLoadActionDontCare && nvmtl_surfin_dontcare())) && !sr->_vramMulti) nvmtl_surface_overwrite_recorded(cb, sr);
-                else nvmtl_surface_in_for_cb(cb, sr);
+                else {
+                    @synchronized (nvmtl_surface_sync(sr)) { (void)nvmtl_surfin_reader_only(sr); }
+                    nvmtl_surface_in_for_cb(cb, sr);
+                }
                 nvmtl_surf_dirty(cb, sr); }
         }
         MTLStoreAction sa = ca.storeAction;
