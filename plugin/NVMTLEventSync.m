@@ -200,7 +200,7 @@ static int nvmtl_ws_record_pages(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!last) return -1;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
     if (nvmtl_vk_record_surface_pages(&last->commands, &r->_i, (void *)r->_surf)) return -1;
-    if (![last->surfaces containsObject:t]) last->surfaces = [last->surfaces arrayByAddingObject:t];
+    if (![last->surfaces containsObject:t]) last->surfaces = [last->surfaces setByAddingObject:t];
     return 0;
 }
 static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
