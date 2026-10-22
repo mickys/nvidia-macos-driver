@@ -1414,6 +1414,9 @@ NVACCEL_CNT(nvaccel_pageoff_direct_us,   gPageoffDirectUs,   "microseconds those
 NVACCEL_CNT(nvaccel_pageoff_direct_fail, gPageoffDirectFail, "direct page-offs that failed and fell back to the staging buffer");
 NVACCEL_CNT(nvaccel_pageoff_staged_n,    gPageoffStagedN,    "page-offs through the staging buffer");
 NVACCEL_CNT(nvaccel_pageoff_staged_us,   gPageoffStagedUs,   "microseconds those took (copy engine + CPU copy)");
+static SInt64 gPageoffWaitN, gPageoffWaitUs;
+NVACCEL_CNT(nvaccel_pageoff_wait_n,      gPageoffWaitN,      "page-offs that waited for WindowServer's GPU mark first (accelerator lock held)");
+NVACCEL_CNT(nvaccel_pageoff_wait_us,     gPageoffWaitUs,     "microseconds those waits took");
 static SInt64 gCntIopAsync, gCntIopAsyncRefused, gCntIopAsyncDrop;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsync, 0, "1 = the swap runs on a thread call and completes through signalTransactionInterrupt (Apple's shape); 0 = the earlier synchronous flip");
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
@@ -1449,6 +1452,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_direct);   sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_direct_n);
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_direct_us); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_direct_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_staged_n); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_staged_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_wait_n);   sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_wait_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
@@ -1796,7 +1800,12 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     }
     // a CPU lock that arrives while WindowServer's GPU is still writing this surface waits for that write first, as a
     // normal IOSurfaceLock does on Apple's drivers (the commit marked it pending; see nvmtl_ws_mark_pending)
-    nvSurfWaitReady(_ZNK9IOSurface12getSurfaceIDEv(surf));
+    {
+        const uint64_t w0 = mach_absolute_time();
+        nvSurfWaitReady(_ZNK9IOSurface12getSurfaceIDEv(surf));
+        uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - w0, &ns);
+        if (ns >= 20000) { OSAddAtomic64(1, &gPageoffWaitN); OSAddAtomic64((SInt64)(ns / 1000), &gPageoffWaitUs); }
+    }
     IOMemoryDescriptor *md = (IOMemoryDescriptor *)_ZNK9IOSurface19getMemoryDescriptorEv(surf);
     if (!md || md->prepare(kIODirectionNone) != kIOReturnSuccess) {
         gNVSVPageoffFail++;
