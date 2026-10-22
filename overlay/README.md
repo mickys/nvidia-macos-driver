@@ -38,35 +38,31 @@ HEVC (P only) encoders and every decoder but AV1; VP9 from 65x65 up.
   380 (the only hardware VP9 and AV1 decoding on an Intel Mac). `--no-decoders` keeps only the encoders.
 
 **Optional, `--desktop`: this fork's Metal plugin.** It is NullMoth 2.5.0's plugin with this fork's changes added one by
-one, each behind its own line in `/Library/GPUBundles/nvmtl/nvrm610.conf`. Two are on by default; the others are off, so
-apart from those two the plugin behaves exactly like NullMoth's. Every change was measured on its own against NullMoth's
-plugin (GTX 1650, NullMoth 2.5.0, macOS 26.7.1, 1920x1080 at 165 Hz, zero-copy scan-out), with a full-screen Metal
-animation while the screen was captured: by Parsec (a client connected, 20 s runs) and by a screen recording.
+one, each behind its own line in `/Library/GPUBundles/nvmtl/nvrm610.conf`. One is on by default; the others are off, so
+apart from that one the plugin behaves exactly like NullMoth's. Every change was measured on its own against NullMoth's
+plugin (GTX 1650, NullMoth 2.5.0, macOS 26.7.1, zero-copy scan-out), with a full-screen Metal animation while the screen
+was captured: by Parsec (a client connected, 20 s runs) and by a screen recording, at 1080p 165 Hz and at 4K HiDPI.
 
-On by default, because they made capture faster and added no stalls:
+On by default, because it made capture faster at every resolution and added no stalls:
 
 - **NV12 plane seed** (`NVMTL_PLANE_SEED`). WindowServer draws captured frames into two-plane (NV12) surfaces. NullMoth's
   plugin copies each plane out with a lock that moves the whole surface's seed, so the other plane looks stale and is
   uploaded again from the CPU before the next frame. The plugin remembers the seed moves of its own copy-outs instead.
-- **One VRAM import per surface** (`NVMTL_SURF_IMPORT_CACHE`). CoreAnimation wraps the same window surfaces in a new texture
-  every frame, and each wrap imported the surface's video memory again (four kernel calls). The import is shared and
-  kept briefly. It needs the plane seed: on its own it made capture slower and frames out of order.
 
-| with a full-screen animation running | NullMoth 2.5.0 | `--desktop` (defaults) |
-|---|---|---|
-| Parsec stream, app / Parsec fps | 50 / 50-52 | **60 / 60-61** |
-| Parsec stream, 100 ms stalls per 20 s (`debug.nvaccel_surface_gpu_timeouts`) | 1 | 1 |
-| Screen recording, app fps | 105-110 | **157-161** |
-| Screen recording, frames out of order | 1-9 | 0-1 |
-| Safari animation in a 1600x900 window, screen updates/s | 65.5 | **78.6 (+20 %)** |
+| with a full-screen animation running | NullMoth 2.5.0 | `--desktop` (default) | with `NVMTL_SURF_IMPORT_CACHE=1` too |
+|---|---|---|---|
+| 1080p 165 Hz, Parsec: app fps / ~100 ms stalls per 20 s | 50 / 1 | 50 / 0 | **60-62 / 0** |
+| 1080p 165 Hz, screen recording: app fps | 105-110 | 118-131 | 157-161 |
+| 4K HiDPI, screen recording with Screen Sharing: app fps / stalls per 15 s | 22-28 / 0 | 25 / 1 | 14-37 / **2-67** |
+| Safari animation in a 1600x900 window (1080p), screen updates/s | 65.5 | | 78.6 |
 
-Off by default (put the line into `nvrm610.conf`, then log out and in; `=0` turns the two defaults off):
+Off by default (put the line into `nvrm610.conf`, then log out and in):
 
 | line | what it does | why it is off |
 |---|---|---|
 | `NVMTL_PLANE_SEED=0` | turns the plane seed off | (on by default) |
-| `NVMTL_SURF_IMPORT_CACHE=0` | turns the import cache off | (on by default) |
-| `NVMTL_SURFIN_UPLOAD=gpu` | CPU-drawn windows (WebKit, CoreGraphics apps) are uploaded by the GPU from their own pages instead of a CPU copy | no measurable gain at 1080p on 2.5.0; it was +67 % for a full-screen 4K Safari window on 2.4.3 (RTX 4090): worth trying on a 4K display |
+| `NVMTL_SURF_IMPORT_CACHE=1` | CoreAnimation wraps the same window surfaces in a new texture every frame, and each wrap imported the surface's video memory again (four kernel calls); the import is shared and kept briefly. Needs the plane seed | **recommended on 1080p / 1440p desktops** (Parsec 50 -> 60 fps, no stalls); at 4K HiDPI it added up to 67 stalls of ~100 ms per 15 s of capture |
+| `NVMTL_SURFIN_UPLOAD=gpu` | CPU-drawn windows (WebKit, CoreGraphics apps) are uploaded by the GPU from their own pages instead of a CPU copy | no measurable gain at 1080p on 2.5.0; it was +67 % for a full-screen 4K Safari window on 2.4.3 (RTX 4090) |
 | `NVMTL_TEX_POOL=1` | CoreAnimation's per-frame intermediate textures (blur, vibrancy) reuse released ones instead of new allocations | no measurable change |
 | `NVMTL_ASYNC_SURFIN=2` | upstream PR #96: a CPU surface upload does not wait for its GPU copy before the next one starts | **under Parsec: 36 stalls of ~100 ms per 20 s, 41 instead of 50 fps, frames jumping back** |
 | `NVMTL_SURF_MULTIPLANE=1` | two-plane (NV12) surfaces share their video memory with other processes, so a reader's CPU lock waits in the kernel | **12 stalls of ~100 ms per 20 s of screen recording**: the reader's page-off waits for the GPU with the accelerator lock held |
