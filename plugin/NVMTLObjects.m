@@ -1266,7 +1266,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
 // NVMTL_SURFIN_UPLOAD=cpu: surface-in copies with the CPU (nvmtl_vk_image_write) instead of importing the pages
 static bool nvmtl_surfin_import(void) {
     static int on = -1;
-    if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = u && (!strcmp(u, "gpu") || !strcmp(u, "1")); }   // stock-plus: opt-in (NVMTL_SURFIN_UPLOAD=gpu)
+    if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = !(u && !strcmp(u, "cpu")); }   // upstream #296 (2.5.1): on by default, =cpu off
     return on;
 }
 - (void)nvmtlSurfaceIn {
