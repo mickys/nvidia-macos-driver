@@ -1229,7 +1229,7 @@ static BOOL nvmtl_own_bumps_cover(IOSurfaceRef s, uint32_t have, uint32_t now)
     return ok;
 }
 static unsigned long long g_surfin_own_skip;
-// the plane seed (c8fb686): on by default (Parsec 1080p165 on a GTX 1650: 50 -> 60 fps with the import cache), NVMTL_PLANE_SEED=0 off
+// the plane seed (c8fb686): on by default (screen recording at 1080p165 105-110 -> 118-131 fps, no stalls at 1080p or 4K), NVMTL_PLANE_SEED=0 off
 static BOOL nvmtl_plane_seed_on(void)
 {
     static int on = -1;
