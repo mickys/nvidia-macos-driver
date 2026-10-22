@@ -176,10 +176,11 @@ and 29 % less in a Core Image blur, while the synchronous elapsed time grows by 
 
 ## Requirements
 
-- NullMoth's driver **2.5.2** installed and running. The installer refuses anything else: it checks NullMoth's version
-  record, the version of the NVRM, NVAccel and NVRMFB kernel extensions on disk, and the version of the ones running
-  (after a NullMoth update, restart before installing the overlay). The plugin and the kernel driver share interfaces,
-  so an overlay is built for one NullMoth version (`COMPATIBLE-DRIVERS` in the package).
+- NullMoth's driver **2.5.3** (or 2.5.2) installed and running. The installer refuses anything else: it checks NullMoth's
+  version record, the version of the NVRM, NVAccel and NVRMFB kernel extensions on disk, and the version of the ones
+  running (after a NullMoth update, restart before installing the overlay). The plugin and the kernel driver share
+  interfaces, so an overlay lists the NullMoth versions it was built for (`COMPATIBLE-DRIVERS` in the package). 2.5.3
+  changes only NVRM's handling of `nvregdwords=`; its NVAccel, NVRMFB and Metal plugin are byte for byte 2.5.2's.
 - An x86_64 Mac (Intel or AMD hackintosh) running macOS 15 or 26, as NullMoth's driver requires. Tested only on
   macOS 26.7.1 with an RTX 4090 and a GTX 1650 so far.
 - The encoder part needs an RTX 40 card or a GTX 1650 (TU117: GTX 1650, T400 / T600 / T1000). The desktop and resolution parts work on every card the driver supports.
