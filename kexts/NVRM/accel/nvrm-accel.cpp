@@ -17,6 +17,9 @@
 #include <mach/kmod.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IORangeAllocator.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOMemoryDescriptor.h>
 #include "IOAccelerator.h"
 #include "IOGraphicsAccelerator2.h"
 #include "IOAccelEventMachineFast2.h"
@@ -39,6 +42,10 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
 #define NV_LOG_TAG "NVAccel: "
 #endif
 #define ALOG(fmt, ...) do { kprintf(NV_LOG_TAG fmt "\n", ##__VA_ARGS__); IOLog(NV_LOG_TAG fmt "\n", ##__VA_ARGS__); } while (0)
+// Per-allocation lines: WindowServer and every Metal app create resources continuously, and logging each one filled the
+// system log (#242). They print only with the -nvaccelverbose boot-arg.
+static bool nvaccel_verbose() { static int v = -1; if (v < 0) { int x = 0; v = PE_parse_boot_argn("-nvaccelverbose", &x, sizeof x) ? 1 : 0; } return v == 1; }
+#define ALOGV(fmt, ...) do { if (nvaccel_verbose()) ALOG(fmt, ##__VA_ARGS__); } while (0)
 #include <libkern/c++/OSSymbol.h>
 #include "nvrm_vram_abi.h"
 #include <IOKit/IODeviceMemory.h>
@@ -47,6 +54,23 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
 #include "nvkms-kapi.h"
 #include <sys/sysctl.h>
 #include <libkern/OSAtomic.h>
+
+// ---- GPU core temperature, published into PerformanceStatistics -------------
+// Same register the out-of-tree NvidiaSensor.kext reads. nouveau's gp100_temp_get() reads
+// 0x020460 as well, but it insists on the "valid" bit (0x20000000) being set and returns
+// -ENODEV otherwise; a GPU whose firmware is GSP-RM never sets it, which is why
+// gp100_therm_new() refuses to attach at all under GSP. Here the range is the judge instead:
+// a value outside 1..125 C is treated as "no reading" rather than published.
+static constexpr UInt32   kNvTsensOffset     = 0x20460;
+static constexpr UInt32   kNvTsensValueMask  = 0x0001fff8u;
+static constexpr unsigned kNvTempMinC        = 1;
+static constexpr unsigned kNvTempMaxC        = 125;
+// The family rewrites PerformanceStatistics 0.25-2 s apart, so a slower writer would be
+// overwritten before iStat reads it; 250 ms keeps our key present essentially always.
+static constexpr unsigned kNvTempIntervalMs  = 250;
+// Nothing touches BAR0 until the GPU has settled: bring-up still runs for a while after start().
+static constexpr unsigned kNvTempFirstMs     = 5000;
+
 extern "C" {   // kern/thread_call.h and kern/clock.h clash with the family headers here, so the KPIs are declared by hand
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
@@ -242,13 +266,20 @@ public:
     OSObject *newSurface() APPLE_KEXT_OVERRIDE { NVSurface *o = OSTypeAlloc(NVSurface); ALOG("newSurface -> %p", o); return o; }
     OSObject *new2DContext() APPLE_KEXT_OVERRIDE { NV2DContext *c = OSTypeAlloc(NV2DContext); ALOG("new2DContext -> %p", c); return c; }
     OSObject *newVideoContext() APPLE_KEXT_OVERRIDE { NVVideoContext *c = OSTypeAlloc(NVVideoContext); ALOG("newVideoContext -> %p", c); return c; }
-    OSObject *newSysMemory() APPLE_KEXT_OVERRIDE { NVSysMemory *m = OSTypeAlloc(NVSysMemory); ALOG("newSysMemory -> %p", m); return m; }
-    OSObject *newVidMemory() APPLE_KEXT_OVERRIDE { NVVidMemory *m = OSTypeAlloc(NVVidMemory); ALOG("newVidMemory -> %p", m); return m; }
-    OSObject *newResource() APPLE_KEXT_OVERRIDE { NVResource *r = OSTypeAlloc(NVResource); OSAddAtomic64(1, &gCntResNew); ALOG("newResource -> %p", r); return r; }
+    OSObject *newSysMemory() APPLE_KEXT_OVERRIDE { NVSysMemory *m = OSTypeAlloc(NVSysMemory); ALOGV("newSysMemory -> %p", m); return m; }
+    OSObject *newVidMemory() APPLE_KEXT_OVERRIDE { NVVidMemory *m = OSTypeAlloc(NVVidMemory); ALOGV("newVidMemory -> %p", m); return m; }
+    OSObject *newResource() APPLE_KEXT_OVERRIDE { NVResource *r = OSTypeAlloc(NVResource); OSAddAtomic64(1, &gCntResNew); ALOGV("newResource -> %p", r); return r; }
     OSObject *newMemoryMap() APPLE_KEXT_OVERRIDE { NVMemoryMap *m = OSTypeAlloc(NVMemoryMap); ALOG("newMemoryMap -> %p", m); return m; }
 
     NVDisplayMachine *fDM = nullptr;
     IOPCIDevice *fPCI = nullptr;
+    // GPU core temperature: BAR0 is mapped lazily on the first tick, never in start().
+    IOMemoryMap        *fTempMap    = nullptr;
+    volatile UInt32    *fTempRegs   = nullptr;
+    IOTimerEventSource *fTempTimer  = nullptr;
+    int                 fTempC      = 0;
+    UInt32              fTempFails  = 0;
+    bool                fTempLogged = false;
     IONotifier *fFBNote = nullptr;
     IONotifier *fIntelNote = nullptr;
     static NVAccel *gAccel;
@@ -679,6 +710,7 @@ public:
                    "IOService::attach starts sleeping)", n, (unsigned)NV_CARRIERS); }
             enableFromHook("start");
             fPCI = OSDynamicCast(IOPCIDevice, provider);
+            startTemperature();
             ALOG("display machine framebuffer count after the family sweep = %u", fDM ? fDM->getFramebufferCount() : 0xFFFFFFFFu);
             fRegLock = IOLockAlloc();
             ALOG("multi-head: up to %u heads, registration lock %p%s", kNvMaxFB, fRegLock,
@@ -717,7 +749,83 @@ public:
         }
         return r;
     }
-    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE { ALOG("stop"); IOGraphicsAccelerator2::stop(provider); }
+    // ---- GPU core temperature ------------------------------------------------
+    // Published into our own PerformanceStatistics as "Temperature(C)", the key iStat Menus
+    // shows on the GPU panel. NVAccel already owns the IOPCIDevice, so no second kext and no
+    // helper process are involved: that is the whole point of doing it here.
+    void startTemperature() {
+        if (fTempTimer || !fPCI) return;
+        IOWorkLoop *wl = getWorkLoop();
+        if (!wl) { ALOG("temperature: no work loop -- no temperature will be published"); return; }
+        fTempTimer = IOTimerEventSource::timerEventSource(this, &NVAccel::tempTimerFired);
+        if (!fTempTimer) { ALOG("temperature: timerEventSource FAILED"); return; }
+        if (wl->addEventSource(fTempTimer) != kIOReturnSuccess) {
+            ALOG("temperature: addEventSource FAILED");
+            fTempTimer->release(); fTempTimer = nullptr; return;
+        }
+        fTempTimer->setTimeoutMS(kNvTempFirstMs);
+        ALOG("temperature: will read TSENS 0x%05x every %u ms", kNvTsensOffset, kNvTempIntervalMs);
+    }
+
+    void stopTemperature() {
+        if (fTempTimer) {
+            fTempTimer->cancelTimeout();
+            if (IOWorkLoop *wl = getWorkLoop()) wl->removeEventSource(fTempTimer);
+            fTempTimer->release(); fTempTimer = nullptr;
+        }
+        if (fTempMap) { fTempMap->release(); fTempMap = nullptr; }
+        fTempRegs = nullptr;
+    }
+
+    static void tempTimerFired(OSObject *owner, IOTimerEventSource *sender) {
+        (void)sender;
+        // Registered with `this` as the owner, so the cast cannot fail; OSDynamicCast is not
+        // used because it needs the complete class, and this body sits inside the class.
+        NVAccel *me = (NVAccel *)owner;
+        if (!me) return;
+        me->sampleTemperature();
+        if (me->fTempTimer) me->fTempTimer->setTimeoutMS(kNvTempIntervalMs);
+    }
+
+    void sampleTemperature() {
+        if (!fTempRegs) {
+            fTempMap = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, 0);
+            if (!fTempMap) { ALOG("temperature: BAR0 map FAILED -- giving up"); return; }
+            fTempRegs = (volatile UInt32 *)fTempMap->getVirtualAddress();
+            if (!fTempRegs) { ALOG("temperature: BAR0 has no virtual address -- giving up"); return; }
+        }
+        UInt32 raw = fTempRegs[kNvTsensOffset / 4];
+        unsigned val = (raw & kNvTsensValueMask) >> 8;
+        // A GPU in a low power state can answer 0xffffffff, and 0 means the sensor has not been
+        // clocked yet: both fall outside the range and are left unpublished rather than guessed.
+        if (raw == 0xffffffffu || val < kNvTempMinC || val > kNvTempMaxC) {
+            if (fTempFails++ == 0)
+                ALOG("temperature: TSENS raw=0x%08x outside %u..%u C -- not publishing",
+                     raw, kNvTempMinC, kNvTempMaxC);
+            return;
+        }
+        fTempFails = 0;
+        if (!fTempLogged) { fTempLogged = true; ALOG("temperature: first reading raw=0x%08x -> %u C", raw, val); }
+        fTempC = (int)val;
+        publishTemperature((unsigned)fTempC);
+    }
+
+    // Read-copy-modify-write: the family keeps 70-odd keys in this dictionary and replaces it
+    // wholesale every 0.25-2 s, so the copy is taken from whatever is in it at this moment.
+    void publishTemperature(unsigned c) {
+        OSDictionary *cur = OSDynamicCast(OSDictionary, getProperty("PerformanceStatistics"));
+        OSDictionary *d = cur ? OSDynamicCast(OSDictionary, cur->copyCollection()) : nullptr;
+        if (!d) { d = OSDictionary::withCapacity(8); if (!d) return; }
+        OSNumber *n = OSNumber::withNumber((unsigned long long)c, 32);
+        if (n) { d->setObject("Temperature(C)", n); n->release(); setProperty("PerformanceStatistics", d); }
+        d->release();
+    }
+
+    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
+        ALOG("stop");
+        stopTemperature();
+        IOGraphicsAccelerator2::stop(provider);
+    }
     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(NVAccel, IOGraphicsAccelerator2)
@@ -884,7 +992,7 @@ bool NVVidMemory::allocPhysical()
     fRmHandle = r.handle; fKva = r.kva; fPhys = r.phys; fBytes = r.actualSize; fAllocationCookie = r.allocationCookie;
     OSAddAtomic64(1, &gCntVmAlloc); OSAddAtomic64((SInt64)fBytes, &gCntVmAllocBytes);
     *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
-    ALOG("NVVidMemory::allocPhysical(%p): %llu bytes of REAL VRAM -- phys 0x%llx kva %p [BAR1 %llu]",
+    ALOGV("NVVidMemory::allocPhysical(%p): %llu bytes of REAL VRAM -- phys 0x%llx kva %p [BAR1 %llu]",
          this, fBytes, fPhys, fKva, r.mappedTotal);
     return true;
 }
