@@ -1006,7 +1006,7 @@ static unsigned long long g_ic_hits, g_ic_imports, g_ic_stale;
 static int nvmtl_ic_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_SURF_IMPORT_CACHE"); on = !(e && e[0] == '0');   /* on by default (needs the plane seed); =0 off */
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_IMPORT_CACHE"); on = e && e[0] == '1';   /* opt-in (needs the plane seed): Parsec 1080p165 50 -> 60 fps, but at 4K HiDPI up to 67 stalls of ~100 ms per 15 s of capture */
                   nvlog("family VRAM import cache %s (NVMTL_SURF_IMPORT_CACHE=%s)", on ? "on" : "off", e ?: "unset"); }
     return on;
 }
