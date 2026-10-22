@@ -1030,6 +1030,29 @@ static void nvmtl_surface_overwrite_recorded(NVMTLCommandBuffer *cb, NVMTLTextur
     [cb->_surfOverwrites addObject:r];
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t);
+// POff8 (notes/plan-pageoff.md): a render pass whose colour load action is DontCare leaves the attachment's previous
+// contents undefined, so uploading the IOSurface's pages first (surface-in) is wasted. WindowServer's capture path
+// (ScreenCaptureKit: DisplayStreamStateMetal::CopyFrame -> ScaleTextureRectToTextureBGRA) uploaded the capture surface every
+// frame (33 MB at 4K), because the reader's read-write lock moves the seed. /tmp/nvmtl-surfin-dontcare turns the skip on
+// (checked every 250 ms); /tmp/nvmtl-pass-log logs large IOSurface render passes to /tmp/nvmtl-pass.log (first 400).
+static int nvmtl_tmp_switch(const char *path, uint64_t *next, int *on) {
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= *next) { *next = now + 250000000ull; *on = access(path, F_OK) == 0; }
+    return *on;
+}
+static int nvmtl_surfin_dontcare(void) { static uint64_t next; static int on; return nvmtl_tmp_switch("/tmp/nvmtl-surfin-dontcare", &next, &on); }
+static void nvmtl_pass_log(NVMTLTexture *sr, MTLLoadAction load, MTLStoreAction store, int att) {
+    static uint64_t next; static int on; static unsigned n;
+    if (!nvmtl_tmp_switch("/tmp/nvmtl-pass-log", &next, &on) || n >= 400 || !sr || !sr->_surf) return;
+    const nvk_image *i = &sr->_i;
+    if ((uint64_t)i->w * i->h < 1000000) return;
+    n++;
+    FILE *f = fopen("/tmp/nvmtl-pass.log", "a"); if (!f) return;
+    fprintf(f, "%llu surface %u %ux%u fmt %lu att %d load %lu store %lu seed %u surfSeed %u synced %d vram %d\n",
+            (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000), (unsigned)IOSurfaceGetID(sr->_surf), i->w, i->h,
+            (unsigned long)sr->_fmt, att, (unsigned long)load, (unsigned long)store, IOSurfaceGetSeed(sr->_surf), sr->_surfSeed, (int)sr->_surfSynced, (int)sr->_vramOn);
+    fclose(f);
+}
 static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
@@ -2912,7 +2935,8 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
             [cb->_resources addObject:t];
             NVMTLTexture *sr = t->_parent ? t->_parent : t;
             if (sr->_surf) {
-                if (ca.loadAction == MTLLoadActionClear && !sr->_vramMulti) nvmtl_surface_overwrite_recorded(cb, sr);
+                nvmtl_pass_log(sr, ca.loadAction, ca.storeAction, (int)i);
+                if ((ca.loadAction == MTLLoadActionClear || (ca.loadAction == MTLLoadActionDontCare && nvmtl_surfin_dontcare())) && !sr->_vramMulti) nvmtl_surface_overwrite_recorded(cb, sr);
                 else nvmtl_surface_in_for_cb(cb, sr);
                 nvmtl_surf_dirty(cb, sr); }
         }
@@ -5027,7 +5051,9 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
             (unsigned long)d.colorAttachments[0].storeAction, d.colorAttachments[0].clearColor.red, d.colorAttachments[0].clearColor.green,
             d.colorAttachments[0].clearColor.blue, d.colorAttachments[0].clearColor.alpha, d.depthAttachment.texture != nil);
         if (sr->_surf) {
-            if (d.colorAttachments[0].loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(self, sr);
+            nvmtl_pass_log(sr, d.colorAttachments[0].loadAction, d.colorAttachments[0].storeAction, 0);
+            const MTLLoadAction la = d.colorAttachments[0].loadAction;
+            if (la == MTLLoadActionClear || (la == MTLLoadActionDontCare && nvmtl_surfin_dontcare() && !sr->_vramMulti)) nvmtl_surface_overwrite_recorded(self, sr);
             else nvmtl_surface_in_for_cb(self, sr);
             nvmtl_surf_dirty(self, sr); } }
     const float defaultBlend[4] = { 0, 0, 0, 0 };
