@@ -365,13 +365,14 @@ static int nvmtl_skip_empty_on(void) {
     // waits for the GPU): Parsec's encoder read the two-plane NV12 capture surface ~1 ms after the commit and before the
     // copy-out, so it encoded the surface's previous frame, and now and then the new one when the copy-out won the race
     // (a counter in the stream read N-1, N+1, N). Such a command buffer reports "scheduled" once its writes are published.
-    // NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1 does it for every surface write, =0 for none.
+    // NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1 does it for every surface write, =0 for none; =3 only for two-plane surfaces
+    // written through private images (the NV12 surfaces WindowServer draws captured frames into), not every private one.
     static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && *e ? e[0] - '0' : 0; }   // stock-plus: stock's default (0); 2 = ours, 1 = every write
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) {
         if (s == drawable || !after) continue;
         NVMTLTexture *r = s->_parent ? s->_parent : s;
-        if (after == 1 || (r->_surf && !r->_vramOn)) _scheduleAfterPublish = YES;
+        if (after == 1 || (r->_surf && !r->_vramOn && (after != 3 || IOSurfaceGetPlaneCount(r->_surf) > 1))) _scheduleAfterPublish = YES;
     }
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
     part->encoders = _nEnc - _nEncSealed; _nEncSealed = _nEnc;
