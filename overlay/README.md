@@ -55,6 +55,13 @@ On by default, because they made capture faster or correct and added no stalls:
   composites) are imported per wrap as before: uncapped, the cache added up to 67 stalls of ~100 ms per 15 s at 4K HiDPI on
   a GTX 1650. With the cap, 1080p and 1440p surfaces (8-15 MB) are cached.
 
+- **No upload of capture frames that were only read** (`NVMTL_SURFIN_READER_SKIP`, since 2.5.3-mickys.2). ScreenCaptureKit
+  (Parsec, recorders) locks every captured frame read-write to read it, which moves the surface's seed as a CPU write would,
+  so before drawing the next frame into that surface the plugin uploaded its system memory back to video memory (33 MB
+  per frame for a 4K 10-bit capture, about 1 s of every 8 s of WindowServer's time). A surface whose seed moved by exactly
+  one since the plugin's own last write, four times in a row, is taken as read, and the upload is skipped (two-plane
+  surfaces likewise, after the plugin's own per-plane seed moves). RTX 4090, Parsec, same session with the skip off / on:
+  4K 10-bit 30.0 / 36.9 fps, 1080p 10-bit 55.7 / 65.3, 1080p 8-bit 54.2 / 56.4; frames in order, late frames nearly gone.
 - **Captured frames in order** (`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=3`). WindowServer draws each captured frame into a
   two-plane (NV12) surface, which the plugin writes through a private image and copies out when the GPU has finished. The
   recorder or streamer (ScreenCaptureKit, Parsec) reads the surface as soon as WindowServer's command buffer is scheduled,
@@ -93,6 +100,7 @@ Off by default (put the line into `nvrm610.conf`, then log out and in):
 
 | line | what it does | why it is off |
 |---|---|---|
+| `NVMTL_SURFIN_READER_SKIP=0` | turns the capture-frame upload skip off | (on by default) |
 | `NVMTL_PLANE_SEED=0` | turns the plane seed off | (on by default) |
 | `NVMTL_SURF_IMPORT_CACHE=0` | turns the import cache off | (on by default) |
 | `NVMTL_SURF_IMPORT_CACHE_MAX_MB=N` | the cache's size limit per surface (default 16; `0` = no limit) | `0` caches 4K surfaces too: level on an RTX 4090, up to 67 stalls per 15 s at 4K HiDPI on a GTX 1650 |
