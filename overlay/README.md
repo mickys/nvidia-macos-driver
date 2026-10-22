@@ -37,7 +37,7 @@ HEVC (P only) encoders and every decoder but AV1; VP9 from 65x65 up.
   streams. 4K: H.264 about 210 fps (NullMoth's decoder: 40, Apple's software decoder: 24), HEVC about 350, VP9 340, AV1
   380 (the only hardware VP9 and AV1 decoding on an Intel Mac). `--no-decoders` keeps only the encoders.
 
-**Optional, `--desktop`: this fork's Metal plugin.** It is NullMoth 2.5.0's plugin with this fork's changes added one by
+**Optional, `--desktop`: this fork's Metal plugin.** It is NullMoth 2.5.2's plugin with this fork's changes added one by
 one, each behind its own line in `/Library/GPUBundles/nvmtl/nvrm610.conf`. One is on by default; the others are off, so
 apart from that one the plugin behaves exactly like NullMoth's. Every change was measured on its own against NullMoth's
 plugin (GTX 1650, NullMoth 2.5.0, macOS 26.7.1, zero-copy scan-out), with a full-screen Metal animation while the screen
@@ -62,7 +62,7 @@ Off by default (put the line into `nvrm610.conf`, then log out and in):
 |---|---|---|
 | `NVMTL_PLANE_SEED=0` | turns the plane seed off | (on by default) |
 | `NVMTL_SURF_IMPORT_CACHE=1` | CoreAnimation wraps the same window surfaces in a new texture every frame, and each wrap imported the surface's video memory again (four kernel calls); the import is shared and kept briefly. Needs the plane seed | **recommended on 1080p / 1440p desktops** (Parsec 50 -> 60 fps, no stalls); at 4K HiDPI it added up to 67 stalls of ~100 ms per 15 s of capture |
-| `NVMTL_SURFIN_UPLOAD=gpu` | CPU-drawn windows (WebKit, CoreGraphics apps) are uploaded by the GPU from their own pages instead of a CPU copy | no measurable gain at 1080p on 2.5.0; it was +67 % for a full-screen 4K Safari window on 2.4.3 (RTX 4090) |
+| `NVMTL_SURFIN_UPLOAD=cpu` | turns off the GPU upload of CPU-drawn windows (WebKit, CoreGraphics apps) from their own pages; NullMoth took it from this fork in 2.5.1 and has it on by default | (on by default in NullMoth's plugin and in this one; level with it off on an RTX 4090 at 1080p 165 Hz) |
 | `NVMTL_TEX_POOL=1` | CoreAnimation's per-frame intermediate textures (blur, vibrancy) reuse released ones instead of new allocations | no measurable change |
 | `NVMTL_ASYNC_SURFIN=2` | upstream PR #96: a CPU surface upload does not wait for its GPU copy before the next one starts | **under Parsec: 36 stalls of ~100 ms per 20 s, 41 instead of 50 fps, frames jumping back** |
 | `NVMTL_SURF_MULTIPLANE=1` | two-plane (NV12) surfaces share their video memory with other processes, so a reader's CPU lock waits in the kernel | **12 stalls of ~100 ms per 20 s of screen recording**: the reader's page-off waits for the GPU with the accelerator lock held |
@@ -116,7 +116,7 @@ sudo nvfb-edid remove                             # the display's own EDID again
 Measured on a GTX 1650 with a 4K HDMI dummy plug (NullMoth 2.4.3, macOS 26.7.1): NullMoth's framebuffer lists 9 timings,
 all 4K (smaller desktops only as scaled modes, which NVKMS refuses on that raster); with `--resolution` 35 (1080p, 1440p,
 720p and the other sizes in the plug's EDID), and 41 with an override adding 1080p at 120 / 144 / 165 / 240 Hz and 1440p at
-120 / 144 Hz; 1080p at 144 Hz set and shown. On NullMoth 2.5.0 the same: the desktop at 1080p 165 Hz from the override.
+120 / 144 Hz; 1080p at 144 Hz set and shown. On NullMoth 2.5.0 the same: the desktop at 1080p 165 Hz from the override. NullMoth 2.5.2 adds scaled and HiDPI modes through the display engine's scaler (its #273), and the overlay's framebuffer has them too: on an RTX 4090 with a 1080p 165 Hz dummy plug, NullMoth 2.5.2 lists 119 modes (all 60 Hz, the plug's EDID), with `--resolution` 164 (up to 165 Hz); every distinct mode of each list (80 and 120) was switched to and shown.
 
 Add only timings the display can show: a real monitor may stay black on one it does not support (remove the file over
 SSH or from safe mode to recover). Overrides are refused unless root-owned and not writable by others, valid, and for the
@@ -140,7 +140,7 @@ and 29 % less in a Core Image blur, while the synchronous elapsed time grows by 
 
 ## Requirements
 
-- NullMoth's driver **2.5.0** installed and running. The installer refuses anything else: it checks NullMoth's version
+- NullMoth's driver **2.5.2** installed and running. The installer refuses anything else: it checks NullMoth's version
   record, the version of the NVRM, NVAccel and NVRMFB kernel extensions on disk, and the version of the ones running
   (after a NullMoth update, restart before installing the overlay). The plugin and the kernel driver share interfaces,
   so an overlay is built for one NullMoth version (`COMPATIBLE-DRIVERS` in the package).
@@ -199,11 +199,11 @@ stay: NullMoth's framebuffer ignores them). Then log out and back in, or restart
 
 ## Source
 
-- Framebuffer (`--resolution`): `kexts/NVRMFB` at the same tag (NullMoth 2.5.0 plus three commits), built with
-  `build/fb_build.sh` against NVIDIA's open-gpu-kernel-modules 615.78.08 headers (NullMoth 2.5.0's RM version; the same
-  script builds NullMoth's own 2.5.0 NVRMFB byte for byte); `nvfb-edid` from `tools/nvfb-edid.c`.
+- Framebuffer (`--resolution`): `kexts/NVRMFB` at the same tag (NullMoth 2.5.2 plus three commits), built with
+  `build/fb_build.sh` against NVIDIA's open-gpu-kernel-modules 615.78.08 headers (NullMoth 2.5.2's RM version; the same
+  script builds NullMoth's own 2.5.2 NVRMFB byte for byte); `nvfb-edid` from `tools/nvfb-edid.c`.
 - Plugin (`--desktop` only): `plugin/` of [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) at the tag named in
-  `SOURCE` (NullMoth 2.5.0 plus the overlay's commits, each behind a config line), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
+  `SOURCE` (NullMoth 2.5.2 plus the overlay's commits, each behind a config line), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
 - Encoder: [mickys/nvenc](https://github.com/mickys/nvenc) at the commit named in `SOURCE`.
 - The plugin source is under the PolyForm Noncommercial License 1.0.0 (`LICENSE`), like NullMoth's. The encoder is MIT
   (`LICENSE-nvenc`).
