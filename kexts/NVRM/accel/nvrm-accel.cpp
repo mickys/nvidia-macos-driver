@@ -1428,6 +1428,12 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_threads, CTLFLAG_RW | CTLFLAG_LOCKE
 NVACCEL_CNT(nvaccel_pageoff_cpu_n,       gPageoffCpuN,       "staged page-offs' CPU copies");
 NVACCEL_CNT(nvaccel_pageoff_cpu_us,      gPageoffCpuUs,      "microseconds those CPU copies took (mapping included)");
 NVACCEL_CNT(nvaccel_pageoff_cpu_mapfail, gPageoffCpuMapFail, "CPU copies whose surface mapping failed (fell back to writeBytes)");
+// POff5: see nvCpuReadWriter
+static int gCpuReadOn = 0;
+static SInt64 gCntCpuReadRefused, gCntCpuReadForeign;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_cpuread, CTLFLAG_RW | CTLFLAG_LOCKED, &gCpuReadOn, 0, "1 = refuse VRAM-newest marks for surfaces another process keeps paging off (the writer copies out itself)");
+NVACCEL_CNT(nvaccel_cpuread_refused, gCntCpuReadRefused, "dirty marks refused because another process reads the surface on the CPU");
+NVACCEL_CNT(nvaccel_cpuread_foreign, gCntCpuReadForeign, "page-offs by a process other than the surface's writer");
 static SInt64 gCntIopAsync, gCntIopAsyncRefused, gCntIopAsyncDrop;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsync, 0, "1 = the swap runs on a thread call and completes through signalTransactionInterrupt (Apple's shape); 0 = the earlier synchronous flip");
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
@@ -1700,11 +1706,6 @@ static unsigned nvSurfGpuEscape(const struct NVRMSurfShareEsc *p)
 // a surface paged off 3 times within 5 s by anyone else is "CPU-read" for 10 s from its last such page-off, and with
 // debug.nvaccel_cpuread=1 its dirty marks are refused (NVRM_SS_CPU_READ): the plugin then copies its writes out to the
 // pages itself at completion (its copy-out path), outside both locks, and the reader's lock finds the pages current.
-static int gCpuReadOn = 0;
-static SInt64 gCntCpuReadRefused, gCntCpuReadForeign;
-SYSCTL_INT(_debug, OID_AUTO, nvaccel_cpuread, CTLFLAG_RW | CTLFLAG_LOCKED, &gCpuReadOn, 0, "1 = refuse VRAM-newest marks for surfaces another process keeps paging off (the writer copies out itself)");
-NVACCEL_CNT(nvaccel_cpuread_refused, gCntCpuReadRefused, "dirty marks refused because another process reads the surface on the CPU");
-NVACCEL_CNT(nvaccel_cpuread_foreign, gCntCpuReadForeign, "page-offs by a process other than the surface's writer");
 struct NVCpuRead { unsigned sid; int writer; unsigned foreign; uint64_t last, seen; };
 static NVCpuRead gCpuRead[32];
 static IOLock *gCpuReadLock;
