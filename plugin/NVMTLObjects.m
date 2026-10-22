@@ -1056,10 +1056,12 @@ static void nvmtl_pass_log(NVMTLTexture *sr, MTLLoadAction load, MTLStoreAction 
 // POff8: the seed of a render target WindowServer draws into with Load can move only because another process locked it
 // read-write to read it (ScreenCaptureKit in Parsec locks every captured frame that way: 10-bit capture surfaces showed
 // seed = our last seed + 1 on every pass), and then each frame uploaded the surface's pages back to VRAM first (33 MB at
-// 4K, ~1 s per 8 s of WindowServer time). With NVMTL_SURFIN_READER_SKIP=1 (diagnostic builds: /tmp/nvmtl-surfin-reader),
+// 4K, ~1 s per 8 s of WindowServer time). With NVMTL_SURFIN_READER_SKIP (diagnostic builds also: /tmp/nvmtl-surfin-reader),
 // a shared-VRAM target whose seed moved by exactly 1 since our last write, four times in a row, is taken as read only.
+// On by default; NVMTL_SURFIN_READER_SKIP=0 turns it off.
 static int nvmtl_surfin_reader_on(void) {
-    static int env = -1; if (env < 0) { const char *e = getenv("NVMTL_SURFIN_READER_SKIP"); env = e && e[0] == '1'; }
+    static int env = -1; if (env < 0) { const char *e = getenv("NVMTL_SURFIN_READER_SKIP"); env = !(e && e[0] == '0');   // on by default (POff8: 4K 10-bit Parsec 30 -> 37 fps, 1080p 10-bit +17 %, 8-bit +4-5 %, frames in order); =0 off
+        nvlog("surface-in reader skip %s (NVMTL_SURFIN_READER_SKIP=%s)", env ? "on" : "off", e ?: "unset"); }
     static uint64_t next; static int tmp;
     return env || nvmtl_tmp_switch("/tmp/nvmtl-surfin-reader", &next, &tmp);
 }
