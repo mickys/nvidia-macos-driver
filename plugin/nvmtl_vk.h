@@ -364,5 +364,7 @@ int nvmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_b
 int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane);
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane);
 void nvmtl_vk_surface_pages_done(uint32_t surfaceID, uint32_t plane);
+int nvmtl_vk_record_surface_pages(nvk_cmdbuf *c, nvk_image *img, void *surf);   /* surf: IOSurfaceRef */
+void nvmtl_vk_surface_pages_gpu(uint32_t surfaceID, uint32_t plane, int recorded);
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending);
 int nvmtl_vk_accel_surface_wait(void);

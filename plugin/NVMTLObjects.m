@@ -1357,11 +1357,11 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
             (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
     const int marked = !r->_vramOn ? -1 : dirtied ? nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)NVMTL_VP(r))
                                                    : nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)NVMTL_VP(r));
-    if (r->_vramOn && (dirtied || !marked)) {
+    if (r->_vramOn && (dirtied || !marked)) {   // dirtied includes the POff5b surfaces (their frame went into the pages on the GPU)
         uint32_t seed = IOSurfaceGetSeed(r->_surf);
         r->_surfSeed = seed; r->_surfSynced = YES;
         r->_surfGen = nvmtl_vram_tag_bump(r->_surf, NVMTL_VP(r), seed);
-        if (dirtied && marked > 0) nvmtl_surface_remark_later(r, seed);
+        if (dirtied && marked == 1) nvmtl_surface_remark_later(r, seed);   // 2 = CPU_READ_PAGES: marked
         static unsigned nd; if (nd++ < 6 || nd % 5000 == 0) nvlog("surface-out -> dirty, no copy (%ux%u surface %u seed %u, #%u)", r->_i.w, r->_i.h, (unsigned)IOSurfaceGetID(r->_surf), seed, nd);
         return YES;
     }

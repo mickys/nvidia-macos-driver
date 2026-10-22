@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+#include <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -6472,6 +6473,59 @@ static void img_to(nvk_cmdbuf *c, nvk_image *img, VkImageLayout to,
     }
     pvkCmdPipelineBarrier(c->cb, srcS, dstS, 0, 0, NULL, 0, NULL, 1, &b);
     img->layout = to;
+}
+
+/* POff5b (NVAccel debug.nvaccel_cpuread=3): a frame of an IOSurface another process reads on the CPU (ScreenCaptureKit's
+   output in Parsec) is copied into the surface's own pages on the GPU at the end of the command buffer that drew it, so a
+   reader's lock finds the pages current once the GPU is done and the kernel skips its page-off copy (~1.7 ms of 8 MB with
+   the accelerator and RM locks held). The pages are imported as device memory once per surface and kept: an entry is
+   reused or dropped only after 2 s without use, so no in-flight copy loses its memory. */
+typedef struct { IOSurfaceRef surf; nvk_buffer buf; uint64_t used_ns; } nvmtl_pages_imp;
+static nvmtl_pages_imp g_pages_imp[8];
+static pthread_mutex_t g_pages_mx = PTHREAD_MUTEX_INITIALIZER;
+static nvk_buffer *nvmtl_pages_import(IOSurfaceRef surf)   /* g_pages_mx held */
+{
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int free_i = -1;
+    for (int i = 0; i < 8; i++) {
+        if (g_pages_imp[i].surf == surf && g_pages_imp[i].buf.buf) { g_pages_imp[i].used_ns = now; return &g_pages_imp[i].buf; }
+        if (free_i < 0 && (!g_pages_imp[i].surf || now - g_pages_imp[i].used_ns > 2000000000ull)) free_i = i;
+    }
+    if (free_i < 0) return NULL;
+    nvmtl_pages_imp *e = &g_pages_imp[free_i];
+    if (e->surf) { nvmtl_vk_buffer_destroy(&e->buf); CFRelease(e->surf); memset(e, 0, sizeof *e); }
+    void *base = IOSurfaceGetBaseAddress(surf);
+    size_t bytes = IOSurfaceGetAllocSize(surf);
+    if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
+    if (!base || nvmtl_vk_buffer_import_host(base, bytes, &e->buf)) { memset(e, 0, sizeof *e); return NULL; }
+    CFRetain(surf); e->surf = surf; e->used_ns = now;
+    return &e->buf;
+}
+/* records image -> the surface's pages into c (still recording, outside a render pass); 0 = recorded */
+int nvmtl_vk_record_surface_pages(nvk_cmdbuf *c, nvk_image *img, void *surf_)
+{
+    IOSurfaceRef surf = (IOSurfaceRef)surf_;
+    if (!c || !c->cb || c->in_rp || !img || !img->img || !surf || IOSurfaceGetPlaneCount(surf) > 1 || img->samples > 1) return -1;
+    const size_t bpp = img->bpp ? img->bpp : 4, row = IOSurfaceGetBytesPerRow(surf);
+    if (img->bw > 1 || img->bh > 1 || !row || row % bpp || row < (size_t)img->w * bpp) return -1;
+    pthread_mutex_lock(&g_pages_mx);
+    nvk_buffer *b = nvmtl_pages_import(surf);
+    pthread_mutex_unlock(&g_pages_mx);
+    if (!b || row * (size_t)img->h > b->size) return -1;
+    img_to(c, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy bic = { 0, (uint32_t)(row / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+    pvkCmdCopyImageToBuffer(c->cb, img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buf, 1, &bic);
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    { static unsigned n; if (n++ < 4 || n % 5000 == 0) nvlog("surface %u: frame copied into its pages on the GPU (%ux%u, #%u)", (unsigned)IOSurfaceGetID(surf), img->w, img->h, n); }
+    return 0;
+}
+/* the copy above was (not) recorded for the frame just marked: NVRM_SS_PLANE_PAGES_DONE / NVRM_SS_PLANE_PAGES_NO */
+void nvmtl_vk_surface_pages_gpu(uint32_t surfaceID, uint32_t plane, int recorded)
+{
+    const uint32_t f = recorded ? 0x20000000u : 0x10000000u;
+    if (nvmtl_surf_esc(1, surfaceID, plane | f) == 0xFFFFFFFFu && pnvk_surface_dirty && g_dev) (void)pnvk_surface_dirty(g_dev, surfaceID, plane | f);
 }
 
 static void nvmtl_private_depth_layout(nvk_cmdbuf *c, nvk_image *img, VkImageLayout to)

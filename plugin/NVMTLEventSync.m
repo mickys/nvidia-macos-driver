@@ -191,6 +191,18 @@ static BOOL nvmtl_ws_publish_settled(NSArray *settled, NVMTLCommandBuffer *cb) {
 // (nvmtl_surface_register_writes): a record stamped before the move matched nothing, every frame's read of the surface
 // still in flight took the CPU path (page-off, wait, 8 MB upload) on the compositor's thread, and a 144 Hz desktop ran
 // at 90 frames a second.
+// POff5b: the frame of t goes into its IOSurface's pages on the GPU, at the end of the command buffer's last part, and
+// that part is made a writer of t so the surface's GPU-done mark is released only after the copy. 0 = recorded.
+static int nvmtl_ws_record_pages(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+    NVMTLSubmissionPart *last = nil;
+    for (NVMTLSubmissionPart *part in cb->_parts)
+        if ([part isKindOfClass:[NVMTLSubmissionPart class]] && part->commands.cb) last = part;
+    if (!last) return -1;
+    NVMTLTexture *r = t->_parent ? t->_parent : t;
+    if (nvmtl_vk_record_surface_pages(&last->commands, &r->_i, (void *)r->_surf)) return -1;
+    if (![last->surfaces containsObject:t]) last->surfaces = [last->surfaces arrayByAddingObject:t];
+    return 0;
+}
 static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
     if (!nvmtl_ws_kernel_waits()) return;
     NSMutableSet *ids = nil;
@@ -206,10 +218,23 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
     holds->ids = ids; holds->early = nvmtl_ws_surface_wait();
     if (holds->early) {
         NSMutableSet *dirtied = [NSMutableSet new];
+        NSMutableSet *gpuPaged = nil;
         for (NVMTLSubmissionPart *part in cb->_parts) {
             if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
-            for (NVMTLTexture *t in part->surfaces)
-                if (t->_surf && t->_vramOn && !nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(t->_surf), (uint32_t)(t->_vramMulti ? 0 : t->_plane))) [dirtied addObject:t];
+            for (NVMTLTexture *t in part->surfaces) {
+                if (!t->_surf || !t->_vramOn) continue;
+                const uint32_t sid = (uint32_t)IOSurfaceGetID(t->_surf), pl = (uint32_t)(t->_vramMulti ? 0 : t->_plane);
+                const int m = nvmtl_vk_surface_dirty(sid, pl);
+                if (m == 0) [dirtied addObject:t];
+                else if (m == 2) {   // another process reads this surface on the CPU: its frame goes into the pages on the GPU (POff5b)
+                    if (!gpuPaged) gpuPaged = [NSMutableSet new];
+                    if ([gpuPaged containsObject:@(sid)]) { [dirtied addObject:t]; continue; }
+                    [gpuPaged addObject:@(sid)];
+                    const int rec = nvmtl_ws_record_pages(cb, t);
+                    nvmtl_vk_surface_pages_gpu(sid, pl, !rec);
+                    [dirtied addObject:t];
+                }
+            }
         }
         holds->dirtied = dirtied;
     }
