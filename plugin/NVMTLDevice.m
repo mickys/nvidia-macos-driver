@@ -1002,21 +1002,42 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 // dup, VA allocation, DMA map), about 0.6 ms in WindowServer. One import per surface is now shared by its wrappers and
 // kept for a while after the last one goes, so the next frame's wrap reuses it. A surface ID can be reused after the
 // surface is freed, so each import writes a per-process cookie into the surface and a cached import is used only while
-// the surface still carries it. NVMTL_SURF_IMPORT_CACHE=0 turns it off.
+// the surface still carries it. On by default; NVMTL_SURF_IMPORT_CACHE=0 turns it off.
 #include <os/lock.h>
 #include <stdatomic.h>
 #include <unistd.h>
 typedef struct { uint32_t sid; size_t need; uint64_t cookie; nvk_buffer b; int refs, stale; uint64_t idle; } nvmtl_ic_ent;
 #define NVMTL_IC_N 32
-#define NVMTL_IC_IDLE_NS 2000000000ull
+// NVMTL_SURF_IMPORT_CACHE_IDLE_MS (default 2000): how long an import stays after its last wrapper goes.
+// NVMTL_SURF_IMPORT_CACHE_MAX_MB (default 16, 0 = no limit): larger surfaces (a 4K window or composite is ~33 MB) are
+// imported per wrapper as without the cache, so the cache never holds the VRAM of the big surfaces that 4K HiDPI capture
+// pages off; 1080p and 1440p surfaces (8-15 MB) are cached.
+static uint64_t nvmtl_ic_env(const char *name, uint64_t def, uint64_t unit)
+{
+    const char *e = getenv(name); if (!e || !*e) return def * unit;
+    char *end; const unsigned long long v = strtoull(e, &end, 10); return end == e ? def * unit : v * unit;
+}
+static uint64_t nvmtl_ic_idle_ns(void)
+{
+    static uint64_t v; static dispatch_once_t once;
+    dispatch_once(&once, ^{ v = nvmtl_ic_env("NVMTL_SURF_IMPORT_CACHE_IDLE_MS", 2000, 1000000ull); });
+    return v;
+}
+static uint64_t nvmtl_ic_max_bytes(void)
+{
+    static uint64_t v; static dispatch_once_t once;
+    dispatch_once(&once, ^{ v = nvmtl_ic_env("NVMTL_SURF_IMPORT_CACHE_MAX_MB", 16, 1ull << 20); });
+    return v;
+}
 static nvmtl_ic_ent g_ic[NVMTL_IC_N];
 static os_unfair_lock g_ic_lock = OS_UNFAIR_LOCK_INIT;
 static unsigned long long g_ic_hits, g_ic_imports, g_ic_stale;
 static int nvmtl_ic_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_SURF_IMPORT_CACHE"); on = e && e[0] == '1';   /* opt-in (needs the plane seed): Parsec 1080p165 50 -> 60 fps, but at 4K HiDPI up to 67 stalls of ~100 ms per 15 s of capture */
-                  nvlog("family VRAM import cache %s (NVMTL_SURF_IMPORT_CACHE=%s)", on ? "on" : "off", e ?: "unset"); }
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_IMPORT_CACHE"); on = !(e && e[0] == '0');   /* on (needs the plane seed), with the 16 MB cap: RTX 4090 1080p165 recording 103-131 -> 137-159 fps, 0 stalls; 4K with the cap level with off. Uncapped, a GTX 1650 at 4K HiDPI had up to 67 stalls of ~100 ms per 15 s */
+                  nvlog("family VRAM import cache %s (NVMTL_SURF_IMPORT_CACHE=%s, idle %llu ms, max %llu MB)", on ? "on" : "off", e ?: "unset",
+                        (unsigned long long)(nvmtl_ic_idle_ns() / 1000000), (unsigned long long)(nvmtl_ic_max_bytes() >> 20)); }
     return on;
 }
 static CFStringRef nvmtl_ic_key(void)
@@ -1032,13 +1053,13 @@ static uint64_t nvmtl_ic_cookie(IOSurfaceRef s)
     if (v) CFRelease(v);
     return c;
 }
-// destroys idle entries (no wrapper left) older than NVMTL_IC_IDLE_NS, or every idle one when `all`; call without the lock
+// destroys idle entries (no wrapper left) older than the idle time, or every idle one when `all`; call without the lock
 static void nvmtl_ic_trim(int all)
 {
     nvk_buffer gone[NVMTL_IC_N]; int n = 0; const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     os_unfair_lock_lock(&g_ic_lock);
     for (int i = 0; i < NVMTL_IC_N; i++)
-        if (g_ic[i].sid && !g_ic[i].refs && (all || g_ic[i].stale || now - g_ic[i].idle > NVMTL_IC_IDLE_NS)) { gone[n++] = g_ic[i].b; memset(&g_ic[i], 0, sizeof g_ic[i]); }
+        if (g_ic[i].sid && !g_ic[i].refs && (all || g_ic[i].stale || now - g_ic[i].idle > nvmtl_ic_idle_ns())) { gone[n++] = g_ic[i].b; memset(&g_ic[i], 0, sizeof g_ic[i]); }
     os_unfair_lock_unlock(&g_ic_lock);
     for (int i = 0; i < n; i++) nvmtl_vk_buffer_destroy(&gone[i]);
 }
@@ -1048,6 +1069,11 @@ static int nvmtl_ic_get(IOSurfaceRef surf, size_t need, nvk_buffer *out)
     const uint32_t sid = IOSurfaceGetID(surf);
     if (!nvmtl_ic_on()) return nvmtl_vk_surface_vram(sid, 0, need, out);
     nvmtl_ic_trim(0);
+    if (nvmtl_ic_max_bytes() && need > nvmtl_ic_max_bytes()) {   // too big to keep: a plain import, nvmtl_ic_put does not find it
+        static _Atomic unsigned long long big; const unsigned long long n = atomic_fetch_add(&big, 1) + 1;
+        if (n < 4 || n % 1000 == 0) nvlog("family VRAM import cache: %llu imports over %llu MB not cached", n, (unsigned long long)(nvmtl_ic_max_bytes() >> 20));
+        return nvmtl_vk_surface_vram(sid, 0, need, out);
+    }
     const uint64_t have = nvmtl_ic_cookie(surf);
     os_unfair_lock_lock(&g_ic_lock);
     for (int i = 0; i < NVMTL_IC_N; i++) {
