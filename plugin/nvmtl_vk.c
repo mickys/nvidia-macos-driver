@@ -1954,6 +1954,9 @@ static int nvmtl_vk_surface_mark_newest(uint32_t surfaceID, uint32_t plane, uint
     uint32_t st = nvmtl_surf_esc(1, surfaceID, plane | flags);
     if (st == 0xFFFFFFFFu) st = pnvk_surface_dirty(g_dev, surfaceID, plane | flags);
     if (st == 0x80000007u) return 1;    /* NVRM_SS_BUSY: a try that found the accelerator lock taken */
+    /* NVRM_SS_CPU_READ_PAGES (NVAccel debug.nvaccel_cpuread=2): marked, and another process reads this surface on the CPU:
+       copy the write out to the pages too, then send nvmtl_vk_surface_pages_done; readers wait for that instead of copying */
+    if (st == 0x80000009u) return 2;
     if (st) { static unsigned n; if (n++ < 8 || n % 2000 == 0) nvlog("surface %u dirty refused (%#x) - copy-out (%u so far)", surfaceID, st, n); }
     return st ? -1 : 0;
 }
@@ -1961,6 +1964,12 @@ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk
 /* the same mark, given up instead of waiting when the accelerator lock is taken (NVRM_SS_PLANE_TRYLOCK; only an NVAccel
    that publishes NVAccelSurfaceWait is asked): 0 marked, 1 the lock was taken, -1 refused */
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, 0x40000000u); }
+/* after the copy-out of a surface that was answered NVRM_SS_CPU_READ_PAGES (NVRM_SS_PLANE_PAGES_DONE) */
+void nvmtl_vk_surface_pages_done(uint32_t surfaceID, uint32_t plane)
+{
+    if (nvmtl_surf_esc(1, surfaceID, plane | 0x20000000u) == 0xFFFFFFFFu && pnvk_surface_dirty && g_dev)
+        (void)pnvk_surface_dirty(g_dev, surfaceID, plane | 0x20000000u);
+}
 // WindowServer completion marks go through a connection of their own. NVRM's user client holds a per-connection gate
 // across every escape, and NVK's connection also carries the VRAM dirty marks, which wait for the accelerator lock. A CPU
 // lock of a surface WindowServer is still drawing (a screen capture: ScreenCaptureKit, Parsec) pages the surface off with

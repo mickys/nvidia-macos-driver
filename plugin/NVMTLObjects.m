@@ -1380,6 +1380,7 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     r->_surfSeed = seed; r->_surfSynced = YES;
     r->_surfGen = r->_vramOn ? r->_surfGen : nvmtl_vram_gen(r->_surf, r->_plane);
     if (r->_vramOn && !lockopt) nvmtl_vram_tag_set(r->_surf, NVMTL_VP(r), seed);
+    if (marked == 2) nvmtl_vk_surface_pages_done((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)NVMTL_VP(r));   // readers wait for this (POff5c)
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-out #%u: %ux%u surface %p seed %u, %.2f ms", n, r->_i.w, r->_i.h,
         (void *)r->_surf, seed, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6);
     return YES;
