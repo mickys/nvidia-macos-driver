@@ -1467,6 +1467,8 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_cpu);      sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_threads);
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_cpu_n);    sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_cpu_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_cpu_mapfail);
+    sysctl_register_oid(&sysctl__debug_nvaccel_cpuread); sysctl_register_oid(&sysctl__debug_nvaccel_cpuread_refused);
+    sysctl_register_oid(&sysctl__debug_nvaccel_cpuread_foreign);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
@@ -1692,6 +1694,58 @@ static unsigned nvSurfGpuEscape(const struct NVRMSurfShareEsc *p)
     if (p->surfaceID) nvSurfMark(p->surfaceID, (p->plane & 1u) != 0);
     return 0;
 }
+// Surfaces another process reads on the CPU (POff5, notes/plan-pageoff.md). A screen capture client (ScreenCaptureKit
+// in Parsec) locks every frame WindowServer renders for it; with VRAM marked newest each lock pages the 8 MB frame off
+// (~1.7 ms with the accelerator lock and NVIDIA's RM lock held). The writer is the process that marks the surface dirty;
+// a surface paged off 3 times within 5 s by anyone else is "CPU-read" for 10 s from its last such page-off, and with
+// debug.nvaccel_cpuread=1 its dirty marks are refused (NVRM_SS_CPU_READ): the plugin then copies its writes out to the
+// pages itself at completion (its copy-out path), outside both locks, and the reader's lock finds the pages current.
+static int gCpuReadOn = 0;
+static SInt64 gCntCpuReadRefused, gCntCpuReadForeign;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_cpuread, CTLFLAG_RW | CTLFLAG_LOCKED, &gCpuReadOn, 0, "1 = refuse VRAM-newest marks for surfaces another process keeps paging off (the writer copies out itself)");
+NVACCEL_CNT(nvaccel_cpuread_refused, gCntCpuReadRefused, "dirty marks refused because another process reads the surface on the CPU");
+NVACCEL_CNT(nvaccel_cpuread_foreign, gCntCpuReadForeign, "page-offs by a process other than the surface's writer");
+struct NVCpuRead { unsigned sid; int writer; unsigned foreign; uint64_t last, seen; };
+static NVCpuRead gCpuRead[32];
+static IOLock *gCpuReadLock;
+static uint64_t nvNowNs() { uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns; }
+static NVCpuRead *nvCpuReadSlot(unsigned sid, bool make, uint64_t now)   // lock held
+{
+    unsigned old = 0;
+    for (unsigned i = 0; i < 32; i++) {
+        if (gCpuRead[i].sid == sid) { gCpuRead[i].seen = now; return &gCpuRead[i]; }
+        if (gCpuRead[i].seen < gCpuRead[old].seen) old = i;
+    }
+    if (!make) return nullptr;
+    gCpuRead[old] = NVCpuRead{ sid, -1, 0, 0, now };
+    return &gCpuRead[old];
+}
+static bool nvCpuReadWriter(unsigned sid, int pid)   // a dirty mark from pid: true = refuse it
+{
+    if (!sid) return false;
+    if (!gCpuReadLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gCpuReadLock)) IOLockFree(l); }
+    if (!gCpuReadLock) return false;
+    const uint64_t now = nvNowNs();
+    IOLockLock(gCpuReadLock);
+    NVCpuRead *e = nvCpuReadSlot(sid, true, now);
+    if (e->writer != pid) { e->writer = pid; e->foreign = 0; }
+    const bool hot = gCpuReadOn && e->foreign >= 3 && now - e->last < 10000000000ULL;
+    IOLockUnlock(gCpuReadLock);
+    return hot;
+}
+static void nvCpuReadPageoff(unsigned sid, int pid)
+{
+    if (!sid || pid <= 0 || !gCpuReadLock) return;
+    const uint64_t now = nvNowNs();
+    IOLockLock(gCpuReadLock);
+    NVCpuRead *e = nvCpuReadSlot(sid, false, now);
+    if (e && e->writer > 0 && e->writer != pid) {
+        if (now - e->last > 5000000000ULL) e->foreign = 0;
+        e->foreign++; e->last = now;
+        OSAddAtomic64(1, &gCntCpuReadForeign);
+    }
+    IOLockUnlock(gCpuReadLock);
+}
 static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigned cmd)
 {
     if (p->version == NVRM_SURFSHARE_VERSION && cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_GPU_MARK)) {
@@ -1706,6 +1760,9 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
     // dropped instead, and the mark taken at commit stands.
     const bool tryOnly = cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_TRYLOCK);
     p->plane &= ~(NVRM_SS_PLANE_TRYLOCK | NVRM_SS_PLANE_GPU_MARK);
+    if (cmd == NVRM_ESC_SURF_DIRTY && nvCpuReadWriter(p->surfaceID, proc_selfpid())) {
+        OSAddAtomic64(1, &gCntCpuReadRefused); p->status = NVRM_SS_CPU_READ; return kIOReturnSuccess;
+    }
     // plane is a full uint32 from the caller and reaches IOGraphicsAccelerator2::deviceCacheForIOSurface
     // below. The plane > 15 refusals further down run after that call, and only on the dirty path.
     if (p->plane > 15) { p->status = NVRM_SS_NO_CACHE; return kIOReturnSuccess; }
@@ -1988,6 +2045,7 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     if (mayUnwire) md->complete(kIODirectionNone);
     else ALOG("surfvram pageoff: res %p CE copy TIMED OUT -- surface pages stay wired (%llu B)", this, len);
     if (ok) {
+        nvCpuReadPageoff(_ZNK9IOSurface12getSurfaceIDEv(surf), proc_selfpid());
         nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(surf), 0);
         volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
         if (valid) valid[0] |= 1;

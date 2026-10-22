@@ -20,6 +20,9 @@
 #define NVRM_SS_NO_VRAM       0x80000005u
 #define NVRM_SS_TOO_SMALL     0x80000006u
 #define NVRM_SS_BUSY          0x80000007u
+/* NVRM_ESC_SURF_DIRTY refused: another process reads this surface on the CPU (it keeps paging it off), so the writer
+ * keeps its system pages current itself instead of marking VRAM newest (NVAccel debug.nvaccel_cpuread) */
+#define NVRM_SS_CPU_READ      0x80000008u
 struct NVRMSurfShareEsc {
     unsigned int version;
     unsigned int surfaceID;
