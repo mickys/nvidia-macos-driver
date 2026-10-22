@@ -1,11 +1,11 @@
 #!/bin/bash
 # fb_build.sh <kexts dir> <out>: build NVRMFB.kext (the framebuffer) from kexts/NVRMFB, the way build/accel_build.sh builds
 # NVAccel. NVRMFB includes only NVKMS's interface headers (nvkms.h, nvkms-kapi.h) and NVIDIA's basic types from
-# open-gpu-kernel-modules 610.57.04, and links against nothing of NVRM's (it finds the NVKMS function table at run time),
-# so it needs no RM build: OGKM=<a 610.57.04 checkout with src/nvidia-modeset and src/common>.
+# open-gpu-kernel-modules 615.78.08 (the RM version of NullMoth 2.5.0; 610.57.04 for 2.4.x), and links against nothing of NVRM's (it finds the NVKMS function table at run time),
+# so it needs no RM build: OGKM=<a 615.78.08 checkout with src/nvidia-modeset and src/common>.
 set -uo pipefail
 SRC=$1; OUT=$2; mkdir -p "$OUT/NVRMFB.kext/Contents/MacOS"
-OGKM=${OGKM:-$HOME/ogkm610}; KMS="$OGKM/src/nvidia-modeset"
+OGKM=${OGKM:-$HOME/ogkm615}; KMS="$OGKM/src/nvidia-modeset"
 SDK=$(xcrun --show-sdk-path); KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
 INC=( -I"$KHDR" -I"$SRC/NVRMFB" -I"$SRC/NVRMFB/fb"
       -I"$OGKM/src/nvidia/arch/nvalloc/unix/include" -I"$OGKM/src/common/sdk/nvidia/inc" -I"$OGKM/src/common/inc" -I"$OGKM/src/common/shared/inc"

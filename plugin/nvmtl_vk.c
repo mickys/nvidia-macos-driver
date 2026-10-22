@@ -1920,8 +1920,18 @@ static void nvmtl_esc_open(int which)
 static void nvmtl_esc_open0(void) { nvmtl_esc_open(0); }
 static void nvmtl_esc_open1(void) { nvmtl_esc_open(1); }
 // 0xFFFFFFFF when the connection is missing or the call fails: the caller then uses NVK's
+// stock-plus: own connections only when switched on (3f49b2c: NVMTL_WS_MARK_CONN=1 for the completion marks, d72bbd9:
+// NVMTL_DIRTY_MARK_CONN=1 for the dirty marks); off = NVK's connection, as stock
+static int nvmtl_esc_on(int which)
+{
+    static int on[2] = { -1, -1 };
+    if (on[which] < 0) { const char *k = which ? "NVMTL_DIRTY_MARK_CONN" : "NVMTL_WS_MARK_CONN", *e = getenv(k); on[which] = e && e[0] == '1';
+        nvlog("%s %s (%s=%s)", which ? "dirty marks on an own connection" : "completion marks on an own connection", on[which] ? "on" : "off", k, e ?: "unset"); }
+    return on[which];
+}
 static uint32_t nvmtl_surf_esc(int which, uint32_t surfaceID, uint32_t plane)
 {
+    if (!nvmtl_esc_on(which)) return 0xFFFFFFFFu;
     pthread_once(&nvmtl_esc_once[which], which ? nvmtl_esc_open1 : nvmtl_esc_open0);
     const io_connect_t c = nvmtl_esc_conns[which];
     if (!c) return 0xFFFFFFFFu;
@@ -6279,20 +6289,6 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
     memcpy(dst, src, n);
 }
 
-/* PR #96 (deferred surface-upload wait), NVMTL_ASYNC_SURFIN=<n> uploads in flight (2 when unset; 0 = the synchronous upload below).
- * The upload is submitted without waiting and its handle is kept on the image (nvk_image.up_token), so the lifetime guard
- * of the async texture uploads finishes it before the image is destroyed, migrated, read back or uploaded again (the
- * use-after-free that had #96 reverted). At most n deferred uploads are in flight per process: the oldest is finished
- * before another one starts. Their staging buffers come from a small pool, so a deferred upload allocates nothing. */
-// one async upload in flight; surfin: a deferred surface upload, whose staging buffer goes back to a pool
-typedef struct nvmtl_asyncup { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; int surfin; } nvmtl_asyncup;
-static unsigned nvmtl_async_surfin(void);
-static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit);
-static void nvmtl_surfin_drop(nvmtl_asyncup *au);
-static void nvmtl_surfin_store(nvk_image *img, nvmtl_asyncup *au);
-static uint64_t nvmtl_asyncup_take(nvk_image *img);
-static void nvmtl_asyncup_finish(uint64_t token);
-
 // Surface-in from the IOSurface's own pages. nvmtl_vk_image_write reads every byte of the surface with the CPU, and
 // WindowServer lets go of a client's surface after each frame, so for a large window most of that copy is page faults:
 // a full-screen 4K Safari window took ~20 ms per upload against ~7 ms for a 3200x1800 one. Importing the locked pages as
@@ -6329,6 +6325,20 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
     nvmtl_vk_buffer_destroy(&hb);
     return rc;
 }
+/* PR #96 (deferred surface-upload wait), behind NVMTL_ASYNC_SURFIN=<n> (0 or unset: the synchronous upload above).
+ * The upload is submitted without waiting and its handle is kept on the image (nvk_image.up_token), so the lifetime guard
+ * of the async texture uploads finishes it before the image is destroyed, migrated, read back or uploaded again (the
+ * use-after-free that had #96 reverted). At most n deferred uploads are in flight per process: the oldest is finished
+ * before another one starts. Their staging buffers come from a small pool, so a deferred upload allocates nothing. */
+// one async upload in flight; surfin: a deferred surface upload, whose staging buffer goes back to a pool
+typedef struct nvmtl_asyncup { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; int surfin; } nvmtl_asyncup;
+static unsigned nvmtl_async_surfin(void);
+static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit);
+static void nvmtl_surfin_drop(nvmtl_asyncup *au);
+static void nvmtl_surfin_store(nvk_image *img, nvmtl_asyncup *au);
+static uint64_t nvmtl_asyncup_take(nvk_image *img);
+static void nvmtl_asyncup_finish(uint64_t token);
+
 // Fills a family VRAM buffer with a whole IOSurface allocation (fork: multi-plane surfaces share one import, and the
 // kernel pages the whole allocation off, so every byte of it has to be current before any plane is marked newer).
 // From the surface's own pages when they can be imported (the copy engine reads them), else through a staging buffer.
@@ -6513,9 +6523,9 @@ static unsigned nvmtl_async_surfin(void)
     static int n = -1;
     if (n < 0) {
         const char *e = getenv("NVMTL_ASYNC_SURFIN");
-        const long v = e && *e ? strtol(e, NULL, 10) : 2;   // on by default, 2 in flight; 0 turns it off
+        const long v = e && *e ? strtol(e, NULL, 10) : 0;
         n = v <= 0 ? 0 : v > NVMTL_SURFIN_MAX ? NVMTL_SURFIN_MAX : (int)v;
-        nvlog("vk: deferred surface upload %s (NVMTL_ASYNC_SURFIN=%d, PR #96)", n ? "ON" : "OFF", n);
+        nvlog("vk: deferred surface upload %s (NVMTL_ASYNC_SURFIN=%d, PR #96)", n ? "ON" : "OFF (default)", n);
     }
     return (unsigned)n;
 }

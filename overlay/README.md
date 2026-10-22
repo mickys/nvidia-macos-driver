@@ -37,93 +37,46 @@ HEVC (P only) encoders and every decoder but AV1; VP9 from 65x65 up.
   streams. 4K: H.264 about 210 fps (NullMoth's decoder: 40, Apple's software decoder: 24), HEVC about 350, VP9 340, AV1
   380 (the only hardware VP9 and AV1 decoding on an Intel Mac). `--no-decoders` keeps only the encoders.
 
-**Optional, `--desktop`: faster desktop with large CPU-drawn windows.** When WindowServer composites a window that an
-app drew with the CPU (every WebKit view, including Safari and Mail, and CoreGraphics apps), NullMoth's plugin copies
-the window's pages into video memory with the CPU. WindowServer lets go of the surface after each frame, so the pages
-are faulted in again for every upload, and for a large window most of the copy is page faults. This fork's plugin
-imports the locked pages as host memory and lets the GPU copy them (falling back to the CPU copy when they cannot be
-imported); that change is 48 lines on top of NullMoth's plugin, the same one proposed to NullMoth. Measured on an RTX 4090
-with NullMoth 2.4.3 (macOS 26.7.1, in a VM), Safari playing a CSS animation, 2 x 3 x 20 s each (stock and patched passes
-alternating; 2.3.7 gave the same):
+**Optional, `--desktop`: this fork's Metal plugin.** It is NullMoth 2.5.0's plugin with this fork's changes added one by
+one, each behind its own line in `/Library/GPUBundles/nvmtl/nvrm610.conf`. Two are on by default; the others are off, so
+apart from those two the plugin behaves exactly like NullMoth's. Every change was measured on its own against NullMoth's
+plugin (GTX 1650, NullMoth 2.5.0, macOS 26.7.1, 1920x1080 at 165 Hz, zero-copy scan-out), with a full-screen Metal
+animation while the screen was captured: by Parsec (a client connected, 20 s runs) and by a screen recording.
 
-| window | plugin | screen updates/s (avg) | WindowServer CPU (user + system) | Safari's painting process |
-|---|---|---|---|---|
-| 3840x2110 (full screen, 4K) | NullMoth 2.4.3 | 20.6 | 73 % of a core | 459 % |
-| 3840x2110 (full screen, 4K) | `--desktop` | 34.6 (+67 %) | 55 % | 255 % |
-| 3200x1800 | NullMoth 2.4.3 | 40.3 | 58 % | 215 % |
-| 3200x1800 | `--desktop` | 42.9 (+6 %) | 55 % | 198 % |
+On by default, because they made capture faster and added no stalls:
 
-Since 2.4.3-mickys.6 the `--desktop` build also carries three fixes for screen capture and compositing (Parsec, OBS
-display capture, screen recording, and the desktop itself):
+- **NV12 plane seed** (`NVMTL_PLANE_SEED`). WindowServer draws captured frames into two-plane (NV12) surfaces. NullMoth's
+  plugin copies each plane out with a lock that moves the whole surface's seed, so the other plane looks stale and is
+  uploaded again from the CPU before the next frame. The plugin remembers the seed moves of its own copy-outs instead.
+- **One VRAM import per surface** (`NVMTL_SURF_IMPORT_CACHE`). CoreAnimation wraps the same window surfaces in a new texture
+  every frame, and each wrap imported the surface's video memory again (four kernel calls). The import is shared and
+  kept briefly. It needs the plane seed: on its own it made capture slower and frames out of order.
 
-- **NV12 capture surfaces stay in step:** WindowServer draws captured frames into two-plane (NV12) surfaces. NullMoth's
-  plugin copied each plane out with a lock that moved the whole surface's seed, so the other plane looked stale and was
-  uploaded again from the CPU before every frame, one plane at a time. The plugin now remembers the seed moves of its own
-  copy-outs. This removes the per-frame uploads and the horizontal tearing they caused in the streamed picture.
-- **One VRAM import per surface:** CoreAnimation wraps the same window surfaces in a new texture for every frame, and each
-  wrap imported the surface's VRAM again (four kernel calls, ~0.6 ms in WindowServer). The import is now shared and kept
-  briefly (`NVMTL_SURF_IMPORT_CACHE=0` turns it off).
-- **Texture pool:** CoreAnimation's per-frame intermediate textures (blur, vibrancy) reuse recently released ones of the
-  same size and format instead of a new VRAM allocation each (`NVMTL_TEX_POOL=0` turns it off).
-
-Measured on a GTX 1650 (NullMoth 2.4.3, macOS 26.7.1), 1920x1080 at 144 Hz:
-
-| test | NullMoth 2.4.3 | with the three fixes |
+| with a full-screen animation running | NullMoth 2.5.0 | `--desktop` (defaults) |
 |---|---|---|
-| Parsec streaming a full-screen GPU animation | 46-47 fps, encode latency 3.6 ms, tearing | **71-72 fps (+53 %)**, 3.0 ms, no tearing |
-| the same animation, no streaming | 118-132 fps | 139-142 fps (the 144 Hz limit) |
+| Parsec stream, app / Parsec fps | 50 / 50-52 | **60 / 60-61** |
+| Parsec stream, 100 ms stalls per 20 s (`debug.nvaccel_surface_gpu_timeouts`) | 1 | 1 |
+| Screen recording, app fps | 105-110 | **157-161** |
+| Screen recording, frames out of order | 1-9 | 0-1 |
+| Safari animation in a 1600x900 window, screen updates/s | 65.5 | **78.6 (+20 %)** |
 
-Desktop benchmark (Safari animation, updates/s): full-screen 1080p 66.0 -> 71.8 (Safari's own painting limit); full-screen 4K
-HiDPI 15.3 -> 19.9 (2.4.3-mickys.5 `--desktop`: 19.4), WindowServer CPU 73 -> 60 % of a core.
+Off by default (put the line into `nvrm610.conf`, then log out and in; `=0` turns the two defaults off):
 
-Since 2.4.3-mickys.7 the `--desktop` build also has:
-
-- **No more ~0.1 s freezes while the screen is captured.** When a capture (Parsec, OBS, screen recording) read a window
-  surface with the CPU, the kernel waited for WindowServer to report that surface finished, while holding the
-  accelerator lock. That report went through the same kernel connection as WindowServer's other surface calls, one of
-  which was waiting for that lock. Nothing moved until the kernel's 100 ms safety bound ran out, a few times every
-  10 seconds: the stream stopped for a moment and then jumped ahead. The plugin now sends these reports on a connection
-  of its own.
-- **Upstream PR #96 (rebased onto 2.4.3):** a CPU surface upload no longer waits for the GPU copy before the next one
-  starts (two staging slots; the pending upload is finished before the image is read, uploaded again, moved or freed).
-  Opt-in in 2.4.3-mickys.7, on by default since 2.4.3-mickys.8; `NVMTL_ASYNC_SURFIN=0` in `nvrm610.conf` turns it off.
-
-Since 2.4.3-mickys.8 the `--desktop` build also has:
-
-- **Captured frames are current.** WindowServer hands a ScreenCaptureKit client (Parsec, OBS) its frame as soon as the
-  GPU work for it is scheduled, and relies on the client's CPU lock to wait for the GPU, as it does on Apple's drivers.
-  NullMoth's plugin draws two-plane (NV12) capture surfaces into a private image and copies them out after the GPU has
-  finished, and the lock did not wait for that copy: Parsec's encoder read the surface about 1 ms after WindowServer's
-  commit and before the copy-out, so it encoded the previous capture, and now and then the new one, which showed as a
-  frame jumping back in the stream. Two changes, each enough on its own: such a command buffer now counts as scheduled
-  only after its copy-out (`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0` turns it off), and two-plane surfaces now share their
-  VRAM with other processes like single-plane ones, so a CPU lock waits in the kernel (`NVMTL_SURF_MULTIPLANE=0` turns it
-  off).
-- **VRAM dirty marks on a connection of their own** (like the completion marks since 2.4.3-mickys.7), so a mark waiting
-  for the accelerator lock no longer holds up NVK's own kernel calls. With shared two-plane surfaces that wait had
-  brought back 100 ms freezes.
-- **IOSurfaces count as in use while GPU work uses them**, as on Apple's drivers (surface pools reuse only surfaces not in
-  use).
-- Parsec on a GTX 1650 at 1080p / 165 Hz now streams 50-58 fps of current frames (2.4.3-mickys.7: 80 fps, but most
-  frames one capture old and an occasional frame out of order); no freezes, encode latency 3 ms. The frame rate is lower
-  because WindowServer now finishes each captured frame before the client reads it, as on a Mac.
-
-Measured on a GTX 1650 (NullMoth 2.4.3, macOS 26.7.1), 1920x1080 at 165 Hz:
-
-| test | 2.4.3-mickys.6 `--desktop` | 2.4.3-mickys.7 `--desktop` (with #96 on) |
+| line | what it does | why it is off |
 |---|---|---|
-| Parsec streaming a full-screen GPU animation | 52-54 fps, 4-11 freezes of ~117 ms per 30 s | **80-81 fps**, no freezes (worst frame 18-28 ms), encode latency 3.0 ms |
-| Safari animation in a 1600x900 window, screen updates/s | 83.0-83.3, WindowServer 73 % of a core | 82.8-83.9, 73 % (unchanged) |
+| `NVMTL_PLANE_SEED=0` | turns the plane seed off | (on by default) |
+| `NVMTL_SURF_IMPORT_CACHE=0` | turns the import cache off | (on by default) |
+| `NVMTL_SURFIN_UPLOAD=gpu` | CPU-drawn windows (WebKit, CoreGraphics apps) are uploaded by the GPU from their own pages instead of a CPU copy | no measurable gain at 1080p on 2.5.0; it was +67 % for a full-screen 4K Safari window on 2.4.3 (RTX 4090): worth trying on a 4K display |
+| `NVMTL_TEX_POOL=1` | CoreAnimation's per-frame intermediate textures (blur, vibrancy) reuse released ones instead of new allocations | no measurable change |
+| `NVMTL_ASYNC_SURFIN=2` | upstream PR #96: a CPU surface upload does not wait for its GPU copy before the next one starts | **under Parsec: 36 stalls of ~100 ms per 20 s, 41 instead of 50 fps, frames jumping back** |
+| `NVMTL_SURF_MULTIPLANE=1` | two-plane (NV12) surfaces share their video memory with other processes, so a reader's CPU lock waits in the kernel | **12 stalls of ~100 ms per 20 s of screen recording**: the reader's page-off waits for the GPU with the accelerator lock held |
+| `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=2` | a command buffer that writes a surface through a private image reports "scheduled" only after its copy-out | WindowServer waits for "scheduled" after every composite: capture 15-20 fps slower; with the line above it caused the stalls of 2.4.3-mickys.8 |
+| `NVMTL_WS_MARK_CONN=1` | WindowServer's completion marks go to the kernel on a connection of their own | fixed ~117 ms freezes on 2.4.3; none on 2.5.0 without it |
+| `NVMTL_DIRTY_MARK_CONN=1` | the same for video-memory dirty marks | no change on 2.5.0 |
+| `NVMTL_SURF_USE_COUNT=1` (every surface) / `=2` (only surfaces written) | IOSurfaces count as in use while GPU work uses them, as on Apple's drivers | with `1`, every app waited a display refresh longer for its next drawable: a full-screen Metal app ran at 72 fps at 144 Hz (NullMoth: 102-136) |
 
-With #96 switched on (`NVMTL_ASYNC_SURFIN=2`) the Safari number is the same: `--desktop` already uploads most windows from
-their own pages, and #96 only speeds up the CPU copy left for surfaces whose pages cannot be imported (on its own,
-without the GPU upload, it gave +8-14 % in the same benchmark).
-
-Per upload of the full-screen window (diagnostic build on 2.3.7): 19.7 ms with the CPU copy, 7.7 ms from the imported pages. Worth it on a 4K (or
-larger) display with big Safari, Mail or other WebKit windows; with smaller windows NullMoth's plugin is as fast. It
-replaces NullMoth's plugin binary, so a problem in it affects the whole desktop: try it, and go back with
-`sudo ./install.sh` (without `--desktop`) or `sudo ./uninstall.sh`. `NVMTL_SURFIN_UPLOAD=cpu` in
-`/Library/GPUBundles/nvmtl/nvrm610.conf` turns the GPU copy off (log out and in afterwards).
+The plugin replaces NullMoth's plugin binary, so a problem in it affects the whole desktop: try it, and go back with
+`sudo ./install.sh` (without `--desktop`) or `sudo ./uninstall.sh`.
 
 ## Command-line tools
 
@@ -167,7 +120,7 @@ sudo nvfb-edid remove                             # the display's own EDID again
 Measured on a GTX 1650 with a 4K HDMI dummy plug (NullMoth 2.4.3, macOS 26.7.1): NullMoth's framebuffer lists 9 timings,
 all 4K (smaller desktops only as scaled modes, which NVKMS refuses on that raster); with `--resolution` 35 (1080p, 1440p,
 720p and the other sizes in the plug's EDID), and 41 with an override adding 1080p at 120 / 144 / 165 / 240 Hz and 1440p at
-120 / 144 Hz; 1080p at 144 Hz set and shown.
+120 / 144 Hz; 1080p at 144 Hz set and shown. On NullMoth 2.5.0 the same: the desktop at 1080p 165 Hz from the override.
 
 Add only timings the display can show: a real monitor may stay black on one it does not support (remove the file over
 SSH or from safe mode to recover). Overrides are refused unless root-owned and not writable by others, valid, and for the
@@ -191,7 +144,7 @@ and 29 % less in a Core Image blur, while the synchronous elapsed time grows by 
 
 ## Requirements
 
-- NullMoth's driver **2.4.3** installed and running. The installer refuses anything else: it checks NullMoth's version
+- NullMoth's driver **2.5.0** installed and running. The installer refuses anything else: it checks NullMoth's version
   record, the version of the NVRM, NVAccel and NVRMFB kernel extensions on disk, and the version of the ones running
   (after a NullMoth update, restart before installing the overlay). The plugin and the kernel driver share interfaces,
   so an overlay is built for one NullMoth version (`COMPATIBLE-DRIVERS` in the package).
@@ -250,10 +203,11 @@ stay: NullMoth's framebuffer ignores them). Then log out and back in, or restart
 
 ## Source
 
-- Framebuffer (`--resolution`): `kexts/NVRMFB` at the same tag (NullMoth 2.4.3 plus three commits), built with
-  `build/fb_build.sh`; `nvfb-edid` from `tools/nvfb-edid.c`.
+- Framebuffer (`--resolution`): `kexts/NVRMFB` at the same tag (NullMoth 2.5.0 plus three commits), built with
+  `build/fb_build.sh` against NVIDIA's open-gpu-kernel-modules 615.78.08 headers (NullMoth 2.5.0's RM version; the same
+  script builds NullMoth's own 2.5.0 NVRMFB byte for byte); `nvfb-edid` from `tools/nvfb-edid.c`.
 - Plugin (`--desktop` only): `plugin/` of [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) at the tag named in
-  `SOURCE` (NullMoth 2.4.3 plus the overlay's commits), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
+  `SOURCE` (NullMoth 2.5.0 plus the overlay's commits, each behind a config line), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
 - Encoder: [mickys/nvenc](https://github.com/mickys/nvenc) at the commit named in `SOURCE`.
 - The plugin source is under the PolyForm Noncommercial License 1.0.0 (`LICENSE`), like NullMoth's. The encoder is MIT
   (`LICENSE-nvenc`).
