@@ -1053,6 +1053,27 @@ static void nvmtl_pass_log(NVMTLTexture *sr, MTLLoadAction load, MTLStoreAction 
             (unsigned long)sr->_fmt, att, (unsigned long)load, (unsigned long)store, IOSurfaceGetSeed(sr->_surf), sr->_surfSeed, (int)sr->_surfSynced, (int)sr->_vramOn);
     fclose(f);
 }
+// POff8: the seed of a render target WindowServer draws into with Load can move only because another process locked it
+// read-write to read it (ScreenCaptureKit in Parsec locks every captured frame that way: 10-bit capture surfaces showed
+// seed = our last seed + 1 on every pass), and then each frame uploaded the surface's pages back to VRAM first (33 MB at
+// 4K, ~1 s per 8 s of WindowServer time). With NVMTL_SURFIN_READER_SKIP=1 (diagnostic builds: /tmp/nvmtl-surfin-reader),
+// a shared-VRAM target whose seed moved by exactly 1 since our last write, four times in a row, is taken as read only.
+static int nvmtl_surfin_reader_on(void) {
+    static int env = -1; if (env < 0) { const char *e = getenv("NVMTL_SURFIN_READER_SKIP"); env = e && e[0] == '1'; }
+    static uint64_t next; static int tmp;
+    return env || nvmtl_tmp_switch("/tmp/nvmtl-surfin-reader", &next, &tmp);
+}
+static uint64_t g_surfin_reader_skip;
+static BOOL nvmtl_surfin_reader_only(NVMTLTexture *r) {
+    if (!nvmtl_surfin_reader_on() || !r->_surf || !r->_vramOn || r->_vramMulti || !r->_surfSynced) return NO;
+    const uint32_t now = IOSurfaceGetSeed(r->_surf);
+    if (now == r->_surfSeed) return NO;
+    if (now != r->_surfSeed + 1) { r->_readerStreak = 0; return NO; }
+    if (r->_readerStreak < 4) { r->_readerStreak++; return NO; }
+    r->_surfSeed = now; nvmtl_vram_tag_set(r->_surf, r->_plane, now); g_surfin_reader_skip++;   // _vramMulti excluded above: the plane is NVMTL_VP
+    static unsigned n; if (n++ < 6 || n % 5000 == 0) nvlog("surface-in SKIPPED (surface %u: seed +1, a reader's lock; %llu so far)", (unsigned)IOSurfaceGetID(r->_surf), g_surfin_reader_skip);
+    return YES;
+}
 static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
@@ -5055,7 +5076,10 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
             nvmtl_pass_log(sr, d.colorAttachments[0].loadAction, d.colorAttachments[0].storeAction, 0);
             const MTLLoadAction la = d.colorAttachments[0].loadAction;
             if (la == MTLLoadActionClear || (la == MTLLoadActionDontCare && nvmtl_surfin_dontcare() && !sr->_vramMulti)) nvmtl_surface_overwrite_recorded(self, sr);
-            else nvmtl_surface_in_for_cb(self, sr);
+            else {
+                @synchronized (nvmtl_surface_sync(sr)) { (void)nvmtl_surfin_reader_only(sr); }
+                nvmtl_surface_in_for_cb(self, sr);
+            }
             nvmtl_surf_dirty(self, sr); } }
     const float defaultBlend[4] = { 0, 0, 0, 0 };
     nvmtl_vk_cmd_set_blend_color(&_c, defaultBlend);
