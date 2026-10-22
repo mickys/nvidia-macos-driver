@@ -28,6 +28,10 @@
  * page-off waits for it and then skips its own copy */
 #define NVRM_SS_CPU_READ_PAGES 0x80000009u
 #define NVRM_SS_PLANE_PAGES_DONE 0x20000000u
+/* debug.nvaccel_cpuread=3 (POff5b): after a dirty mark answered NVRM_SS_CPU_READ_PAGES the writer records a GPU copy of the
+ * frame into the surface's pages in the same command buffer and sends NVRM_SS_PLANE_PAGES_DONE ("current at GPU done"),
+ * or NVRM_SS_PLANE_PAGES_NO when it could not; a reader's page-off then waits for the GPU-done mark and skips its copy */
+#define NVRM_SS_PLANE_PAGES_NO 0x10000000u
 struct NVRMSurfShareEsc {
     unsigned int version;
     unsigned int surfaceID;

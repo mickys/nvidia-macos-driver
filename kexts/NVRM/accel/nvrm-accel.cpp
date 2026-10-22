@@ -1431,10 +1431,11 @@ NVACCEL_CNT(nvaccel_pageoff_cpu_mapfail, gPageoffCpuMapFail, "CPU copies whose s
 // POff5: see nvCpuReadWriter
 static int gCpuReadOn = 0;
 static SInt64 gCntCpuReadRefused, gCntCpuReadForeign;
-SYSCTL_INT(_debug, OID_AUTO, nvaccel_cpuread, CTLFLAG_RW | CTLFLAG_LOCKED, &gCpuReadOn, 0, "1 = refuse VRAM-newest marks for surfaces another process keeps paging off (the writer copies out itself); 2 = take the mark, the writer copies out too and readers wait for that instead of copying");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_cpuread, CTLFLAG_RW | CTLFLAG_LOCKED, &gCpuReadOn, 0, "1 = refuse VRAM-newest marks for surfaces another process keeps paging off (the writer copies out itself); 2 = take the mark, the writer copies out too and readers wait for that instead of copying (deadlocks: POff5c); 3 = the writer copies the frame into the pages on the GPU in the same command buffer, readers wait for GPU done and skip the copy (POff5b)");
 NVACCEL_CNT(nvaccel_cpuread_refused, gCntCpuReadRefused, "dirty marks refused because another process reads the surface on the CPU");
 NVACCEL_CNT(nvaccel_cpuread_foreign, gCntCpuReadForeign, "page-offs by a process other than the surface's writer");
-static SInt64 gCntCpuReadHeld, gCntCpuReadDone, gCntCpuReadBypass, gCntCpuReadSkipped;
+static SInt64 gCntCpuReadHeld, gCntCpuReadDone, gCntCpuReadBypass, gCntCpuReadSkipped, gCntCpuReadNo;
+NVACCEL_CNT(nvaccel_cpuread_no,      gCntCpuReadNo,      "cpuread=3: frames whose GPU copy into the pages could not be recorded");
 NVACCEL_CNT(nvaccel_cpuread_held,    gCntCpuReadHeld,    "cpuread=2: GPU-done marks held until the writer's pages-done mark");
 NVACCEL_CNT(nvaccel_cpuread_done,    gCntCpuReadDone,    "cpuread=2: pages-done marks");
 NVACCEL_CNT(nvaccel_cpuread_bypass,  gCntCpuReadBypass,  "cpuread=2: the writer's own page-offs passed through without a copy");
@@ -1482,6 +1483,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_cpuread_foreign);
     sysctl_register_oid(&sysctl__debug_nvaccel_cpuread_held); sysctl_register_oid(&sysctl__debug_nvaccel_cpuread_done);
     sysctl_register_oid(&sysctl__debug_nvaccel_cpuread_bypass); sysctl_register_oid(&sysctl__debug_nvaccel_cpuread_skipped);
+    sysctl_register_oid(&sysctl__debug_nvaccel_cpuread_no);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
@@ -1716,7 +1718,7 @@ static unsigned nvSurfGpuEscape(const struct NVRMSurfShareEsc *p)
 // a surface paged off 3 times within 5 s by anyone else is "CPU-read" for 10 s from its last such page-off, and with
 // debug.nvaccel_cpuread=1 its dirty marks are refused (NVRM_SS_CPU_READ): the plugin then copies its writes out to the
 // pages itself at completion (its copy-out path), outside both locks, and the reader's lock finds the pages current.
-struct NVCpuRead { unsigned sid; int writer; unsigned foreign; uint64_t last, seen; bool awaiting, fresh; };
+struct NVCpuRead { unsigned sid; int writer; unsigned foreign; uint64_t last, seen; bool awaiting, fresh, gpu; };
 static NVCpuRead gCpuRead[32];
 static IOLock *gCpuReadLock;
 static uint64_t nvNowNs() { uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns; }
@@ -1728,10 +1730,10 @@ static NVCpuRead *nvCpuReadSlot(unsigned sid, bool make, uint64_t now)   // lock
         if (gCpuRead[i].seen < gCpuRead[old].seen) old = i;
     }
     if (!make) return nullptr;
-    gCpuRead[old] = NVCpuRead{ sid, -1, 0, 0, now, false, false };
+    gCpuRead[old] = NVCpuRead{ sid, -1, 0, 0, now, false, false, false };
     return &gCpuRead[old];
 }
-static bool nvCpuReadWriter(unsigned sid, int pid, bool *pagesToo)   // a dirty mark from pid: true = refuse it
+static bool nvCpuReadWriter(unsigned sid, int pid, bool *pagesToo, bool remark)   // a dirty mark from pid: true = refuse it
 {
     if (pagesToo) *pagesToo = false;
     if (!sid) return false;
@@ -1743,7 +1745,8 @@ static bool nvCpuReadWriter(unsigned sid, int pid, bool *pagesToo)   // a dirty 
     if (e->writer != pid) { e->writer = pid; e->foreign = 0; }
     const bool hot = gCpuReadOn && e->foreign >= 3 && now - e->last < 10000000000ULL;
     if (hot && gCpuReadOn == 2) { e->awaiting = true; e->fresh = false; if (pagesToo) *pagesToo = true; }
-    else { e->awaiting = false; e->fresh = false; }
+    else if (hot && gCpuReadOn == 3) { if (!remark) e->gpu = false; if (pagesToo) *pagesToo = true; }   // a new frame: not in the pages until its GPU copy is promised
+    else { e->awaiting = false; e->fresh = false; e->gpu = false; }
     IOLockUnlock(gCpuReadLock);
     return hot && gCpuReadOn == 1;
 }
@@ -1789,13 +1792,22 @@ static void nvCpuReadPagesDone(unsigned sid)   // the writer copied its write ou
     nvSurfMark(sid, false);
     OSAddAtomic64(1, &gCntCpuReadDone);
 }
+static void nvCpuReadGpuPages(unsigned sid, bool on)   // cpuread=3: this frame's GPU copy into the pages is (not) recorded
+{
+    if (!gCpuReadLock) return;
+    IOLockLock(gCpuReadLock);
+    NVCpuRead *e = nvCpuReadSlot(sid, false, nvNowNs());
+    if (e) e->gpu = on;
+    IOLockUnlock(gCpuReadLock);
+    OSAddAtomic64(1, on ? &gCntCpuReadDone : &gCntCpuReadNo);
+}
 // in a page-off: 1 = the writer's own lock while it copies out (no copy, no wait), 2 = the pages are current (no copy)
 static int nvCpuReadPageoffState(unsigned sid, int pid)
 {
-    if (!gCpuReadLock || gCpuReadOn != 2) return 0;
+    if (!gCpuReadLock || gCpuReadOn < 2) return 0;
     IOLockLock(gCpuReadLock);
     NVCpuRead *e = nvCpuReadSlot(sid, false, nvNowNs());
-    const int r = !e ? 0 : (e->awaiting && pid == e->writer) ? 1 : (!e->awaiting && e->fresh) ? 2 : 0;
+    const int r = !e ? 0 : (gCpuReadOn == 3) ? (e->gpu ? 3 : 0) : (e->awaiting && pid == e->writer) ? 1 : (!e->awaiting && e->fresh) ? 2 : 0;
     IOLockUnlock(gCpuReadLock);
     return r;
 }
@@ -1813,11 +1825,13 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
     // dropped instead, and the mark taken at commit stands.
     const bool tryOnly = cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_TRYLOCK);
     p->plane &= ~(NVRM_SS_PLANE_TRYLOCK | NVRM_SS_PLANE_GPU_MARK);
-    if (cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_PAGES_DONE)) {
-        nvCpuReadPagesDone(p->surfaceID); p->status = 0; return kIOReturnSuccess;
+    if (cmd == NVRM_ESC_SURF_DIRTY && (p->plane & (NVRM_SS_PLANE_PAGES_DONE | NVRM_SS_PLANE_PAGES_NO))) {
+        if (gCpuReadOn == 3) nvCpuReadGpuPages(p->surfaceID, (p->plane & NVRM_SS_PLANE_PAGES_DONE) != 0);
+        else nvCpuReadPagesDone(p->surfaceID);
+        p->status = 0; return kIOReturnSuccess;
     }
     bool pagesToo = false;
-    if (cmd == NVRM_ESC_SURF_DIRTY && nvCpuReadWriter(p->surfaceID, proc_selfpid(), &pagesToo)) {
+    if (cmd == NVRM_ESC_SURF_DIRTY && nvCpuReadWriter(p->surfaceID, proc_selfpid(), &pagesToo, tryOnly)) {
         OSAddAtomic64(1, &gCntCpuReadRefused); p->status = NVRM_SS_CPU_READ; return kIOReturnSuccess;
     }
     // plane is a full uint32 from the caller and reaches IOGraphicsAccelerator2::deviceCacheForIOSurface
@@ -2020,13 +2034,15 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     // normal IOSurfaceLock does on Apple's drivers (the commit marked it pending; see nvmtl_ws_mark_pending)
     const int cr = nvCpuReadPageoffState(_ZNK9IOSurface12getSurfaceIDEv(surf), proc_selfpid());
     if (cr == 1) { OSAddAtomic64(1, &gCntCpuReadBypass); if (out) *out = true; return; }   // the writer is about to fill the pages itself
+    bool gpuReady = true;
     {
         const uint64_t w0 = mach_absolute_time();
-        nvSurfWaitReady(_ZNK9IOSurface12getSurfaceIDEv(surf));
+        gpuReady = nvSurfWaitReady(_ZNK9IOSurface12getSurfaceIDEv(surf));
         uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - w0, &ns);
         if (ns >= 20000) { OSAddAtomic64(1, &gPageoffWaitN); OSAddAtomic64((SInt64)(ns / 1000), &gPageoffWaitUs); }
     }
-    if (cr == 2 || nvCpuReadPageoffState(_ZNK9IOSurface12getSurfaceIDEv(surf), proc_selfpid()) == 2) {   // copied out by the writer
+    const int cr2 = nvCpuReadPageoffState(_ZNK9IOSurface12getSurfaceIDEv(surf), proc_selfpid());
+    if (cr == 2 || cr2 == 2 || (cr2 == 3 && gpuReady)) {   // copied out by the writer (cpuread=2) / by its GPU (cpuread=3, the frame done)
         nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(surf), 0);
         volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
         if (valid) valid[0] |= 1;
