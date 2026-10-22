@@ -1229,11 +1229,11 @@ static BOOL nvmtl_own_bumps_cover(IOSurfaceRef s, uint32_t have, uint32_t now)
     return ok;
 }
 static unsigned long long g_surfin_own_skip;
-// stock-plus: the plane seed (c8fb686) only with NVMTL_PLANE_SEED=1
+// the plane seed (c8fb686): on by default (Parsec 1080p165 on a GTX 1650: 50 -> 60 fps with the import cache), NVMTL_PLANE_SEED=0 off
 static BOOL nvmtl_plane_seed_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_PLANE_SEED"); on = e && e[0] == '1'; nvlog("plane seed %s (NVMTL_PLANE_SEED=%s)", on ? "on" : "off", e ?: "unset"); }
+    if (on < 0) { const char *e = getenv("NVMTL_PLANE_SEED"); on = !(e && e[0] == '0'); nvlog("plane seed %s (NVMTL_PLANE_SEED=%s)", on ? "on" : "off", e ?: "unset"); }   // on by default; =0 turns it off
     return on;
 }
 // The plane whose kernel / VRAM-tag / lock state a texture uses: a plane of a multi-plane surface aliased in the whole
