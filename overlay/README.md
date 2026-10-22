@@ -38,13 +38,13 @@ HEVC (P only) encoders and every decoder but AV1; VP9 from 65x65 up.
   380 (the only hardware VP9 and AV1 decoding on an Intel Mac). `--no-decoders` keeps only the encoders.
 
 **Optional, `--desktop`: this fork's Metal plugin.** It is NullMoth 2.5.2's plugin with this fork's changes added one by
-one, each behind its own line in `/Library/GPUBundles/nvmtl/nvrm610.conf`. Two are on by default; the others are off, so
-apart from those two the plugin behaves exactly like NullMoth's. Every change was measured on its own against NullMoth's
+one, each behind its own line in `/Library/GPUBundles/nvmtl/nvrm610.conf`. Three are on by default; the others are off, so
+apart from those three the plugin behaves exactly like NullMoth's. Every change was measured on its own against NullMoth's
 plugin, on a GTX 1650 (NullMoth 2.5.0) and again on an RTX 4090 (NullMoth 2.5.2; macOS 26.7.1, zero-copy scan-out), with a
 full-screen Metal animation while the screen was captured: by Parsec (a client connected, 20 s runs; GTX 1650) and by a
 screen recording, at 1080p 165 Hz and at 4K HiDPI.
 
-On by default, because they made capture faster and added no stalls:
+On by default, because they made capture faster or correct and added no stalls:
 
 - **NV12 plane seed** (`NVMTL_PLANE_SEED`). WindowServer draws captured frames into two-plane (NV12) surfaces. NullMoth's
   plugin copies each plane out with a lock that moves the whole surface's seed, so the other plane looks stale and is
@@ -55,10 +55,24 @@ On by default, because they made capture faster and added no stalls:
   composites) are imported per wrap as before: uncapped, the cache added up to 67 stalls of ~100 ms per 15 s at 4K HiDPI on
   a GTX 1650. With the cap, 1080p and 1440p surfaces (8-15 MB) are cached.
 
+- **Captured frames in order** (`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=3`). WindowServer draws each captured frame into a
+  two-plane (NV12) surface, which the plugin writes through a private image and copies out when the GPU has finished. The
+  recorder or streamer (ScreenCaptureKit, Parsec) reads the surface as soon as WindowServer's command buffer is scheduled,
+  about 1 ms after the commit, so it sometimes got the previous frame: a stream that jumps back a frame now and then. Such a
+  command buffer now reports "scheduled" after its copy-out. It costs nothing without capture; while capturing, the captured
+  app runs ~15 % slower (still faster than with NullMoth's plugin, which has the jumps too):
+
+| RTX 4090, 1080p 165 Hz, Metal animation recorded with Screen Sharing connected | app fps | frames out of order per 20 s |
+|---|---|---|
+| NullMoth 2.5.2 | 81-93 | 142-183 |
+| plane seed + import cache | 107-128 | 12-55 |
+| `--desktop` (default: also captured frames in order) | 90-103 | 0 |
+| without capture: plane seed + import cache / default | 136-152 / 133-150 | |
+
 RTX 4090, NullMoth 2.5.2, macOS 26.7.1, 1080p 165 Hz, a full-screen Metal animation while the screen is recorded (one boot,
 20 s runs):
 
-| | NullMoth 2.5.2 | plane seed only | `--desktop` (default: plane seed + import cache) |
+| | NullMoth 2.5.2 | plane seed only | plane seed + import cache (without the frame-order fix) |
 |---|---|---|---|
 | app fps | 95-107 | 103-131 | 137-159 |
 | ~100 ms stalls per 20 s | 0 | 0 | 0 |
@@ -87,7 +101,8 @@ Off by default (put the line into `nvrm610.conf`, then log out and in):
 | `NVMTL_TEX_POOL=1` | CoreAnimation's per-frame intermediate textures (blur, vibrancy) reuse released ones instead of new allocations | no measurable change |
 | `NVMTL_ASYNC_SURFIN=2` | upstream PR #96: a CPU surface upload does not wait for its GPU copy before the next one starts | **under Parsec: 36 stalls of ~100 ms per 20 s, 41 instead of 50 fps, frames jumping back** |
 | `NVMTL_SURF_MULTIPLANE=1` | two-plane (NV12) surfaces share their video memory with other processes, so a reader's CPU lock waits in the kernel | **12 stalls of ~100 ms per 20 s of screen recording**: the reader's page-off waits for the GPU with the accelerator lock held |
-| `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=2` | a command buffer that writes a surface through a private image reports "scheduled" only after its copy-out | WindowServer waits for "scheduled" after every composite: capture 15-20 fps slower; with the line above it caused the stalls of 2.4.3-mickys.8 |
+| `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0` | turns the frame-order fix off (on by default, `=3`; see below) | (on by default) |
+| `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=2` / `=1` | the frame-order fix for every surface written through a private image / every surface write | `=2` orders capture as well as `=3` at the same cost; `=1` slows every app |
 | `NVMTL_WS_MARK_CONN=1` | WindowServer's completion marks go to the kernel on a connection of their own | fixed ~117 ms freezes on 2.4.3; none on 2.5.0 without it |
 | `NVMTL_DIRTY_MARK_CONN=1` | the same for video-memory dirty marks | no change on 2.5.0 |
 | `NVMTL_SURF_USE_COUNT=1` (every surface) / `=2` (only surfaces written) | IOSurfaces count as in use while GPU work uses them, as on Apple's drivers | with `1`, every app waited a display refresh longer for its next drawable: a full-screen Metal app ran at 72 fps at 144 Hz (NullMoth: 102-136) |

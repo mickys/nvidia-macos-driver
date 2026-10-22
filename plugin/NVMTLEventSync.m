@@ -365,9 +365,10 @@ static int nvmtl_skip_empty_on(void) {
     // waits for the GPU): Parsec's encoder read the two-plane NV12 capture surface ~1 ms after the commit and before the
     // copy-out, so it encoded the surface's previous frame, and now and then the new one when the copy-out won the race
     // (a counter in the stream read N-1, N+1, N). Such a command buffer reports "scheduled" once its writes are published.
-    // NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1 does it for every surface write, =0 for none; =3 only for two-plane surfaces
-    // written through private images (the NV12 surfaces WindowServer draws captured frames into), not every private one.
-    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && *e ? e[0] - '0' : 0; }   // stock-plus: stock's default (0); 2 = ours, 1 = every write
+    // NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=3 (default) does it only for two-plane surfaces written through private images (the
+    // NV12 surfaces WindowServer draws captured frames into, so it costs nothing without capture), =2 for every private one,
+    // =1 for every surface write, =0 for none.
+    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && *e ? e[0] - '0' : 3; }   // 3 (default): NV12 capture surfaces only (RTX 4090 1080p165 recording + Screen Sharing: 0 frames out of order instead of 9-39, app 90-103 instead of 107-128 fps; NullMoth's plugin 81-93 fps with 106-134 out of order); 0 = stock's, 2 = every private-image write, 1 = every write
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) {
         if (s == drawable || !after) continue;
