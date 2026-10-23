@@ -1,6 +1,7 @@
 # Plugin changes in mickys/nvidia-macos-driver that may be worth taking upstream
 
-Nine changes to `plugin/` (NVMTLDriver) carried in the fork's `dev` branch on top of v2.5.3, plus one framebuffer feature.
+Nine changes to `plugin/` (NVMTLDriver) carried in the fork's `dev` branch on top of v2.5.3, one change to NVAccel, plus one
+framebuffer feature.
 Each is behind its own switch, so it can be compared with the stock behaviour in the same build. Each group is also on its
 own branch based on v2.5.3 (see **Branches**), ready to merge or to open as a pull request.
 
@@ -36,6 +37,7 @@ v2.5.3
 ├── upstream/plane-seed       item 6
 │   ├── upstream/reader-skip  item 7 (needs 6)
 │   └── upstream/import-cache item 8 (needs 6)
+├── upstream/accel-unlocked-wait  item 10 (NVAccel)
 └── upstream/nvrmfb-modes     NVRMFB (outside the plugin)
 ```
 
@@ -47,8 +49,9 @@ v2.5.3
 | [`upstream/plane-seed`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/plane-seed) | v2.5.3 | 6 | 0c98c3e |
 | [`upstream/reader-skip`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/plane-seed...upstream/reader-skip) | `upstream/plane-seed` | 7 | 1e7d414 |
 | [`upstream/import-cache`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/plane-seed...upstream/import-cache) | `upstream/plane-seed` | 8 | 6d20e60 |
+| [`upstream/accel-unlocked-wait`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/accel-unlocked-wait) | v2.5.3 | 10 (NVAccel) | 9bbfba8 |
 | [`upstream/nvrmfb-modes`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/nvrmfb-modes) | v2.5.3 | NVRMFB | 9c023cd |
-| [`upstream/all`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/all) | v2.5.3 | every leaf merged (a test integration, not for merging) | f789975 |
+| [`upstream/all`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/all) | v2.5.3 | every leaf merged (a test integration, not for merging) | b317082 |
 
 `upstream/all` (as of 8a2e674, before the timer fix below was added to item 9), installed on the test machine (RTX 4090, macOS 26.7.1), passed the fork's release checks: NV12 round trips at
 1080p and 4K (0 mismatches), CPU-drawn surface uploads at four sizes on the GPU and CPU paths (8 of 8 runs, 0 wrong), and a
@@ -83,6 +86,8 @@ multi-plane VRAM sharing hooks (an experiment not offered here) are left out of 
 | 9 | Page cache + async upload | Safari animation, local display 1080p 165 Hz / 4K HiDPI 60 Hz (screen updates/s) | 73 / 58 | 128 / 60 |
 | 9 | | WindowServer system CPU at 4K | 28 % | 7 % |
 | 9 | | Parsec 1080p / 4K, Safari animation (fps) | 34 / 15.6 | 37 / 17.3 |
+| 10 | Unlocked page-off wait | with the plugin's NV12 VRAM sharing on: screen recording + Screen Sharing, ~100 ms stalls per 15 s | 3 / 1 (locked wait) | 0 / 0 |
+| 10 | | Parsec 1080p, Metal animation, plugin defaults -> NV12 sharing + this (fps) | 68.3 / 67.2 | 71.3 / 71.1 |
 
 ---
 
@@ -225,6 +230,33 @@ multi-plane VRAM sharing hooks (an experiment not offered here) are left out of 
 - **Required by:** none.
 - **Commits:** branch `upstream/page-cache` (aed2036 + 97f1db1, the timer's dispatch source kept alive: under ARC it was released at once and the 500 ms timer never fired; based on `upstream/fixes`; on dev 6d1812e, 05ac4bb, 284bb99, 5536b1e, e3ce433,
   49091b2). Needs items 2 and 3. The newest change (2026-10-23), so far tested on the RTX 4090 only.
+
+## Group E: kernel (item 10)
+
+### 10. Unlocked page-off wait (NVAccel, `debug.nvaccel_pageoff_unlocked_wait`)
+
+- **Problem:** `NVResource::pageoff`, which the family calls with the accelerator lock held, waits up to 100 ms
+  (`nvSurfWaitReady`) for WindowServer's pending GPU write to the surface with that lock held. Every RM call that needs the lock
+  (VRAM imports, allocations, dirty marks) queues behind the wait; a reader's CPU lock of a surface WindowServer is still drawing
+  stalls everyone. This is why two-plane (NV12) capture surfaces could not share VRAM: with the plugin's sharing on, a screen
+  recording had ~100 ms stalls.
+- **Change:** when the surface is still pending and the current thread is the lock's recorded owner, the page-off lets go of
+  the lock for the wait, takes it back and re-reads the resource before it copies; otherwise it waits as before. Ownership is
+  recorded by `acceleratorDidLock` / `acceleratorWillUnlock` overrides (the family and `nvFamLock` call them). `=0` restores the
+  locked wait; counters `debug.nvaccel_pageoff_unlocked_waits`, `_locked_not_owner`, `_unlocked_wait_max_us`.
+- **Why should merge:** removes a class of stalls in the kernel (any RM work queued behind a page-off's GPU wait), and with it the
+  reason two-plane surfaces cannot share VRAM, which lets a capture reader wait in the kernel as on Apple's drivers instead of
+  WindowServer waiting at every capture commit.
+- **Performance:** with the plugin's NV12 VRAM sharing on, screen recording + Screen Sharing: ~100 ms stalls 3 / 1 per 15 s with
+  the locked wait, 0 / 0 with this (~460 unlocked waits across the tests, the longest 2.9 ms, never refused for ownership, no
+  hang). Parsec, one session: full-screen Metal app 68.3 / 67.2 fps (plugin defaults) -> 71.3 / 71.1 (sharing + this); Safari
+  animation level (34.9 / 39.5 vs 33.9 / 38.8; WindowServer then CPU-bound by sharing's own costs). Without sharing it changes
+  little (2-3 unlocked waits per recording).
+- **Required by:** none. Its gain needs the plugin's two-plane VRAM sharing (fork `dev`, `NVMTL_SURF_MULTIPLANE=1`), which is not
+  offered here as a branch: on its own it stalls, and with this change it is only worth it under Parsec.
+- **Commits:** branch `upstream/accel-unlocked-wait` (9bbfba8; on the fork 'accel-unlocked-wait' afa361d), builds byte-identical to
+  the tested kext (2d2b4bbc). **Priority: lower than items 1-9:** a small measured gain, and it releases the family's lock inside
+  a family callback: the order of that lock against the family's other locks is not known, please review before taking it.
 
 ---
 
