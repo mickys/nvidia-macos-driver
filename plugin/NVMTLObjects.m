@@ -5276,9 +5276,10 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 }
 - (void)waitUntilScheduled {
     _nWait++; [_completionCondition lock];
-    while (!_wasScheduled && !_executionDone) [_completionCondition wait];
+    while (!_wasScheduled && !_executionDone && !_scheduledWaitReleased) [_completionCondition wait];
+    const BOOL early = !_wasScheduled && _scheduledWaitReleased;
     [_completionCondition unlock];
-    dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER);
+    if (!early) dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER);
 }
 - (MTLCommandBufferStatus)status { [_completionCondition lock]; MTLCommandBufferStatus s = _cbstatus; [_completionCondition unlock]; return s; }
 - (NSError *)error { return _cbError; }

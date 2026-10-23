@@ -401,7 +401,9 @@ static int nvmtl_skip_empty_on(void) {
     // NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=3 (default) does it only for two-plane surfaces written through private images (the
     // NV12 surfaces WindowServer draws captured frames into, so it costs nothing without capture), =2 for every private one,
     // =1 for every surface write, =0 for none.
-    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && *e ? e[0] - '0' : 3; }   // 3 (default): NV12 capture surfaces only (RTX 4090 1080p165 recording + Screen Sharing: 0 frames out of order instead of 9-39, app 90-103 instead of 107-128 fps; NullMoth's plugin 81-93 fps with 106-134 out of order); 0 = stock's, 2 = every private-image write, 1 = every write
+    static int after0 = -1; if (after0 < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after0 = e && *e ? e[0] - '0' : 3; }
+    static uint64_t offNext; static int offTmp;   // diagnostic builds: /tmp/nvmtl-sched-off = mode 0, live
+    const int after = nvmtl_tmp_switch("/tmp/nvmtl-sched-off", &offNext, &offTmp) ? 0 : after0;   // 3 (default): NV12 capture surfaces only (RTX 4090 1080p165 recording + Screen Sharing: 0 frames out of order instead of 9-39, app 90-103 instead of 107-128 fps; NullMoth's plugin 81-93 fps with 106-134 out of order); 0 = stock's, 2 = every private-image write, 1 = every write
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) {
         if (s == drawable || !after) continue;
@@ -484,8 +486,26 @@ static int nvmtl_skip_empty_on(void) {
         });
     });
 }
+// Schedule split (NVMTL_SCHEDULE_SPLIT=1; diagnostic builds: /tmp/nvmtl-sched-split): a command buffer that reports
+// scheduled only after its writes are published (NVMTL_SCHEDULE_AFTER_SURFACE_WRITES) lets waitUntilScheduled return at
+// submission, while its scheduled handlers and its status still wait for the publication. WindowServer's main thread
+// blocked in SkyLight's commitAndWaitUntilSubmitted for the capture frame's GPU time; frames stay in order only if
+// ScreenCaptureKit's frame hand-off runs from a scheduled handler, not after that wait.
+static int nvmtl_sched_split_on(void) {
+    static int env = -1; if (env < 0) { const char *e = getenv("NVMTL_SCHEDULE_SPLIT"); env = e && e[0] == '1';
+        nvlog("schedule split %s (NVMTL_SCHEDULE_SPLIT=%s)", env ? "on" : "off", e ?: "unset"); }
+    static uint64_t next; static int tmp;
+    return env || nvmtl_tmp_switch("/tmp/nvmtl-sched-split", &next, &tmp);
+}
 - (void)nvmtlMarkScheduled {
-    if (_scheduleAfterPublish) return;
+    if (_scheduleAfterPublish) {
+        if (nvmtl_sched_split_on()) {
+            [_completionCondition lock];
+            if (!_scheduledWaitReleased) { _scheduledWaitReleased = YES; [_completionCondition broadcast]; }
+            [_completionCondition unlock];
+        }
+        return;
+    }
     [_completionCondition lock];
     if (!_wasScheduled) {
         _wasScheduled = YES; _cbstatus = MTLCommandBufferStatusScheduled;

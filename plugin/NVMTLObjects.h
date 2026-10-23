@@ -135,6 +135,7 @@ extern id gNVMTLMainDevice;
   NSCondition *_completionCondition;
   dispatch_group_t _callbackGroup, _scheduledGroup;
   BOOL _wasScheduled, _executionDone, _completionReady, _scheduleAfterPublish;
+  BOOL _scheduledWaitReleased;   // schedule split: waitUntilScheduled returned at submission, handlers/status wait for publication
   NSMutableArray *_signals;
   NSMutableArray *_waits;
 }
