@@ -22,7 +22,8 @@ NullMoth's plugin has a hook for exactly this: with `NVMTL_NVENCVT` set in `nvrm
 its own bundle (never into WindowServer, and only if the library and its folder are owned by root and not writable by
 group or others), and VideoToolbox picks it over the other codecs by rating (1100). It is available to every app that
 uses VideoToolbox (Parsec, OBS, QuickTime and other AVFoundation apps), and to command-line tools through `nvenc-run`
-(see below). It checks the GPU first and stays off on other cards (RTX 20 / 30 / 50 keep NullMoth's encoders).
+(see below; the optional `--cli-wrappers` makes a plain `ffmpeg` use it, which ffmpeg also needs to decode from the first
+frame). It checks the GPU first and stays off on other cards (RTX 20 / 30 / 50 keep NullMoth's encoders).
 
 On the GTX 1650 (TU117) the hardware has no AV1 and no HEVC B pictures, so the overlay offers H.264 (with B pictures) and
 HEVC (P only) encoders and every decoder but AV1; VP9 from 65x65 up.
@@ -295,7 +296,8 @@ sudo ./uninstall.sh
 ```
 
 It puts the plugin, its signature and `nvrm610.conf` back exactly as they were, and removes `libnvencvt.dylib`,
-`nvenc-run`, the `--cli-aliases` lines and the `--no-decoders` setting; after `--resolution` it also puts NullMoth's
+`nvenc-run`, the `--cli-wrappers` wrappers and lines (and `/etc/zshenv` if only that line was in it), the `--cli-aliases`
+lines and the `--no-decoders` setting; after `--resolution` it also puts NullMoth's
 NVRMFB back (kernel collection rebuilt) and removes `nvfb-edid` and `/Library/NullMoth/nvfb-small` (EDID override files
 stay: NullMoth's framebuffer ignores them). Then log out and back in, or restart after `--resolution`. Updating NullMoth's driver also replaces the overlay (its installer writes the whole bundle).
 
