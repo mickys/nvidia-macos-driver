@@ -2,7 +2,7 @@
 # Install the mickys overlay on top of NullMoth's NVIDIA driver: adds the open-source encoder libnvencvt.dylib next to
 # NullMoth's Metal plugin in /Library/GPUBundles/NVMTLDriver.bundle, which loads it by itself since 2.3.7
 # (NVMTL_NVENCVT in nvrm610.conf). NullMoth's files stay as they are.
-#   sudo ./install.sh [--desktop] [--resolution] [--event-wait] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-aliases] [--no-decoders]
+#   sudo ./install.sh [--desktop] [--resolution] [--event-wait] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-wrappers] [--cli-aliases] [--no-decoders]
 #     --desktop      also replace the plugin binary with this fork's build (CPU-drawn windows uploaded by the GPU)
 #     --event-wait   apps wait for GPU work with an event instead of polling (NVRM_EVENT_WAIT=1 in nvrm610.conf): less CPU,
 #                    slightly more latency in synchronous work; WindowServer already waits this way
@@ -12,6 +12,8 @@
 # plugin or framebuffer back.
 #     --nvenc        which processes get the open-source H.264/HEVC encoder (RTX 40 only): 1 = every app (default), a
 #                    comma-separated list of process names to limit it to those, off = none
+#     --cli-wrappers also make ffmpeg, ffprobe, ffplay, HandBrakeCLI and avconvert run through nvenc-run in every zsh (scripts
+#                    and ssh commands too) and interactive bash login shells: wrappers first in PATH (/etc/zshenv, /etc/zshrc, /etc/bashrc)
 #     --cli-aliases  also make ffmpeg, HandBrakeCLI and avconvert run through nvenc-run in interactive zsh/bash shells
 #     --no-decoders  the library's hardware decoders off (encoders only): NVENCVT_NO_DEC=1 in /usr/local/etc/nvencvt.conf
 # Unless --nvenc=off, it also installs /usr/local/bin/nvenc-run, which gives command-line tools the encoder.
@@ -20,7 +22,7 @@
 # Undo: sudo ./uninstall.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-NVENC=1; ALIASES=0; ENCONLY=1; NODEC=0; RES=0; EVW=0
+NVENC=1; ALIASES=0; WRAPS=0; ENCONLY=1; NODEC=0; RES=0; EVW=0
 for a in "$@"; do case $a in
   --desktop) ENCONLY=0 ;;
   --resolution) RES=1 ;;
@@ -28,6 +30,7 @@ for a in "$@"; do case $a in
   --encoder-only) ENCONLY=1 ;;   # the default since 2.3.7-2; kept so older instructions still work
   --nvenc=*) NVENC=${a#--nvenc=} ;;
   --cli-aliases) ALIASES=1 ;;
+  --cli-wrappers) WRAPS=1 ;;
   --no-decoders) NODEC=1 ;;
   *) echo "unknown option $a"; exit 2 ;;
 esac; done
@@ -36,6 +39,7 @@ ok() { echo "   ok  $*"; }
 [ "$(id -u)" = 0 ] || die "run with sudo"
 case $NVENC in off|1) ;; *) [[ $NVENC =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] || die "--nvenc: process names separated by commas, 1 or off" ;; esac
 [ "$NVENC" != off ] || [ $ALIASES = 0 ] || die "--cli-aliases needs the encoder (not --nvenc=off)"
+[ "$NVENC" != off ] || [ $WRAPS = 0 ] || die "--cli-wrappers needs the encoder (not --nvenc=off)"
 [ "$NVENC" != off ] || [ $ENCONLY = 0 ] || [ $RES = 1 ] || [ $EVW = 1 ] || die "--nvenc=off without --desktop, --resolution or --event-wait would install nothing"
 
 OV=$(cat "$HERE/VERSION")
@@ -43,6 +47,8 @@ B=/Library/GPUBundles/NVMTLDriver.bundle; X=$B/Contents/MacOS; C=/Library/GPUBun
 CR=$B/Contents/_CodeSignature/CodeResources
 FB=/Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB; SMALL=/Library/NullMoth/nvfb-small; EDT=/usr/local/bin/nvfb-edid
 RUN=/usr/local/bin/nvenc-run; SH=/usr/local/share/mickys-overlay; VC=/usr/local/etc/nvencvt.conf; VMARK='# mickys overlay --no-decoders'; RC="/etc/zshrc /etc/bashrc"; MARK='# mickys overlay --cli-aliases'
+WRC="/etc/zshenv /etc/zshrc /etc/bashrc"; WMARK='# mickys overlay --cli-wrappers'; WBIN=/usr/local/share/mickys-overlay/bin
+WTOOLS="ffmpeg ffprobe ffplay HandBrakeCLI avconvert"
 echo "== mickys overlay $OV (for NullMoth driver $(paste -sd ' ' "$HERE/COMPATIBLE-DRIVERS"))"
 
 echo "== 1. checks"
@@ -166,9 +172,10 @@ chown root:wheel "$C.new"; chmod 644 "$C.new"; mv "$C.new" "$C"
 ok "NVMTL_NVENCVT=${NVENC/off/(not set)}$([ $EVW = 1 ] && echo ", NVRM_EVENT_WAIT=1 (--event-wait)")"
 
 echo "== 5. command-line tools"
-for f in $RC; do   # drop an earlier --cli-aliases hook; rewrite in place to keep the file's owner and mode
-  [ -f "$f" ] && grep -qF "$MARK" "$f" || continue
-  grep -vF "$MARK" "$f" > "$f.mickys" || true; cat "$f.mickys" > "$f"; rm -f "$f.mickys"
+for f in $RC $WRC; do   # drop earlier --cli-aliases / --cli-wrappers hooks; rewrite in place to keep the file's owner and mode
+  [ -f "$f" ] && grep -qF -e "$MARK" -e "$WMARK" "$f" || continue
+  grep -vF -e "$MARK" -e "$WMARK" "$f" > "$f.mickys" || true; cat "$f.mickys" > "$f"; rm -f "$f.mickys"
+  [ -s "$f" ] || [ "$f" != /etc/zshenv ] || rm -f "$f"   # macOS ships no /etc/zshenv: the overlay made it
 done
 rm -rf "$SH"
 if [ "$NVENC" = off ]; then
@@ -188,6 +195,18 @@ else
       ok "$f: ffmpeg, HandBrakeCLI, avconvert run through nvenc-run (new shells)"
     done
   fi
+  if [ $WRAPS = 1 ]; then
+    # wrappers named like the tools, first in PATH: zshenv for every zsh (scripts, ssh commands), zshrc / bashrc again after
+    # /etc/zprofile's / /etc/profile's path_helper, which moves the system's paths in front for login shells
+    install -d -o root -g wheel -m 755 "$SH" "$WBIN"
+    for t in $WTOOLS; do install -o root -g wheel -m 755 "$HERE/payload/nvenc-cli-wrap" "$WBIN/$t"; xattr -d com.apple.quarantine "$WBIN/$t" 2>/dev/null || true; done
+    for f in $WRC; do
+      [ -f "$f" ] || [ "$f" = /etc/zshenv ] || continue
+      [ -f "$f" ] || install -o root -g wheel -m 644 /dev/null "$f"
+      echo '[ ! -d /usr/local/share/mickys-overlay/bin ] || { PATH=/usr/local/share/mickys-overlay/bin:${PATH//\/usr\/local\/share\/mickys-overlay\/bin:/}; export PATH; }  '"$WMARK" >> "$f"
+    done
+    ok "$WBIN first in PATH ($WRC): $WTOOLS run through nvenc-run in new shells, scripts and ssh commands (NVENC_WRAP=0 bypasses)"
+  fi
 fi
 
 echo "== 6. decoders"
@@ -206,5 +225,5 @@ WHAT="the encoders and decoders"; [ $NODEC = 0 ] || WHAT="the encoders"
 if [ $FBCHANGED = 1 ]; then echo "Done. Restart the Mac to load the $([ $RES = 1 ] && echo "new framebuffer (then pick a size in System Settings > Displays)" || echo "NullMoth framebuffer again")."
 elif [ $ENCONLY = 1 ]; then echo "Done. Apps you open from now on get $WHAT (quit and reopen running ones)."
 else echo "Done. Log out and back in (or restart) so WindowServer and running apps load the new plugin."; fi
-[ "$NVENC" = off ] || echo "Command-line tools (ffmpeg, HandBrakeCLI, avconvert) see the encoder only through nvenc-run:   nvenc-run ffmpeg ...$([ $ALIASES = 1 ] || echo "   (sudo ./install.sh --cli-aliases does that for you in zsh/bash)")"
+[ "$NVENC" = off ] || [ $WRAPS = 1 ] || echo "Command-line tools (ffmpeg, HandBrakeCLI, avconvert) see the encoders, and the decoders from the first frame, only through nvenc-run:   nvenc-run ffmpeg ...   (sudo ./install.sh --cli-wrappers does that for you)"
 echo "Undo: sudo $HERE/uninstall.sh   (backup: $BK)"

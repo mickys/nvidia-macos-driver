@@ -1,0 +1,21 @@
+#!/bin/sh
+# nvenc-cli-wrap (mickys overlay, install.sh --cli-wrappers): installed as ffmpeg, ffprobe, ffplay, HandBrakeCLI and avconvert
+# in /usr/local/share/mickys-overlay/bin, which /etc/zshenv, /etc/zshrc and /etc/bashrc put first in PATH. Each runs the real
+# tool of its name (the next one in PATH) through nvenc-run, so scripts and `ssh mac ffmpeg ...` get the NVENC encoders and the
+# NVDEC decoders too, registered before the tool's first VideoToolbox session. Without that, ffmpeg's first decoder session
+# finds none of ours (the Metal plugin registers them while VideoToolbox is already looking) and the frames up to the next key
+# frame are lost. NVENC_WRAP=0 runs the real tool directly. A tool not in PATH is looked for where installers put it
+# (/usr/local/bin, /opt/homebrew/bin, /opt/local/bin): non-interactive shells (ssh commands, sudo) often lack those in PATH.
+me=${0##*/}
+here=$(cd "${0%/*}" 2>/dev/null && pwd -P)
+real=
+IFS=:
+for d in $PATH /usr/local/bin /opt/homebrew/bin /opt/local/bin; do
+  [ -n "$d" ] || d=.
+  [ "$(cd "$d" 2>/dev/null && pwd -P)" = "$here" ] && continue
+  if [ -f "$d/$me" ] && [ -x "$d/$me" ]; then real=$d/$me; break; fi
+done
+unset IFS
+[ -n "$real" ] || { echo "$me: not found in PATH, /usr/local/bin, /opt/homebrew/bin or /opt/local/bin (the mickys overlay's wrapper in $here only forwards to it)" >&2; exit 127; }
+if [ "${NVENC_WRAP-1}" = 0 ] || [ ! -x /usr/local/bin/nvenc-run ]; then exec "$real" "$@"; fi
+exec /usr/local/bin/nvenc-run "$real" "$@"
