@@ -74,22 +74,15 @@ On by default, because they made capture faster or correct and added no stalls:
   shader that reads the colour attachment (framebuffer fetch, a separate set) voided that list, so every draw of such a
   pipeline wrote all ~180 descriptors, almost all placeholders: WindowServer wrote 2.2 million descriptors a second while a
   window animated. That set is now left out like the texture heap: about 6 writes per draw, 35 thousand a second.
-- **CPU-drawn windows uploaded without waiting** (`NVMTL_SURFIN_PAGE_CACHE`, `NVMTL_SURFIN_ASYNC`, `NVMTL_SURFIN_ORDERED`,
-  since 2.5.3-mickys.4). A window drawn on the CPU (Safari and WebKit, most AppKit apps) is copied to video memory by the
-  GPU straight from the surface's own pages. The pages were imported (wired and mapped by the kernel: ~8100 pages for a 4K
-  window) and released for every upload, and WindowServer waited for each copy. The import is now kept per surface (up to
-  64 surfaces, at most 512 MB wired, released 2 s after their last upload) and the copy is not waited for: the GPU runs it
-  before the command buffer that draws the window, and the plugin finishes it before the window's texture is read back,
-  uploaded again or freed. The copy now also waits for earlier GPU reads of the texture (`NVMTL_SURFIN_ORDERED`).
+- **Uploads of CPU-drawn windows ordered after earlier reads** (`NVMTL_SURFIN_ORDERED`, since 2.5.3-mickys.4). A window drawn
+  on the CPU (Safari and WebKit, most AppKit apps) is copied to video memory by the GPU; that copy now waits for earlier GPU
+  reads of the window's texture instead of starting from the top of the pipe. It costs nothing measurable.
 
-| RTX 4090, full-screen Safari animation (drawn on the CPU), 2.5.3-mickys.3 / this release | 1080p 165 Hz | 4K HiDPI 60 Hz |
+| RTX 4090, 2.5.3-mickys.3 / this release (same morning; frames in order in both) | 1080p 165 Hz | 4K HiDPI 60 Hz |
 |---|---|---|
-| local display, screen updates/s | 67-68 / **131-135** | 48.5-50 / **60** (the refresh rate) |
-| WindowServer CPU (user + system, of one core) | 46+28 % / 66-67+13 % | 34+28 % / 43+7 % |
-| Parsec, fps sent (frames in order in both) | 29.2 / **46.7-46.9** | 15.1-16.1 / 16.8-17.6 |
-
-A full-screen Metal app is level (153-162 / 155-165 fps without capture; through Parsec 63.7-64.8 / 65.9-68.7 fps). Every
-recorded frame of eight screen recordings was decoded: none out of order, garbled or torn.
+| full-screen Safari animation (drawn on the CPU), local display, screen updates/s | 67-68 / **72.8-74.0** | 48.5-50 / **57.7-58.0** |
+| the same through Parsec, fps sent | 29.2 / **33.5-33.7** | 15.1-16.1 / 15.4-15.8 |
+| full-screen Metal app, local / through Parsec, fps | 153-162 / 157-165; 63.7-64.8 / **67.0-69.6** | |
 
 - **Captured frames in order** (`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=3`). WindowServer draws each captured frame into a
   two-plane (NV12) surface, which the plugin writes through a private image and copies out when the GPU has finished. The
@@ -131,8 +124,7 @@ Off by default (put the line into `nvrm610.conf`, then log out and in):
 |---|---|---|
 | `NVMTL_GPU_COPYOUT=0` | turns the GPU copy-out of captured frames off | (on by default) |
 | `NVMTL_DESC_MASK=0` | descriptor sets of framebuffer-fetch pipelines written in full again | (on by default) |
-| `NVMTL_SURFIN_ASYNC=0` | WindowServer waits for each CPU-drawn window's upload again | (on by default) |
-| `NVMTL_SURFIN_PAGE_CACHE=0` | a CPU-drawn window's pages are imported and released for every upload again (also turns `NVMTL_SURFIN_ASYNC` off) | (on by default) |
+| `NVMTL_SURFIN_PAGE_CACHE=1` | a CPU-drawn window's pages stay imported between uploads (up to 64 windows, 512 MB wired, released 2 s after their last upload) and WindowServer no longer waits for the upload (`NVMTL_SURFIN_ASYNC=0` keeps the wait): RTX 4090, full-screen Safari animation 1080p 165 Hz 73-74 -> **131-135** screen updates/s, 4K 58 -> 60 at half the system CPU, Parsec 1080p up to ~47 fps (diagnostic build, another session) | **WindowServer stalls ~1 s now and then** (6 of 14 thirty-second Parsec runs of a full-screen Metal app had one, 0 of 12 without it) |
 | `NVMTL_SURFIN_ORDERED=0` | the upload no longer waits for earlier GPU reads of the window's texture | (on by default) |
 | `NVMTL_SURFIN_READER_SKIP=0` | turns the capture-frame upload skip off | (on by default) |
 | `NVMTL_PLANE_SEED=0` | turns the plane seed off | (on by default) |
