@@ -6402,9 +6402,24 @@ static uint64_t nvmtl_sic_idle_ns(void)
     }
     return v;
 }
+// NVMTL_SURFIN_DEFER_FREE (on by default, =0 off; diagnostic builds: /tmp/nvmtl-surfin-deferfree-off): an entry the cache
+// lets go of (least recently used, over budget, idle) is freed by the 500 ms timer, not by the upload that made room. Freeing
+// it (the page import, then the surface reference: both kernel calls) took ~2 ms on WindowServer's main thread per eviction,
+// 4.6 % of it while the screen was recorded (RTX 4090, Safari animating full screen). The upload also no longer scans for idle
+// entries: the timer's sweep frees them. Entries waiting to be freed keep their pages wired until then (at most NVMTL_SIC_N).
+int nvmtl_surfin_deferfree_on(void) { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_DEFER_FREE", 1, "/tmp/nvmtl-surfin-deferfree-off", &e, &n, &o); }
+typedef struct { nvk_buffer buf; const void *surf; } nvmtl_sic_gone;
+static nvmtl_sic_gone g_sic_gone[NVMTL_SIC_N];
+static unsigned g_sic_ngone;
+static _Atomic unsigned long long g_sic_deferred_frees;
 // frees one entry (its page import, then our reference to its surface), timing each half
 static void nvmtl_sic_drop(nvmtl_sic *e)   /* g_sic_mx held */
 {
+    if (nvmtl_surfin_deferfree_on() && g_sic_ngone < NVMTL_SIC_N) {   // the timer frees it (nvmtl_sic_free_gone)
+        g_sic_gone[g_sic_ngone++] = (nvmtl_sic_gone){ e->buf, e->surf };
+        memset(e, 0, sizeof *e); g_sicp.drops++; g_sic_deferred_frees++;
+        return;
+    }
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     nvmtl_vk_buffer_destroy(&e->buf);
     const uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -6423,7 +6438,7 @@ static int nvmtl_sic_get(const void *surf, void *base, size_t bytes)   /* g_sic_
     for (int i = 0; i < NVMTL_SIC_N; i++) {
         nvmtl_sic *e = &g_sic[i];
         if (e->surf == surf && e->base == base && e->bytes == bytes && e->buf.buf) { e->used_ns = now; g_sic_hit++; g_sicp.hit = 1; return i; }
-        if (e->surf && !e->pins && now - e->used_ns > idle) { nvmtl_sic_drop(e); g_sicp.idle++; }
+        if (!nvmtl_surfin_deferfree_on() && e->surf && !e->pins && now - e->used_ns > idle) { nvmtl_sic_drop(e); g_sicp.idle++; }   // deferred: the timer's sweep
         if (slot < 0 && !e->surf) slot = i;
         if (e->surf && !e->pins && (old < 0 || e->used_ns < g_sic[old].used_ns)) old = i;
     }
@@ -6488,10 +6503,10 @@ void nvmtl_surfin_stat(int host, uint64_t ns)
     snprintf(path, sizeof path, "%s/nvmtl-surfstat-%d.log", (td && *td) ? td : "/private/tmp", (int)getpid());
     FILE *f = fopen(path, "a"); if (!f) return;
     fprintf(f, "  shared VRAM surface-in: %llu copies, %.2f ms, host %llu cpu %llu, imports %llu, cache hits %llu, deferred %llu, full %llu,"
-               " cache %d ordered %d async %d mask %d icmax %ld | vram import cache: %llu imports %llu hits %llu stale %llu over-cap"
+               " cache %d ordered %d async %d mask %d icmax %ld deferfree %d (%llu deferred frees) | vram import cache: %llu imports %llu hits %llu stale %llu over-cap"
                " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies | ic misses by size:%s | slow %llu max %.1f ms\n",
             n, t / 1e6, h, c, (unsigned long long)g_sic_made, (unsigned long long)g_sic_hit, (unsigned long long)g_ss_defer, (unsigned long long)g_sic_full,
-            nvmtl_surfin_cache_on(), nvmtl_surfin_barrier_on(), nvmtl_surfin_async_on(), nvmtl_desc_mask_on(), nvmtl_ic_max_mb_override(),
+            nvmtl_surfin_cache_on(), nvmtl_surfin_barrier_on(), nvmtl_surfin_async_on(), nvmtl_desc_mask_on(), nvmtl_ic_max_mb_override(), nvmtl_surfin_deferfree_on(), (unsigned long long)g_sic_deferred_frees,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], miss, (unsigned long long)atomic_exchange(&g_ss_slow, 0), atomic_exchange(&g_ss_slow_max_ns, 0) / 1e6);
     fclose(f);
 }
@@ -6908,12 +6923,20 @@ static void nvmtl_surfin_reap(void)
 static void nvmtl_sic_sweep(void)
 {
     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), idle = nvmtl_sic_idle_ns();
+    nvmtl_sic_gone gone[NVMTL_SIC_N]; unsigned ng = 0;
     pthread_mutex_lock(&g_sic_mx);
     for (int i = 0; i < NVMTL_SIC_N; i++)
         if (g_sic[i].surf && !g_sic[i].pins && now - g_sic[i].used_ns > idle) nvmtl_sic_drop(&g_sic[i]);
+    // the entries let go of since the last tick, freed here without the lock
+    ng = g_sic_ngone; memcpy(gone, g_sic_gone, ng * sizeof gone[0]); g_sic_ngone = 0;
     pthread_mutex_unlock(&g_sic_mx);
+    for (unsigned k = 0; k < ng; k++) { nvmtl_vk_buffer_destroy(&gone[k].buf); CFRelease((CFTypeRef)gone[k].surf); }
 }
 // Every 500 ms, off the caller's thread: finish signalled deferred uploads, free idle cache entries.
+// The source is kept in a static: the plugin is one Objective-C translation unit built with ARC, so a dispatch source held
+// only by a local was released when this block returned and the timer never fired (2.5.3-mickys.5 and .6 had no timer: the
+// uploads themselves still reaped, idle entries stayed until the next upload).
+static dispatch_source_t g_surfin_timer;
 static void nvmtl_surfin_tick_start(void)
 {
     static dispatch_once_t once;
@@ -6921,7 +6944,9 @@ static void nvmtl_surfin_tick_start(void)
         dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
         if (!t) return;
         dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), 500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
-        dispatch_source_set_event_handler(t, ^{ if (g_state == 1) { nvmtl_surfin_reap(); nvmtl_sic_sweep(); } });
+        dispatch_source_set_event_handler(t, ^{ if (g_state == 1) { nvmtl_surfin_reap(); nvmtl_sic_sweep();
+            static unsigned ticks; if (++ticks <= 2 || ticks % 1200 == 0) nvlog("surface-in timer: tick %u (reap + page-cache sweep)", ticks); } });
+        g_surfin_timer = t;
         dispatch_resume(t);
     });
 }
