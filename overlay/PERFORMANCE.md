@@ -26,10 +26,12 @@ same client session, back to back, at least twice.
 | HEVC decode, 1080p / 4K | 833 / 305 fps | 933 / 310 fps | 2.4.3-mickys.1 |
 | VP9 / AV1 decode, 4K | none / none | 306 / 295 fps | 2.4.3-mickys.1 |
 | Screen recording with Screen Sharing connected, 1080p 165 Hz: app fps, frames out of order per 20 s | 81-93 fps, 142-183 out of order (NullMoth 2.5.2) | **129-154 fps, 0 out of order** | 2.5.3-mickys.3 |
-| Parsec, 1080p 165 Hz, frames in order | not measured with NullMoth's plugin (without the overlay there is no hardware encoder on Ada) | 62-65 fps (8-bit); 63-65 fps (10-bit, measured with 2.5.3-mickys.2) | 2.5.3-mickys.3 |
-| Parsec, 4K HiDPI 60 Hz, frames in order | not measured | 38-41 fps (8-bit); 37 fps (10-bit, measured with 2.5.3-mickys.2) | 2.5.3-mickys.3 |
+| Parsec, 1080p 165 Hz, 8-bit (fps sent; frames out of order per 30 s) | **4.1-7.6 fps**, software encoding, 126-199 ms per frame (no hardware encoder on Ada); with the overlay's encoder but NullMoth's plugin: 48.9-50.3 fps, **342-353 out of order** | **55.8-61.2 fps, 0-1 out of order** (62-65 in other sessions); 10-bit 63-65 (measured with 2.5.3-mickys.2) | 2.5.3-mickys.3 |
+| Parsec, 4K HiDPI 60 Hz, 8-bit | **2.8 fps** or none, software encoding (332 ms per frame); with the overlay's encoder but NullMoth's plugin: 30.6-31.2 fps, 70-98 out of order | **37.3-41.1 fps, 0 out of order**; 10-bit 37 (measured with 2.5.3-mickys.2) | 2.5.3-mickys.3 |
 | Desktop without capture (window animation, 144 Hz full-screen app) | 79.2-79.5 transactions/s; 118-128 fps | level: 79.1-80.5; 117-131 fps | 2.5.2-mickys.1 |
 | Display modes (1080p 165 Hz dummy plug) | 119 modes, all 60 Hz (NullMoth 2.5.2) | 164 modes, up to 165 Hz | 2.4.3-mickys.5 |
+
+The Parsec rows were measured in one sitting (2026-10-23, NullMoth 2.5.3, macOS 26.7.1, a full-screen Metal animation, the same client, 2 x 30 s per setup): NullMoth's driver alone, NullMoth's driver with only the overlay's encoder (`install.sh` without `--desktop`), and the full overlay (`--desktop`). The frame-order check runs in the overlay's encoder, so the stock row has fps only.
 
 The GPU upload of CPU-drawn windows (a full-screen 4K Safari window: 21 -> 34 screen updates per second, 2.3.7-mickys.2)
 started in this fork and has been part of NullMoth's driver since 2.5.1, so it no longer shows against stock.

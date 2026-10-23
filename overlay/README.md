@@ -131,7 +131,9 @@ Against NullMoth's driver on its own (details, release by release and per card: 
 - **RTX 4090:** hardware encoding for every VideoToolbox app (NullMoth has no encoder for Ada); H.264 decode 666 / 190 fps
   at 1080p / 4K against 160 / 38, VP9 and AV1 decode (none in NullMoth's); a screen recording with Screen Sharing
   connected at 1080p 165 Hz 129-154 fps with every frame in order against 81-93 fps with 142-183 frames out of order per
-  20 s; Parsec with frames in order 62-65 fps at 1080p 165 Hz and 38-41 at 4K (8-bit); the desktop without capture level.
+  20 s; Parsec (1080p 165 Hz, 8-bit) 56-65 fps with frames in order, against 4-8 fps with NullMoth's driver alone (software
+  encoding) and 49-50 fps with 342-353 frames out of order per 30 s with only the overlay's encoder; at 4K 37-41 fps
+  against 3 / 31; the desktop without capture level.
 - **GTX 1650:** hardware encoding (NullMoth's encoders do not register on TU117); H.264 decode 447 / 121 fps against
   154 / 36, VP9 decode; Parsec 60-62 against 50 fps at 1080p (NullMoth 2.5.0).
 
