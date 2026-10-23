@@ -6315,10 +6315,13 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
 // The caller holds the surface lock across the call, and the import is released before it returns.
 // Non-zero when the pages cannot be imported (block-compressed format, base or length not a multiple of the import
 // alignment, no host import on this device); the caller then uses nvmtl_vk_image_write.
-// Capture-cost changes to the GPU upload of CPU-drawn windows (#296) and to descriptor sets, on by default since
-// 2.5.3-mickys.4 (each `<NAME>=0` in nvrm610.conf turns it off; diagnostic builds: a /tmp/nvmtl-<x>-off file turns it off
-// live, checked every 250 ms; release builds ignore /tmp/nvmtl-* files). RTX 4090, Safari animating full screen, the
-// published 2.5.3-mickys.3 vs all of them: 1080p 165 Hz 67 -> 120-125 screen updates/s, Parsec 29 -> 47 fps; 4K 48-50 -> 60.
+// Capture-cost changes to the GPU upload of CPU-drawn windows (#296) and to descriptor sets (2.5.3-mickys.4). On by default:
+// NVMTL_DESC_MASK, NVMTL_SURFIN_ORDERED (`=0` off; diagnostic builds: /tmp/nvmtl-<x>-off turns one off live). Off by default:
+// NVMTL_SURFIN_PAGE_CACHE (and with it NVMTL_SURFIN_ASYNC), `=1` on (diagnostic builds: /tmp/nvmtl-surfin-cache turns it on
+// live): with it, WindowServer stalled ~1 s now and then (an upload of ~1000 ms, about one per minute with Parsec streaming a
+// full-screen Metal app), most likely the pages it keeps wired meeting an unmap of the surface. Release builds ignore
+// /tmp/nvmtl-* files. RTX 4090, Safari animating full screen, the published 2.5.3-mickys.3 vs all of them on: 1080p 165 Hz 67
+// -> 131-135 screen updates/s, Parsec 29 -> 47 fps; 4K 48-50 -> 60.
 //   NVMTL_SURFIN_PAGE_CACHE  keep each surface's page import between uploads instead of importing and releasing its pages
 //                            for every upload (the kernel wires and maps ~8100 pages per 4K upload, then undoes it)
 //   NVMTL_SURFIN_ASYNC       with the page cache: submit the upload without waiting for it (queue order + the barrier order it
@@ -6334,15 +6337,16 @@ static int nvmtl_vk_tmpsw(const char *path, uint64_t *next, int *on)
     if (now >= *next) { *next = now + 250000000ull; *on = access(path, F_OK) == 0; }
     return *on;
 }
-static int nvmtl_capsw(const char *name, const char *off, int *env, uint64_t *next, int *tmpoff)
+// def: the default; a diagnostic file `flip` turns a default-on switch off, a default-off one on
+static int nvmtl_capsw(const char *name, int def, const char *flip, int *env, uint64_t *next, int *tmp)
 {
-    if (*env < 0) { const char *e = getenv(name); *env = !(e && e[0] == '0'); nvlog("%s %s (%s=%s)", name, *env ? "on" : "off", name, e ? e : "unset"); }
-    return *env && !nvmtl_vk_tmpsw(off, next, tmpoff);
+    if (*env < 0) { const char *e = getenv(name); *env = e && *e ? e[0] != '0' : def; nvlog("%s %s (%s=%s)", name, *env ? "on" : "off", name, e ? e : "unset"); }
+    return def ? (*env && !nvmtl_vk_tmpsw(flip, next, tmp)) : (*env || nvmtl_vk_tmpsw(flip, next, tmp));
 }
-int nvmtl_surfin_cache_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_PAGE_CACHE", "/tmp/nvmtl-surfin-cache-off", &e, &n, &o); }
-int nvmtl_surfin_barrier_on(void) { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ORDERED", "/tmp/nvmtl-surfin-barrier-off", &e, &n, &o); }
-int nvmtl_surfin_async_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ASYNC", "/tmp/nvmtl-surfin-async-off", &e, &n, &o); }
-int nvmtl_desc_mask_on(void)      { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_DESC_MASK", "/tmp/nvmtl-desc-mask-off", &e, &n, &o); }
+int nvmtl_surfin_cache_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_PAGE_CACHE", 0, "/tmp/nvmtl-surfin-cache", &e, &n, &o); }
+int nvmtl_surfin_barrier_on(void) { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ORDERED", 1, "/tmp/nvmtl-surfin-barrier-off", &e, &n, &o); }
+int nvmtl_surfin_async_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ASYNC", 1, "/tmp/nvmtl-surfin-async-off", &e, &n, &o); }
+int nvmtl_desc_mask_on(void)      { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_DESC_MASK", 1, "/tmp/nvmtl-desc-mask-off", &e, &n, &o); }
 // diagnostic builds: /tmp/nvmtl-ic-max-mb (a number) overrides the VRAM import cache's per-surface cap
 long nvmtl_ic_max_mb_override(void)
 {
