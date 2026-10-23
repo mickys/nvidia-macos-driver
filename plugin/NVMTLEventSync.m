@@ -191,13 +191,14 @@ static BOOL nvmtl_ws_publish_settled(NSArray *settled, NVMTLCommandBuffer *cb) {
 // (nvmtl_surface_register_writes): a record stamped before the move matched nothing, every frame's read of the surface
 // still in flight took the CPU path (page-off, wait, 8 MB upload) on the compositor's thread, and a 144 Hz desktop ran
 // at 90 frames a second.
-// GPU copy-out (NVMTL_GPU_COPYOUT=1; diagnostic builds also /tmp/nvmtl-gpu-copyout): planes of two-plane IOSurfaces drawn
+// GPU copy-out (on by default, NVMTL_GPU_COPYOUT=0 off; diagnostic builds: /tmp/nvmtl-gpu-copyout also turns it on): planes of two-plane IOSurfaces drawn
 // through private images (WindowServer's NV12 capture surfaces) go into the surface's pages on the GPU at the end of this
 // command buffer, and that part becomes a writer of the surface, so its publication waits for the copy. Their publication
 // then skips the readback + CPU copy, and with the frame-order fix (scheduled after publication) WindowServer's wait at
 // the capture commit shrinks to the GPU's own time.
 static int nvmtl_gpu_copyout_on(void) {
-    static int env = -1; if (env < 0) { const char *e = getenv("NVMTL_GPU_COPYOUT"); env = e && e[0] == '1'; nvlog("GPU copy-out %s (NVMTL_GPU_COPYOUT=%s)", env ? "on" : "off", e ?: "unset"); }
+    static int env = -1; if (env < 0) { const char *e = getenv("NVMTL_GPU_COPYOUT"); env = !(e && e[0] == '0');   // on by default (RTX 4090 Parsec 1080p165 8-bit 58 -> 64-65 fps, frames in order); =0 off
+        nvlog("GPU copy-out %s (NVMTL_GPU_COPYOUT=%s)", env ? "on" : "off", e ?: "unset"); }
     static uint64_t next; static int tmp;
     return env || nvmtl_tmp_switch("/tmp/nvmtl-gpu-copyout", &next, &tmp);
 }
