@@ -199,7 +199,9 @@ everything up to the next key frame is missing (since mickys/nvenc 0.9.5 those f
 earlier versions showed one grey picture for them). For AV1 (no Apple decoder on Intel Macs) that is the first GOP, often
 several seconds; for H.264 / HEVC the first session gets NullMoth's or Apple's decoder instead. Through `nvenc-run` (or
 `--cli-wrappers`) our decoders are registered before the first session: a 300-frame 4K AV1 clip comes out bit-exact against
-libdav1d on every frame. Apps are not affected: they start the GPU before they decode.
+libdav1d on every frame. Apps are not affected: they start the GPU before they decode. Since mickys/nvenc 0.9.5 (2.5.3-mickys.6) the decoders also hand
+ffmpeg their own buffers instead of VideoToolbox copying every frame: 4K AV1 40 -> 125 fps, HEVC 35 -> 115, VP9 39 -> 158 on an
+RTX 4090.
 Nothing else is loaded into other programs: the overlay never sets `DYLD_INSERT_LIBRARIES` globally.
 
 Why a wrapper: macOS has no way for a third party to register a video encoder for every process. VideoToolbox only
