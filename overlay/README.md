@@ -137,6 +137,7 @@ Off by default (put the line into `nvrm610.conf`, then log out and in):
 | `NVMTL_DESC_MASK=0` | descriptor sets of framebuffer-fetch pipelines written in full again | (on by default) |
 | `NVMTL_SURFIN_PAGE_CACHE=0` | a CPU-drawn window's pages are imported and released for every upload again, and WindowServer waits for each upload (also turns `NVMTL_SURFIN_ASYNC` off) | (on by default) |
 | `NVMTL_SURFIN_ASYNC=0` | keeps the page cache, but WindowServer waits for each upload again | (on by default) |
+| `NVMTL_SURFIN_DEFER_FREE=0` | page-cache entries let go of are freed by the upload that made room (on WindowServer's main thread) again, not by the 500 ms timer | (on by default) |
 | `NVMTL_SURFIN_ORDERED=0` | the upload no longer waits for earlier GPU reads of the window's texture | (on by default) |
 | `NVMTL_SURFIN_READER_SKIP=0` | turns the capture-frame upload skip off | (on by default) |
 | `NVMTL_PLANE_SEED=0` | turns the plane seed off | (on by default) |
