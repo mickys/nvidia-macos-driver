@@ -1,9 +1,8 @@
 # Plugin changes in mickys/nvidia-macos-driver that may be worth taking upstream
 
 Nine changes to `plugin/` (NVMTLDriver) carried in the fork's `dev` branch on top of v2.5.3, plus one framebuffer feature.
-Each is behind its own switch, so it can be compared with the stock behaviour in the same build. Commits are on
-[github.com/mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) `dev`; per-group branches based on
-v2.5.3 can be provided.
+Each is behind its own switch, so it can be compared with the stock behaviour in the same build. Each group is also on its
+own branch based on v2.5.3 (see **Branches**), ready to merge or to open as a pull request.
 
 ## Background
 
@@ -21,6 +20,44 @@ v2.5.3 can be provided.
   macOS screen recording with Screen Sharing connected (every recorded frame's counter decoded). Every comparison was run in
   the same boot or client session, at least twice. Absolute numbers on other machines will differ; the differences are the
   point.
+
+## Branches
+
+Branches of [github.com/mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver), based on v2.5.3 (75e2e28) or on
+the branch an item needs. Each holds only its items: switches read with `getenv` and on by default, no diagnostic files or
+statistics, nothing from the fork's other experiments. Each builds on its own (release build, macOS 15.0 minimum), and all
+leaves merge together without conflicts.
+
+```
+v2.5.3
+├── upstream/fixes            items 1-3
+│   └── upstream/page-cache   item 9 (needs 2 and 3)
+├── upstream/capture-order    items 4-5
+├── upstream/plane-seed       item 6
+│   ├── upstream/reader-skip  item 7 (needs 6)
+│   └── upstream/import-cache item 8 (needs 6)
+└── upstream/nvrmfb-modes     NVRMFB (outside the plugin)
+```
+
+| Branch | Based on | Items | Commits |
+|---|---|---|---|
+| [`upstream/fixes`](https://github.com/mickys/nvidia-macos-driver/compare/v2.5.3...upstream/fixes) | v2.5.3 | 1, 2, 3 | 18c9cdd, 3901503, 21ab072 |
+| [`upstream/page-cache`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/fixes...upstream/page-cache) | `upstream/fixes` | 9 | aed2036 |
+| [`upstream/capture-order`](https://github.com/mickys/nvidia-macos-driver/compare/v2.5.3...upstream/capture-order) | v2.5.3 | 4, 5 | c77ee56, bfaaf26 |
+| [`upstream/plane-seed`](https://github.com/mickys/nvidia-macos-driver/compare/v2.5.3...upstream/plane-seed) | v2.5.3 | 6 | 0c98c3e |
+| [`upstream/reader-skip`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/plane-seed...upstream/reader-skip) | `upstream/plane-seed` | 7 | 1e7d414 |
+| [`upstream/import-cache`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/plane-seed...upstream/import-cache) | `upstream/plane-seed` | 8 | 6d20e60 |
+| [`upstream/nvrmfb-modes`](https://github.com/mickys/nvidia-macos-driver/compare/v2.5.3...upstream/nvrmfb-modes) | v2.5.3 | NVRMFB | 9c023cd |
+| [`upstream/all`](https://github.com/mickys/nvidia-macos-driver/compare/v2.5.3...upstream/all) | v2.5.3 | every leaf merged (a test integration, not for merging) | 8a2e674 |
+
+`upstream/all`, installed on the test machine (RTX 4090, macOS 26.7.1), passed the fork's release checks: NV12 round trips at
+1080p and 4K (0 mismatches), CPU-drawn surface uploads at four sizes on the GPU and CPU paths (8 of 8 runs, 0 wrong), and a
+15 s screen recording with macOS Screen Sharing connected (923 frames, app 122-138 fps, 0 frames out of order, 0 swap timeouts),
+the same as the fork's released plugin.
+
+Differences from the fork's `dev` code: the deferred upload of item 9 keeps only the parts of PR #96's design it needs (the
+pending list and the image's upload guard, no staging-buffer path); item 8 uses the existing `nvmtl_vk_vram_bytes()`; the
+multi-plane VRAM sharing hooks (an experiment not offered here) are left out of items 5 and 7.
 
 ## Performance at a glance
 
@@ -65,7 +102,7 @@ v2.5.3 can be provided.
 - **Performance:** Safari animation, local display 1080p 165 Hz 67.6-69.2 -> 73.7-74.0 screen updates/s; Parsec 1080p
   27.9 -> 29.5-29.7 fps; descriptor writes 2.2 million/s -> 35,000/s. No differences in screenshots or in frame-by-frame checks of a screen recording.
 - **Required by:** none.
-- **Commits:** d712925 (the mask), e3ce433 (default on).
+- **Commits:** branch `upstream/fixes` (18c9cdd; on dev d712925, e3ce433).
 
 ### 2. Witness lap check
 
@@ -80,7 +117,7 @@ v2.5.3 can be provided.
 - **Performance:** no change on its own. With item 9 it was the cause of occasional ~1 s WindowServer stalls (single uploads
   of ~1000 ms in 6 of 14 Parsec runs of a full-screen Metal app; 0 of 12 with item 9 off) and of WindowServer dropping to ~12 fps after many sessions.
 - **Required by:** item 9.
-- **Commits:** the `nvmtl_keep_verdict` part of 5536b1e (the rest of that commit belongs to item 9).
+- **Commits:** branch `upstream/fixes` (3901503; on dev part of 5536b1e).
 
 ### 3. Ordered upload (`NVMTL_SURFIN_ORDERED`)
 
@@ -92,7 +129,7 @@ v2.5.3 can be provided.
 - **Performance:** no cost (3.92 vs 3.98 ms per upload). The tear was not provoked in testing; the fix follows from the
   barrier semantics.
 - **Required by:** item 9 (its deferred uploads move further from the reads they must follow).
-- **Commits:** the barrier part of 6d1812e (the rest belongs to item 9), default on in e3ce433.
+- **Commits:** branch `upstream/fixes` (21ab072; on dev part of 6d1812e, e3ce433).
 
 ## Group B: capture order (items 4-5)
 
@@ -111,7 +148,7 @@ v2.5.3 can be provided.
   Parsec 342-353 out of order per 30 s -> 0-1. While capturing it costs throughput: Parsec ~70 -> 62-65 fps (item 5 wins
   most of it back).
 - **Required by:** item 5 (for its frames-in-order results).
-- **Commits:** aea3bd0, cf64a20.
+- **Commits:** branch `upstream/capture-order` (c77ee56; on dev aea3bd0, cf64a20).
 
 ### 5. GPU copy-out (`NVMTL_GPU_COPYOUT`)
 
@@ -123,7 +160,7 @@ v2.5.3 can be provided.
 - **Performance:** Parsec 1080p 8-bit 58 -> 62-65 fps, 4K 31 -> 38-41; screen recording with Screen Sharing 98-108 ->
   129-154 fps; frames in order with item 4.
 - **Required by:** none.
-- **Commits:** 10b56c2, 15e02de (default on). Uses the one-private-image-per-IOSurface path.
+- **Commits:** branch `upstream/capture-order` (bfaaf26; on dev 10b56c2, 15e02de). Uses the one-private-image-per-IOSurface path.
 
 ## Group C: plane seed (item 6)
 
@@ -138,8 +175,8 @@ v2.5.3 can be provided.
   change (on by default since its 2.4.3 builds).
 - **Performance:** measured together with item 8 and a texture pool on a GTX 1650 with NullMoth 2.4.3: Parsec 1080p 144 Hz
   46-47 -> 71-72 fps, no tearing. Not measured alone.
-- **Required by:** item 7.
-- **Commits:** 59d118f.
+- **Required by:** items 7 and 8.
+- **Commits:** branch `upstream/plane-seed` (0c98c3e; on dev 59d118f).
 
 ## Group D: the rest (items 7-9)
 
@@ -153,7 +190,7 @@ v2.5.3 can be provided.
 - **Why should merge:** removes one full upload per captured frame.
 - **Performance:** Parsec 4K 10-bit 30 -> 37 fps, 1080p 10-bit 55 -> 63-65, 1080p 8-bit 54 -> 56-57; late frames gone.
 - **Required by:** none.
-- **Commits:** 34c65a7, e012b57, cc2c2b1. Needs item 6. The rule "exactly one bump means a read-only lock" is an inference
+- **Commits:** branch `upstream/reader-skip` (1e7d414; on dev 34c65a7, e012b57, cc2c2b1). Needs item 6. The rule "exactly one bump means a read-only lock" is an inference
   about reader behaviour; it held in every test, but deserves your review.
 
 ### 8. VRAM import cache (`NVMTL_SURF_IMPORT_CACHE`, size cap by VRAM, 128 entries)
@@ -168,8 +205,10 @@ v2.5.3 can be provided.
 - **Performance:** screen recording 1080p 165 Hz 103-123 -> 138-157 fps, 0 stalls. Without a cap, a GTX 1650 stalled at 4K
   HiDPI (up to 67 stalls per 15 s), hence the cap.
 - **Required by:** none.
-- **Commits:** 443b1ce, b280be5, 7876e00, 284bb99 (cap by VRAM), 18bf0cc (128 entries). The cap and idle time were tuned on
-  one machine.
+- **Needs:** item 6. Alone (GTX 1650, NullMoth 2.5.0) it made screen recording worse: 54-59 fps with 26 / 18 swap timeouts;
+  with the plane seed 157-161 fps with 1 / 0.
+- **Commits:** branch `upstream/import-cache` (6d20e60; on dev 443b1ce, b280be5, 7876e00, 284bb99, 18bf0cc). The cap and idle time
+  were tuned on one machine.
 
 ### 9. Page cache + async upload (`NVMTL_SURFIN_PAGE_CACHE`, `NVMTL_SURFIN_ASYNC`)
 
@@ -184,8 +223,8 @@ v2.5.3 can be provided.
   rate) with WindowServer system CPU 28 % -> 7 %; Parsec 1080p 34 -> 37 fps, 4K 15.6 -> 17.3; a full-screen Metal app
   unchanged; with item 2, no stall and no lost witness in 6 Parsec soak rounds plus 10 Parsec runs of a Metal app.
 - **Required by:** none.
-- **Commits:** 6d1812e (cache), 05ac4bb (async), 284bb99 (64 entries / 512 MB), 5536b1e (collection and timer), e3ce433 /
-  49091b2 (defaults). Needs items 2 and 3. The newest change (2026-10-23), so far tested on the RTX 4090 only.
+- **Commits:** branch `upstream/page-cache` (aed2036, based on `upstream/fixes`; on dev 6d1812e, 05ac4bb, 284bb99, 5536b1e, e3ce433,
+  49091b2). Needs items 2 and 3. The newest change (2026-10-23), so far tested on the RTX 4090 only.
 
 ---
 
@@ -202,5 +241,5 @@ v2.5.3 can be provided.
 - **Performance:** on a 1080p 165 Hz dummy plug, 119 modes, all at 60 Hz -> 164 modes up to 165 Hz (NullMoth 2.5.2's scaled
   and HiDPI modes included); every distinct mode was switched to and checked. GTX 1650: 1080p up to 240 Hz with an override.
 - **Required by:** none.
-- **Commits:** fork branch `feature/change-resolution-2.4.3` (3 commits), built against the 615.78.08 headers; the same build
-  script reproduces NullMoth's own 2.5.2 NVRMFB byte for byte.
+- **Commits:** branch `upstream/nvrmfb-modes` (9c023cd; first written as fork commits 4f5345e, 798b93f, dacec61), built against the
+  615.78.08 headers with `build/fb_build.sh`, which reproduces NullMoth's own 2.5.2 NVRMFB byte for byte.
