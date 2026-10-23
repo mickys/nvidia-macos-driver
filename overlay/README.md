@@ -147,7 +147,7 @@ Off by default (put the line into `nvrm610.conf`, then log out and in):
 | `NVMTL_SURFIN_UPLOAD=cpu` | turns off the GPU upload of CPU-drawn windows (WebKit, CoreGraphics apps) from their own pages; NullMoth took it from this fork in 2.5.1 and has it on by default | (on by default in NullMoth's plugin and in this one; level with it off on an RTX 4090 at 1080p 165 Hz) |
 | `NVMTL_TEX_POOL=1` | CoreAnimation's per-frame intermediate textures (blur, vibrancy) reuse released ones instead of new allocations | no measurable change |
 | `NVMTL_ASYNC_SURFIN=2` | upstream PR #96: a CPU surface upload does not wait for its GPU copy before the next one starts | **under Parsec: 36 stalls of ~100 ms per 20 s, 41 instead of 50 fps, frames jumping back** |
-| `NVMTL_SURF_MULTIPLANE=1` | two-plane (NV12) surfaces share their video memory with other processes, so a reader's CPU lock waits in the kernel | **12 stalls of ~100 ms per 20 s of screen recording**: the reader's page-off waits for the GPU with the accelerator lock held |
+| `NVMTL_SURF_MULTIPLANE=1` | two-plane (NV12) surfaces share their video memory with other processes, so a reader's CPU lock waits in the kernel | **on by default since 2.5.3-mickys.8 when `--desktop` installs this fork's NVAccel** (below); with NullMoth's NVAccel (`--no-accel`) it stays off: 12 stalls of ~100 ms per 20 s of screen recording, because NullMoth's page-off waits for the GPU with the accelerator lock held |
 | `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0` | turns the frame-order fix off (on by default, `=3`; see below) | (on by default) |
 | `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=2` / `=1` | the frame-order fix for every surface written through a private image / every surface write | `=2` orders capture as well as `=3` at the same cost; `=1` slows every app |
 | `NVMTL_WS_MARK_CONN=1` | WindowServer's completion marks go to the kernel on a connection of their own | fixed ~117 ms freezes on 2.4.3; none on 2.5.0 without it |
@@ -274,7 +274,8 @@ sudo ./install.sh                      # encoder for every app; NullMoth's plugi
 sudo ./install.sh --nvenc=parsecd,obs  # encoder only for these processes
 sudo ./install.sh --cli-wrappers       # and ffmpeg/ffprobe/HandBrakeCLI/avconvert through nvenc-run in shells and scripts
 sudo ./install.sh --no-decoders        # the encoders only (NVENCVT_NO_DEC=1 in /usr/local/etc/nvencvt.conf)
-sudo ./install.sh --desktop            # also this fork's plugin build (see "What it changes")
+sudo ./install.sh --desktop            # also this fork's plugin and NVAccel builds (see "What it changes"; restart afterwards)
+sudo ./install.sh --desktop --no-accel # the plugin build only, NullMoth's NVAccel
 sudo ./install.sh --desktop --nvenc=off  # the plugin build only, no encoder
 sudo ./install.sh --resolution         # also this fork's framebuffer build: smaller desktops, EDID overrides (restart)
 sudo ./install.sh --desktop --resolution  # both
@@ -292,6 +293,20 @@ it also backs up NullMoth's NVRMFB binary, installs this fork's, rebuilds the Au
 it keeps the old collection unless all of NullMoth's kernel extensions made it into the new one) and installs
 `/usr/local/bin/nvfb-edid`; restart afterwards.
 
+**`--desktop` also replaces NullMoth's NVAccel (the accelerator kernel extension) with this fork's build** (since 2.5.3-mickys.8;
+`--no-accel` keeps NullMoth's). The only change: when a CPU lock of a surface arrives while WindowServer's GPU is still drawing it,
+NullMoth's page-off waits for the GPU (up to 100 ms) with the accelerator lock held, so every other kernel call that needs that
+lock waits too; this build lets go of the lock for that wait. That is what lets two-plane (NV12) capture surfaces share their
+video memory (`NVMTL_SURF_MULTIPLANE=1`, which the installer then turns on): a capture reader's lock waits in the kernel, as
+on Apple's drivers, instead of WindowServer waiting at every capture commit. RTX 4090, one Parsec session: a full-screen Metal app
+67-68 -> 71 fps, a Safari animation level; with sharing on and NullMoth's locked wait a screen recording had 1-3 stalls of ~100 ms per
+15 s, with this build none; frames in order (about 6,000 frames checked through Parsec). The installer backs up NullMoth's
+NVAccel, installs this one and rebuilds the Auxiliary Kernel Collection: restart the Mac afterwards. `sudo sysctl -w
+debug.nvaccel_pageoff_unlocked_wait=0` brings the locked wait back until the next restart; counters
+`debug.nvaccel_pageoff_unlocked_waits` / `_locked_not_owner`. Source: this repository's `kexts/NVRM/accel` at the release tag
+(branch `accel-unlocked-wait`), built against NVIDIA's 615.78.08 headers like NullMoth's (NullMoth 2.5.2 and 2.5.3 ship the same
+NVAccel).
+
 ## Undo
 
 ```bash
@@ -300,9 +315,9 @@ sudo ./uninstall.sh
 
 It puts the plugin, its signature and `nvrm610.conf` back exactly as they were, and removes `libnvencvt.dylib`,
 `nvenc-run`, the `--cli-wrappers` wrappers and lines (and `/etc/zshenv` if only that line was in it), the `--cli-aliases`
-lines and the `--no-decoders` setting; after `--resolution` it also puts NullMoth's
-NVRMFB back (kernel collection rebuilt) and removes `nvfb-edid` and `/Library/NullMoth/nvfb-small` (EDID override files
-stay: NullMoth's framebuffer ignores them). Then log out and back in, or restart after `--resolution`. Updating NullMoth's driver also replaces the overlay (its installer writes the whole bundle).
+lines and the `--no-decoders` setting; it puts NullMoth's NVAccel back after `--desktop`, and after `--resolution` NullMoth's
+NVRMFB (kernel collection rebuilt) and removes `nvfb-edid` and `/Library/NullMoth/nvfb-small` (EDID override files
+stay: NullMoth's framebuffer ignores them). Then log out and back in, or restart after `--desktop` or `--resolution`. Updating NullMoth's driver also replaces the overlay (its installer writes the whole bundle).
 
 ## Check that it is active
 
