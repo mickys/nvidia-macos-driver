@@ -88,8 +88,12 @@ overlay) took a full-screen app from 140-150 to 157-164 fps at 165 Hz and Parsec
 
 ## Trade-offs that stay switchable
 
-- Frame order: keeping captured frames in order costs speed while capturing. `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0` gives
-  Parsec ~70 instead of 62-65 fps at 1080p 8-bit (RTX 4090), with about two one-frame jumps back per second.
+- Frame order: keeping captured frames in order no longer costs measurable speed. Before the GPU copy-out (2.5.3-mickys.3),
+  `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0` gave Parsec ~70 instead of 62-65 fps at 1080p 8-bit with about two one-frame jumps
+  back per second. With 2.5.3-mickys.6 (RTX 4090, one Parsec session, 1080p 165 Hz, modes switched live): a full-screen Metal
+  app 66.8-69.2 fps with frame order kept, 67.4-68.9 without; a full-screen Safari animation 32.1 / 32.0 fps. A variant that
+  lets WindowServer's commit return at submission and still delivers the frame after publication was level too (69.1-69.9 /
+  31.9).
 - Every change above has its own line in `nvrm610.conf` (README, "Every config line").
 
 ## Adding a release
