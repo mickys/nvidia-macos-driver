@@ -2093,7 +2093,11 @@ static int nvmtl_spirv_bands_ok(const void *p, size_t n, const char *what)
     free(heap);
     return ok;
 }
-static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
+static int nvmtl_spirv_bmask_x(const void *p, size_t n, uint64_t out[4], int skip_fetch);
+static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4]) { return nvmtl_spirv_bmask_x(p, n, out, 0); }
+// skip_fetch: the framebuffer-fetch set (3: [[color(n)]] at binding 192+n, bound on its own) is left out like the heap. Counted,
+// its binding 192 is no stage binding and voided the whole mask, so every draw of such a pipeline wrote all ~180 descriptors.
+static int nvmtl_spirv_bmask_x(const void *p, size_t n, uint64_t out[4], int skip_fetch)
 {
     const uint32_t *w = (const uint32_t *)p; size_t nw = n / 4;
     memset(out, 0, 4 * sizeof *out);
@@ -2106,7 +2110,7 @@ static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
     for (size_t i = 5; i < nw; ) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
         if (!wc || i + wc > nw) { free(heap); return 0; }
-        if (op == 71 && wc == 4 && w[i + 2] == 34 && w[i + 3] == 2 && w[i + 1] < bound) heap[w[i + 1]] = 1;
+        if (op == 71 && wc == 4 && w[i + 2] == 34 && (w[i + 3] == 2 || (skip_fetch && w[i + 3] == 3)) && w[i + 1] < bound) heap[w[i + 1]] = 1;
         i += wc;
     }
     int ok = 1;
@@ -2887,7 +2891,8 @@ static VkDescriptorSet nvmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint3
 { return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL); }
 #define NVMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
 int nvmtl_desc_nocopy_on(void);
-static _Atomic unsigned long long g_desc_copies;   // descriptors copied from a previous set (statistics)
+int nvmtl_desc_mask_on(void);
+static _Atomic unsigned long long g_desc_copies, g_desc_allmask;   // descriptors copied from a previous set; sets of pipelines with no binding mask
 static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
                                              VkDescriptorSet from, const uint64_t *copym)
 {
@@ -3037,7 +3042,9 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
     if (!t || which > 1 || !nvmtl_enc78_on(NVMTL_E78_H3)) return nvmtl_snapshot_set_t(c, which, p->stex_hi[which], p->tbany ? p->tbm[which] : NULL);
     const uint64_t all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
-    const uint64_t *pm = p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all;
+    const uint64_t *pm = nvmtl_desc_mask_on() ? (p->bmask2_ok ? p->bmask2 : (p->gmask2_ok && which < 2) ? p->gmask2[which] : all)
+                                              : (p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all);
+    if (pm == all) g_desc_allmask++;
     uint32_t hi = p->stex_hi[which];
     // A texture binding holds an image or, for a shader that reads a texel buffer there, a texel buffer (the layout's
     // descriptors are mutable). The last set can be bound again, or copied from, only by a pipeline that reads the same
@@ -4176,6 +4183,7 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
 
     if (!nvmtl_spirv_ok(vs, vn, "vertex module") || !nvmtl_spirv_ok(fs, fn, "fragment module")) return -1;
     if (!td) out->gmask_ok = (uint32_t)(nvmtl_spirv_bmask(vs, vn, out->gmask[0]) && nvmtl_spirv_bmask(fs, fn, out->gmask[1]));
+    if (!td) out->gmask2_ok = (uint32_t)(nvmtl_spirv_bmask_x(vs, vn, out->gmask2[0], 1) && nvmtl_spirv_bmask_x(fs, fn, out->gmask2[1], 1));
     VkShaderModuleCreateInfo vsm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, vn, (const uint32_t *)vs };
     uint32_t *fcopy = (uint32_t *)malloc(fn);
     if (!fcopy) { nvlog("vk: out of memory copying the fragment module"); return -1; }
@@ -4383,6 +4391,7 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
     out->tbany = (out->tbm[0][0] | out->tbm[0][1] | out->tbm[0][2] | out->tbm[0][3]) != 0;
     out->lin = nvmtl_spirv_has_specid(cs, n / 4, 3);
     out->bmask_ok = (uint32_t)nvmtl_spirv_bmask(cs, n, out->bmask);
+    out->bmask2_ok = (uint32_t)nvmtl_spirv_bmask_x(cs, n, out->bmask2, 1);
     VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, n, (const uint32_t *)cs };
     VkShaderModule mod = VK_NULL_HANDLE;
     VKCK(pvkCreateShaderModule(g_dev, &smi, NULL, &mod), "vkCreateShaderModule(compute)");
@@ -6320,6 +6329,9 @@ int nvmtl_surfin_barrier_on(void) { static uint64_t n; static int on; return nvm
 //   /tmp/nvmtl-ic-max-mb       (a number) the family VRAM import cache's per-surface cap in MB, over NVMTL_SURF_IMPORT_CACHE_MAX_MB
 int nvmtl_surfin_async_on(void) { static uint64_t n; static int on; return nvmtl_vk_tmpsw("/tmp/nvmtl-surfin-async", &n, &on); }
 int nvmtl_desc_nocopy_on(void) { static uint64_t n; static int on; return nvmtl_vk_tmpsw("/tmp/nvmtl-desc-nocopy", &n, &on); }
+//   /tmp/nvmtl-desc-mask       binding masks that leave the framebuffer-fetch set out (nvmtl_spirv_bmask_x): a draw writes only
+//                              the descriptors its shaders declare instead of all ~180
+int nvmtl_desc_mask_on(void) { static uint64_t n; static int on; return nvmtl_vk_tmpsw("/tmp/nvmtl-desc-mask", &n, &on); }
 long nvmtl_ic_max_mb_override(void)
 {
     static uint64_t next; static long v = -1;
@@ -6377,20 +6389,20 @@ void nvmtl_surfin_stat(int host, uint64_t ns)
     if (now < next) return;
     next = now + 2000000000ull;
     const unsigned long long n = atomic_exchange(&g_ss_n, 0), t = atomic_exchange(&g_ss_ns, 0), h = atomic_exchange(&g_ss_host, 0), c = atomic_exchange(&g_ss_cpu, 0);
-    static unsigned long long last[8];
-    const unsigned long long cur[8] = { g_ic_imports, g_ic_hits, g_ic_stale, g_ic_big,
+    static unsigned long long last[9];
+    const unsigned long long cur[9] = { g_ic_imports, g_ic_hits, g_ic_stale, g_ic_big,
                                         __atomic_load_n(&g_e78c[E78C_SETNEW], __ATOMIC_RELAXED), __atomic_load_n(&g_e78c[E78C_SETREUSE], __ATOMIC_RELAXED),
-                                        __atomic_load_n(&g_e78c[E78C_WRITES], __ATOMIC_RELAXED), g_desc_copies };
-    unsigned long long d[8]; for (int k = 0; k < 8; k++) { d[k] = cur[k] - last[k]; last[k] = cur[k]; }
+                                        __atomic_load_n(&g_e78c[E78C_WRITES], __ATOMIC_RELAXED), g_desc_copies, g_desc_allmask };
+    unsigned long long d[9]; for (int k = 0; k < 9; k++) { d[k] = cur[k] - last[k]; last[k] = cur[k]; }
     const char *td = getenv("TMPDIR"); char path[512];
     snprintf(path, sizeof path, "%s/nvmtl-surfstat-%d.log", (td && *td) ? td : "/private/tmp", (int)getpid());
     FILE *f = fopen(path, "a"); if (!f) return;
     fprintf(f, "  shared VRAM surface-in: %llu copies, %.2f ms, host %llu cpu %llu, imports %llu, cache hits %llu, deferred %llu, full %llu,"
                " cache %d barrier %d async %d nocopy %d icmax %ld | vram import cache: %llu imports %llu hits %llu stale %llu over-cap"
-               " | descriptor sets: %llu new %llu reused %llu writes %llu copies\n",
+               " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies mask %d\n",
             n, t / 1e6, h, c, (unsigned long long)g_sic_made, (unsigned long long)g_sic_hit, (unsigned long long)g_ss_defer, (unsigned long long)g_sic_full,
             nvmtl_surfin_cache_on(), nvmtl_surfin_barrier_on(), nvmtl_surfin_async_on(), nvmtl_desc_nocopy_on(), nvmtl_ic_max_mb_override(),
-            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], nvmtl_desc_mask_on());
     fclose(f);
 }
 

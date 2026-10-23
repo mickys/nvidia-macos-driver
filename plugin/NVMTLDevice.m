@@ -1086,6 +1086,9 @@ static int nvmtl_ic_get(IOSurfaceRef surf, size_t need, nvk_buffer *out)
         return 0;
     }
     os_unfair_lock_unlock(&g_ic_lock);
+    { static _Atomic unsigned misslog; const unsigned k = atomic_fetch_add(&misslog, 1);   // which surfaces miss: new ones, or evicted?
+      if (k < 60 || k % 5000 == 0) nvlog("ic miss #%u: surface %u %zux%zu fmt %.4s, %zu B, use count %d", k, (unsigned)sid, IOSurfaceGetWidth(surf), IOSurfaceGetHeight(surf),
+                                          (const char *)&(uint32_t){ CFSwapInt32HostToBig(IOSurfaceGetPixelFormat(surf)) }, need, (int)IOSurfaceGetUseCount(surf)); }
     if (nvmtl_vk_surface_vram(sid, 0, need, out)) return -1;
     static _Atomic uint64_t next = 1;
     const uint64_t cookie = ((uint64_t)getpid() << 32) | (atomic_fetch_add(&next, 1) & 0xffffffffu);
