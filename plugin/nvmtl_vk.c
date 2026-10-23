@@ -2700,7 +2700,7 @@ static int nvmtl_keep_page_push(nvmtl_address_page *p)
 #define NVMTL_WSEQ_LOST 0xFFFFFFFEu
 static nvk_buffer g_wit; static int g_wit_state;
 static uint32_t g_wit_seq;
-static uint64_t g_wit_ok, g_wit_waited, g_wit_leak, g_wit_blind, g_wit_ctl_run, g_wit_ctl_fired, g_wit_lost;
+static uint64_t g_wit_ok, g_wit_waited, g_wit_leak, g_wit_blind, g_wit_ctl_run, g_wit_ctl_fired, g_wit_lost, g_wit_lapped;
 static int nvmtl_wit_ready(void)
 {
     int st = __atomic_load_n(&g_wit_state, __ATOMIC_ACQUIRE);
@@ -2750,6 +2750,16 @@ static int nvmtl_keep_verdict(uint32_t s)
     if (s == NVMTL_WSEQ_LOST) return -1;
     if (g_state != 1 || g_wit_state <= 0) return -1;
     if (nvmtl_wit_read(s) == s) { __atomic_add_fetch(&g_wit_ok, 1, __ATOMIC_RELAXED); return 1; }
+    // A later lap of the same slot: a command buffer submitted NVMTL_WIT_SLOTS (or more) after this one wrote it, on the same
+    // in-order queue, so this one finished long ago (its fence has signalled too). It happens to command buffers finished late,
+    // like a deferred surface upload whose image was not touched again for a while: this check waited the full second below
+    // and leaked the pool every time, and after NVMTL_WIT_LOST_MAX of them pool reuse went off for the whole process
+    // (WindowServer at 12 fps). notes/plan-page-cache-stall.md.
+    { const uint32_t v = nvmtl_wit_read(s), d = v - s;
+      if (v && v < NVMTL_WSEQ_LOST && d && d < 0x80000000u && d % NVMTL_WIT_SLOTS == 0) {
+          const unsigned long long n = __atomic_add_fetch(&g_wit_lapped, 1, __ATOMIC_RELAXED);
+          if (n == 1 || (n & 0xFF) == 0) nvlog("vk: keep witness %u checked after its slot was reused by %u (%llu so far): finished, not lost", s, v, n);
+          return 1; } }
     static long wait_ms = -1; if (wait_ms < 0) { const char *e = getenv("NVMTL_WIT_WAIT_MS"); wait_ms = e ? atol(e) : 1000; }
     const uint64_t w0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     for (;;) {
@@ -6364,6 +6374,7 @@ typedef struct nvmtl_asyncup { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf
 static unsigned nvmtl_async_surfin(void);
 static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit);
 static nvmtl_asyncup *nvmtl_surfin_rec_host(unsigned limit);
+static void nvmtl_surfin_tick_start(void);
 static void nvmtl_surfin_drop(nvmtl_asyncup *au);
 static void nvmtl_surfin_store(nvk_image *img, nvmtl_asyncup *au);
 static uint64_t nvmtl_asyncup_take(nvk_image *img);
@@ -6502,6 +6513,7 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
     T[2] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     nvk_buffer hb, *hp = &hb; int slot = -1; nvmtl_sicprobe pr; memset(&pr, 0, sizeof pr);
     if (cached) {
+        nvmtl_surfin_tick_start();
         pthread_mutex_lock(&g_sic_mx);
         T[3] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         slot = nvmtl_sic_get(surf, base, bytes);
@@ -6872,9 +6884,53 @@ static void nvmtl_surfin_limit(unsigned limit)
         nvmtl_asyncup_finish((uint64_t)(uintptr_t)oldest);
     }
 }
+// Finishes the deferred surface uploads whose fence has signalled. Without it a deferred upload was finished only when its
+// image was uploaded again, read back or destroyed - for a window that stops changing, minutes later - and by then its
+// completion witness was overwritten: a 1 s wait in nvmtl_keep_verdict inside some other upload, and a leaked pool.
+static unsigned long long g_surfin_reaped;
+static void nvmtl_surfin_reap(void)
+{
+    nvmtl_asyncup *done[NVMTL_SURFIN_MAX]; unsigned nd = 0;
+    pthread_mutex_lock(&g_asyncup_mutex);
+    for (unsigned k = 0; k < g_surfin_npend; ) {
+        nvmtl_asyncup *au = g_surfin_pend[k].au;
+        if (au->infl.fence && pvkWaitForFences(g_dev, 1, &au->infl.fence, VK_TRUE, 0) == VK_SUCCESS) {
+            if (g_surfin_pend[k].img->up_token == (uint64_t)(uintptr_t)au) g_surfin_pend[k].img->up_token = 0;
+            memmove(&g_surfin_pend[k], &g_surfin_pend[k + 1], (g_surfin_npend - k - 1) * sizeof g_surfin_pend[0]);
+            g_surfin_npend--; done[nd++] = au;
+        } else k++;
+    }
+    pthread_mutex_unlock(&g_asyncup_mutex);
+    for (unsigned k = 0; k < nd; k++) nvmtl_asyncup_finish((uint64_t)(uintptr_t)done[k]);
+    g_surfin_reaped += nd;
+}
+// Frees the page cache's idle entries (unpinned, unused for longer than the idle limit), also when no upload comes to do it
+// and when the cache has been switched off: their pages stayed pinned and their surfaces retained until the next upload.
+static void nvmtl_sic_sweep(void)
+{
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), idle = nvmtl_sic_idle_ns();
+    pthread_mutex_lock(&g_sic_mx);
+    for (int i = 0; i < NVMTL_SIC_N; i++)
+        if (g_sic[i].surf && !g_sic[i].pins && now - g_sic[i].used_ns > idle) nvmtl_sic_drop(&g_sic[i]);
+    pthread_mutex_unlock(&g_sic_mx);
+}
+// Every 500 ms, off the caller's thread: finish signalled deferred uploads, free idle cache entries.
+static void nvmtl_surfin_tick_start(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        if (!t) return;
+        dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), 500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(t, ^{ if (g_state == 1) { nvmtl_surfin_reap(); nvmtl_sic_sweep(); } });
+        dispatch_resume(t);
+    });
+}
 // A record for a deferred upload from a surface's cached page import (no staging buffer), after making room for it.
 static nvmtl_asyncup *nvmtl_surfin_rec_host(unsigned limit)
 {
+    nvmtl_surfin_tick_start();
+    nvmtl_surfin_reap();
     nvmtl_surfin_limit(limit);
     nvmtl_asyncup *au = (nvmtl_asyncup *)calloc(1, sizeof *au);
     if (au) au->surfin = 1;
