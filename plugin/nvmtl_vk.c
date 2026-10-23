@@ -2898,7 +2898,6 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
 static VkDescriptorSet nvmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb)
 { return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL); }
 #define NVMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
-int nvmtl_desc_nocopy_on(void);
 int nvmtl_desc_mask_on(void);
 static _Atomic unsigned long long g_desc_copies, g_desc_allmask;   // descriptors copied from a previous set; sets of pipelines with no binding mask
 static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
@@ -3097,7 +3096,7 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     for (int k = 0; k < 4; k++) m[k] = pm[k] | (live ? t->lastw[which][k] : 0);
     if (live && t->last_hi[which] > hi) hi = t->last_hi[which];
     VkDescriptorSet from = VK_NULL_HANDLE; uint64_t cm[4] = { 0, 0, 0, 0 };
-    if (live && nvmtl_dirty_only_on() && !nvmtl_desc_nocopy_on()) {   // nocopy: the unchanged ones are written from the table too
+    if (live && nvmtl_dirty_only_on()) {
         from = t->last[which];
         for (int k = 0; k < 4; k++) cm[k] = t->lastw[which][k];
         for (uint32_t j = 0; j < NVMTL_NSTEX && NVMTL_STEX_BASE + j < 256; j++) {
@@ -6316,30 +6315,35 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
 // The caller holds the surface lock across the call, and the import is released before it returns.
 // Non-zero when the pages cannot be imported (block-compressed format, base or length not a multiple of the import
 // alignment, no host import on this device); the caller then uses nvmtl_vk_image_write.
-// Theory tests on #296 (diagnostic switches, checked every 250 ms):
-//   /tmp/nvmtl-surfin-cache    keep each surface's page import between uploads instead of importing and releasing the pages
-//                              for every upload (the kernel wires and maps ~8100 pages per 4K upload, then undoes it)
-//   /tmp/nvmtl-surfin-barrier  order the upload after earlier GPU reads of the image (the copy's barrier started from
-//                              top-of-pipe / undefined, so a composite still sampling the previous frame was not waited for)
+// Capture-cost changes to the GPU upload of CPU-drawn windows (#296) and to descriptor sets, on by default since
+// 2.5.3-mickys.4 (each `<NAME>=0` in nvrm610.conf turns it off; diagnostic builds: a /tmp/nvmtl-<x>-off file turns it off
+// live, checked every 250 ms; release builds ignore /tmp/nvmtl-* files). RTX 4090, Safari animating full screen, the
+// published 2.5.3-mickys.3 vs all of them: 1080p 165 Hz 67 -> 120-125 screen updates/s, Parsec 29 -> 47 fps; 4K 48-50 -> 60.
+//   NVMTL_SURFIN_PAGE_CACHE  keep each surface's page import between uploads instead of importing and releasing its pages
+//                            for every upload (the kernel wires and maps ~8100 pages per 4K upload, then undoes it)
+//   NVMTL_SURFIN_ASYNC       with the page cache: submit the upload without waiting for it (queue order + the barrier order it
+//                            before the command buffer that samples the image; the image's upload guard finishes it before
+//                            the image is read back, uploaded again or destroyed; its cache entry stays pinned until then)
+//   NVMTL_SURFIN_ORDERED     order the upload after earlier GPU reads of the image (the copy's barrier started from
+//                            top-of-pipe, so a composite still sampling the previous frame was not waited for)
+//   NVMTL_DESC_MASK          binding masks that leave the framebuffer-fetch set out (nvmtl_spirv_bmask_x), so a draw writes
+//                            only the descriptors its shaders declare: WindowServer wrote ~180 per draw, 2.2 million a second
 static int nvmtl_vk_tmpsw(const char *path, uint64_t *next, int *on)
 {
     const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (now >= *next) { *next = now + 250000000ull; *on = access(path, F_OK) == 0; }
     return *on;
 }
-int nvmtl_surfin_cache_on(void) { static uint64_t n; static int on; return nvmtl_vk_tmpsw("/tmp/nvmtl-surfin-cache", &n, &on); }
-int nvmtl_surfin_barrier_on(void) { static uint64_t n; static int on; return nvmtl_vk_tmpsw("/tmp/nvmtl-surfin-barrier", &n, &on); }
-//   /tmp/nvmtl-surfin-async    with the cache: submit the upload without waiting for it (queue order + the barrier order it
-//                              before the command buffer that samples the image; the image's upload guard finishes it before
-//                              the image is read back, uploaded again or destroyed; its cache entry stays pinned until then)
-//   /tmp/nvmtl-desc-nocopy     a draw's new descriptor set writes its unchanged descriptors from the bind table instead of
-//                              copying them from the previous set (NVK keeps sets in write-combined VRAM: a copy reads it back)
-//   /tmp/nvmtl-ic-max-mb       (a number) the family VRAM import cache's per-surface cap in MB, over NVMTL_SURF_IMPORT_CACHE_MAX_MB
-int nvmtl_surfin_async_on(void) { static uint64_t n; static int on; return nvmtl_vk_tmpsw("/tmp/nvmtl-surfin-async", &n, &on); }
-int nvmtl_desc_nocopy_on(void) { static uint64_t n; static int on; return nvmtl_vk_tmpsw("/tmp/nvmtl-desc-nocopy", &n, &on); }
-//   /tmp/nvmtl-desc-mask       binding masks that leave the framebuffer-fetch set out (nvmtl_spirv_bmask_x): a draw writes only
-//                              the descriptors its shaders declare instead of all ~180
-int nvmtl_desc_mask_on(void) { static uint64_t n; static int on; return nvmtl_vk_tmpsw("/tmp/nvmtl-desc-mask", &n, &on); }
+static int nvmtl_capsw(const char *name, const char *off, int *env, uint64_t *next, int *tmpoff)
+{
+    if (*env < 0) { const char *e = getenv(name); *env = !(e && e[0] == '0'); nvlog("%s %s (%s=%s)", name, *env ? "on" : "off", name, e ? e : "unset"); }
+    return *env && !nvmtl_vk_tmpsw(off, next, tmpoff);
+}
+int nvmtl_surfin_cache_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_PAGE_CACHE", "/tmp/nvmtl-surfin-cache-off", &e, &n, &o); }
+int nvmtl_surfin_barrier_on(void) { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ORDERED", "/tmp/nvmtl-surfin-barrier-off", &e, &n, &o); }
+int nvmtl_surfin_async_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ASYNC", "/tmp/nvmtl-surfin-async-off", &e, &n, &o); }
+int nvmtl_desc_mask_on(void)      { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_DESC_MASK", "/tmp/nvmtl-desc-mask-off", &e, &n, &o); }
+// diagnostic builds: /tmp/nvmtl-ic-max-mb (a number) overrides the VRAM import cache's per-surface cap
 long nvmtl_ic_max_mb_override(void)
 {
     static uint64_t next; static long v = -1;
@@ -6404,6 +6408,9 @@ static void nvmtl_sic_unpin(int slot) { pthread_mutex_lock(&g_sic_mx); if (g_sic
 static _Atomic unsigned long long g_ss_n, g_ss_ns, g_ss_host, g_ss_cpu;
 void nvmtl_surfin_stat(int host, uint64_t ns)
 {
+#if NVMTL_RELEASE
+    (void)host; (void)ns; return;
+#endif
     g_ss_n++; g_ss_ns += ns; if (host) g_ss_host++; else g_ss_cpu++;
     static uint64_t next; const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (now < next) return;
@@ -6419,11 +6426,11 @@ void nvmtl_surfin_stat(int host, uint64_t ns)
     snprintf(path, sizeof path, "%s/nvmtl-surfstat-%d.log", (td && *td) ? td : "/private/tmp", (int)getpid());
     FILE *f = fopen(path, "a"); if (!f) return;
     fprintf(f, "  shared VRAM surface-in: %llu copies, %.2f ms, host %llu cpu %llu, imports %llu, cache hits %llu, deferred %llu, full %llu,"
-               " cache %d barrier %d async %d nocopy %d icmax %ld | vram import cache: %llu imports %llu hits %llu stale %llu over-cap"
-               " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies mask %d | ic misses by size:%s\n",
+               " cache %d ordered %d async %d mask %d icmax %ld | vram import cache: %llu imports %llu hits %llu stale %llu over-cap"
+               " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies | ic misses by size:%s\n",
             n, t / 1e6, h, c, (unsigned long long)g_sic_made, (unsigned long long)g_sic_hit, (unsigned long long)g_ss_defer, (unsigned long long)g_sic_full,
-            nvmtl_surfin_cache_on(), nvmtl_surfin_barrier_on(), nvmtl_surfin_async_on(), nvmtl_desc_nocopy_on(), nvmtl_ic_max_mb_override(),
-            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], nvmtl_desc_mask_on(), miss);
+            nvmtl_surfin_cache_on(), nvmtl_surfin_barrier_on(), nvmtl_surfin_async_on(), nvmtl_desc_mask_on(), nvmtl_ic_max_mb_override(),
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], miss);
     fclose(f);
 }
 
