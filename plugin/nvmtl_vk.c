@@ -6376,20 +6376,50 @@ static nvmtl_sic g_sic[NVMTL_SIC_N];
 static pthread_mutex_t g_sic_mx = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic unsigned long long g_sic_made, g_sic_hit, g_sic_full, g_ss_defer;
 // the slot of the cached import of (surf, base, bytes), or -1 (every slot pinned, or the import failed)
+// Page-cache stall probe (diagnostic builds; notes/plan-page-cache-stall.md): what one nvmtl_sic_get did, and how long the
+// frees took. Filled under g_sic_mx by the call that holds it, read by the same thread right after.
+typedef struct { unsigned drops, idle, lru, budget; uint64_t free_ns, free_max_ns, rel_ns, rel_max_ns, import_ns; int hit; } nvmtl_sicprobe;
+static nvmtl_sicprobe g_sicp;
+// diagnostic builds: /tmp/nvmtl-sic-idle-ms (a number) replaces the 2 s idle limit (a large one = idle entries are never freed)
+static uint64_t nvmtl_sic_idle_ns(void)
+{
+    static uint64_t next, v = 2000000000ull;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= next) {
+        next = now + 250000000ull; long x = -1;
+        FILE *f = fopen("/tmp/nvmtl-sic-idle-ms", "r"); if (f) { if (fscanf(f, "%ld", &x) != 1 || x < 0) x = -1; fclose(f); }
+        v = x >= 0 ? (uint64_t)x * 1000000ull : 2000000000ull;
+    }
+    return v;
+}
+// frees one entry (its page import, then our reference to its surface), timing each half
+static void nvmtl_sic_drop(nvmtl_sic *e)   /* g_sic_mx held */
+{
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    nvmtl_vk_buffer_destroy(&e->buf);
+    const uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    CFRelease((CFTypeRef)e->surf);
+    const uint64_t t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    memset(e, 0, sizeof *e);
+    g_sicp.drops++; g_sicp.free_ns += t1 - t0; g_sicp.rel_ns += t2 - t1;
+    if (t1 - t0 > g_sicp.free_max_ns) g_sicp.free_max_ns = t1 - t0;
+    if (t2 - t1 > g_sicp.rel_max_ns) g_sicp.rel_max_ns = t2 - t1;
+}
 static int nvmtl_sic_get(const void *surf, void *base, size_t bytes)   /* g_sic_mx held */
 {
-    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), idle = nvmtl_sic_idle_ns();
+    memset(&g_sicp, 0, sizeof g_sicp);
     int slot = -1, old = -1;
     for (int i = 0; i < NVMTL_SIC_N; i++) {
         nvmtl_sic *e = &g_sic[i];
-        if (e->surf == surf && e->base == base && e->bytes == bytes && e->buf.buf) { e->used_ns = now; g_sic_hit++; return i; }
-        if (e->surf && !e->pins && now - e->used_ns > 2000000000ull) { nvmtl_vk_buffer_destroy(&e->buf); CFRelease((CFTypeRef)e->surf); memset(e, 0, sizeof *e); }
+        if (e->surf == surf && e->base == base && e->bytes == bytes && e->buf.buf) { e->used_ns = now; g_sic_hit++; g_sicp.hit = 1; return i; }
+        if (e->surf && !e->pins && now - e->used_ns > idle) { nvmtl_sic_drop(e); g_sicp.idle++; }
         if (slot < 0 && !e->surf) slot = i;
         if (e->surf && !e->pins && (old < 0 || e->used_ns < g_sic[old].used_ns)) old = i;
     }
     if (slot < 0) {
         if (old < 0) { g_sic_full++; return -1; }
-        slot = old; nvmtl_vk_buffer_destroy(&g_sic[slot].buf); CFRelease((CFTypeRef)g_sic[slot].surf); memset(&g_sic[slot], 0, sizeof g_sic[slot]);
+        slot = old; nvmtl_sic_drop(&g_sic[slot]); g_sicp.lru++;
     }
     // the imports keep their pages wired: at most NVMTL_SIC_BYTES of them, the least recently used unpinned ones go first
     for (;;) {
@@ -6399,12 +6429,30 @@ static int nvmtl_sic_get(const void *surf, void *base, size_t bytes)   /* g_sic_
             if (!g_sic[i].pins && (lru < 0 || g_sic[i].used_ns < g_sic[lru].used_ns)) lru = i;
         }
         if (held + bytes <= NVMTL_SIC_BYTES || lru < 0) break;
-        nvmtl_vk_buffer_destroy(&g_sic[lru].buf); CFRelease((CFTypeRef)g_sic[lru].surf); memset(&g_sic[lru], 0, sizeof g_sic[lru]);
+        nvmtl_sic_drop(&g_sic[lru]); g_sicp.budget++;
     }
     nvmtl_sic *e = &g_sic[slot];
-    if (nvmtl_vk_buffer_import_host(base, bytes, &e->buf)) { memset(e, 0, sizeof *e); return -1; }
+    const uint64_t ti = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const int ir = nvmtl_vk_buffer_import_host(base, bytes, &e->buf);
+    g_sicp.import_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - ti;
+    if (ir) { memset(e, 0, sizeof *e); return -1; }
     CFRetain((CFTypeRef)surf); e->surf = surf; e->base = base; e->bytes = bytes; e->used_ns = now; g_sic_made++;
     return slot;
+}
+// diagnostic builds: one line per surface-in call over 100 ms, in $TMPDIR/nvmtl-slow-<pid>.log (wall clock, every segment)
+static _Atomic unsigned long long g_ss_slow, g_ss_slow_max_ns;
+void nvmtl_surfin_slow(const char *fmt, ...)
+{
+#if NVMTL_RELEASE
+    (void)fmt; return;
+#endif
+    const char *td = getenv("TMPDIR"); char path[512];
+    snprintf(path, sizeof path, "%s/nvmtl-slow-%d.log", (td && *td) ? td : "/private/tmp", (int)getpid());
+    FILE *f = fopen(path, "a"); if (!f) return;
+    struct timeval tv; gettimeofday(&tv, NULL); struct tm tm; localtime_r(&tv.tv_sec, &tm);
+    fprintf(f, "%02d:%02d:%02d.%03d ", tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(tv.tv_usec / 1000));
+    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
+    fputc('\n', f); fclose(f);
 }
 static void nvmtl_sic_unpin(int slot) { pthread_mutex_lock(&g_sic_mx); if (g_sic[slot].pins > 0) g_sic[slot].pins--; pthread_mutex_unlock(&g_sic_mx); }
 // statistics for desk-run.sh / parsec-sic.sh: every 2 s a line in $TMPDIR/nvmtl-surfstat-<pid>.log ("N copies, T ms," for the
@@ -6431,17 +6479,19 @@ void nvmtl_surfin_stat(int host, uint64_t ns)
     FILE *f = fopen(path, "a"); if (!f) return;
     fprintf(f, "  shared VRAM surface-in: %llu copies, %.2f ms, host %llu cpu %llu, imports %llu, cache hits %llu, deferred %llu, full %llu,"
                " cache %d ordered %d async %d mask %d icmax %ld | vram import cache: %llu imports %llu hits %llu stale %llu over-cap"
-               " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies | ic misses by size:%s\n",
+               " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies | ic misses by size:%s | slow %llu max %.1f ms\n",
             n, t / 1e6, h, c, (unsigned long long)g_sic_made, (unsigned long long)g_sic_hit, (unsigned long long)g_ss_defer, (unsigned long long)g_sic_full,
             nvmtl_surfin_cache_on(), nvmtl_surfin_barrier_on(), nvmtl_surfin_async_on(), nvmtl_desc_mask_on(), nvmtl_ic_max_mb_override(),
-            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], miss);
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], miss, (unsigned long long)atomic_exchange(&g_ss_slow, 0), atomic_exchange(&g_ss_slow_max_ns, 0) / 1e6);
     fclose(f);
 }
 
 int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, const void *surf)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
+    uint64_t T[8] = { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };   // stall probe: start, barrier, rec, lock, sic_get, begin, record, submit
     nvmtl_vk_image_upload_barrier(img);   // a deferred upload (#96, or the one below) still pending on the image must not land after this one
+    T[1] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     // bufferRowLength counts texels, so the row pitch has to be a whole number of them
     if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
     if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
@@ -6449,15 +6499,20 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
     const int cached = surf && nvmtl_surfin_cache_on();
     // deferred: taken before g_sic_mx, since making room may finish (and unpin) the oldest deferred upload
     nvmtl_asyncup *au = cached && nvmtl_surfin_async_on() ? nvmtl_surfin_rec_host(NVMTL_SURFIN_HOST_INFLIGHT) : NULL;
-    nvk_buffer hb, *hp = &hb; int slot = -1;
+    T[2] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    nvk_buffer hb, *hp = &hb; int slot = -1; nvmtl_sicprobe pr; memset(&pr, 0, sizeof pr);
     if (cached) {
         pthread_mutex_lock(&g_sic_mx);
+        T[3] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         slot = nvmtl_sic_get(surf, base, bytes);
+        pr = g_sicp;
         if (slot < 0) { pthread_mutex_unlock(&g_sic_mx); if (au) nvmtl_surfin_drop(au); return -1; }
         hp = &g_sic[slot].buf;
-    } else if (nvmtl_vk_buffer_import_host(base, bytes, &hb)) return -1;
+    } else { T[3] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); if (nvmtl_vk_buffer_import_host(base, bytes, &hb)) return -1; }
+    T[4] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     nvk_cmdbuf local, *c = au ? &au->cb : &local;
     if (nvmtl_vk_cmd_begin(q, c)) { if (cached) pthread_mutex_unlock(&g_sic_mx); else nvmtl_vk_buffer_destroy(&hb); if (au) nvmtl_surfin_drop(au); return -1; }
+    T[5] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
     const int ordered = nvmtl_surfin_barrier_on();
     VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, ordered ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -6473,15 +6528,28 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, au ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
     img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    T[6] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int rc = 0;
     if (au) {
         if (nvmtl_vk_submit_begin_at(c, &au->infl, "surface upload (imported pages, deferred)")) { pthread_mutex_unlock(&g_sic_mx); nvmtl_surfin_drop(au); return -1; }
         g_sic[slot].pins++; au->sic = slot + 1; g_ss_defer++;
         pthread_mutex_unlock(&g_sic_mx);
         nvmtl_surfin_store(img, au);
-        return 0;
+    } else {
+        rc = nvmtl_vk_submit_wait_at(c, "surface upload (imported pages)");
+        if (cached) pthread_mutex_unlock(&g_sic_mx); else nvmtl_vk_buffer_destroy(&hb);
     }
-    const int rc = nvmtl_vk_submit_wait_at(c, "surface upload (imported pages)");
-    if (cached) pthread_mutex_unlock(&g_sic_mx); else nvmtl_vk_buffer_destroy(&hb);
+    T[7] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t tot = T[7] - T[0];
+    if (tot > 100000000ull) {
+        g_ss_slow++; if (tot > g_ss_slow_max_ns) g_ss_slow_max_ns = tot;
+        nvmtl_surfin_slow("write_host %.1f ms: barrier %.1f rec %.1f lock %.1f sic_get %.1f (%s, drops %u: idle %u lru %u budget %u; free %.1f max %.1f, "
+                          "release %.1f max %.1f, import %.1f) begin %.1f record %.1f submit%s %.1f | %ux%u %zu B cache %d async %d",
+                          tot / 1e6, (T[1] - T[0]) / 1e6, (T[2] - T[1]) / 1e6, (T[3] - T[2]) / 1e6, (T[4] - T[3]) / 1e6,
+                          !cached ? "uncached" : pr.hit ? "hit" : "miss", pr.drops, pr.idle, pr.lru, pr.budget, pr.free_ns / 1e6, pr.free_max_ns / 1e6,
+                          pr.rel_ns / 1e6, pr.rel_max_ns / 1e6, pr.import_ns / 1e6, (T[5] - T[4]) / 1e6, (T[6] - T[5]) / 1e6,
+                          au ? "(deferred)" : "+wait", (T[7] - T[6]) / 1e6, img->w, img->h, bytes, cached, au != NULL);
+    }
     return rc;
 }
 /* PR #96 (deferred surface-upload wait), behind NVMTL_ASYNC_SURFIN=<n> (0 or unset: the synchronous upload above).
