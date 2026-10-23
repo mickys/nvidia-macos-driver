@@ -42,15 +42,15 @@ v2.5.3
 | Branch | Based on | Items | Commits |
 |---|---|---|---|
 | [`upstream/fixes`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/fixes) | v2.5.3 | 1, 2, 3 | 18c9cdd, 3901503, 21ab072 |
-| [`upstream/page-cache`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/fixes...upstream/page-cache) | `upstream/fixes` | 9 | aed2036 |
+| [`upstream/page-cache`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/fixes...upstream/page-cache) | `upstream/fixes` | 9 | aed2036, 97f1db1 |
 | [`upstream/capture-order`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/capture-order) | v2.5.3 | 4, 5 | c77ee56, bfaaf26 |
 | [`upstream/plane-seed`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/plane-seed) | v2.5.3 | 6 | 0c98c3e |
 | [`upstream/reader-skip`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/plane-seed...upstream/reader-skip) | `upstream/plane-seed` | 7 | 1e7d414 |
 | [`upstream/import-cache`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/plane-seed...upstream/import-cache) | `upstream/plane-seed` | 8 | 6d20e60 |
 | [`upstream/nvrmfb-modes`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/nvrmfb-modes) | v2.5.3 | NVRMFB | 9c023cd |
-| [`upstream/all`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/all) | v2.5.3 | every leaf merged (a test integration, not for merging) | 8a2e674 |
+| [`upstream/all`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/all) | v2.5.3 | every leaf merged (a test integration, not for merging) | f789975 |
 
-`upstream/all`, installed on the test machine (RTX 4090, macOS 26.7.1), passed the fork's release checks: NV12 round trips at
+`upstream/all` (as of 8a2e674, before the timer fix below was added to item 9), installed on the test machine (RTX 4090, macOS 26.7.1), passed the fork's release checks: NV12 round trips at
 1080p and 4K (0 mismatches), CPU-drawn surface uploads at four sizes on the GPU and CPU paths (8 of 8 runs, 0 wrong), and a
 15 s screen recording with macOS Screen Sharing connected (923 frames, app 122-138 fps, 0 frames out of order, 0 swap timeouts),
 the same as the fork's released plugin.
@@ -223,7 +223,7 @@ multi-plane VRAM sharing hooks (an experiment not offered here) are left out of 
   rate) with WindowServer system CPU 28 % -> 7 %; Parsec 1080p 34 -> 37 fps, 4K 15.6 -> 17.3; a full-screen Metal app
   unchanged; with item 2, no stall and no lost witness in 6 Parsec soak rounds plus 10 Parsec runs of a Metal app.
 - **Required by:** none.
-- **Commits:** branch `upstream/page-cache` (aed2036, based on `upstream/fixes`; on dev 6d1812e, 05ac4bb, 284bb99, 5536b1e, e3ce433,
+- **Commits:** branch `upstream/page-cache` (aed2036 + 97f1db1, the timer's dispatch source kept alive: under ARC it was released at once and the 500 ms timer never fired; based on `upstream/fixes`; on dev 6d1812e, 05ac4bb, 284bb99, 5536b1e, e3ce433,
   49091b2). Needs items 2 and 3. The newest change (2026-10-23), so far tested on the RTX 4090 only.
 
 ---
