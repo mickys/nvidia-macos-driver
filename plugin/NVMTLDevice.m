@@ -1007,11 +1007,11 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 #include <stdatomic.h>
 #include <unistd.h>
 typedef struct { uint32_t sid; size_t need; uint64_t cookie; nvk_buffer b; int refs, stale; uint64_t idle; } nvmtl_ic_ent;
-#define NVMTL_IC_N 32
+#define NVMTL_IC_N 128   /* 32 filled up with live textures while a capture runs ("table full: not cached"): the same menu-bar surfaces were imported every frame */
 // NVMTL_SURF_IMPORT_CACHE_IDLE_MS (default 2000): how long an import stays after its last wrapper goes.
-// NVMTL_SURF_IMPORT_CACHE_MAX_MB (default 16, 0 = no limit): larger surfaces (a 4K window or composite is ~33 MB) are
-// imported per wrapper as without the cache, so the cache never holds the VRAM of the big surfaces that 4K HiDPI capture
-// pages off; 1080p and 1440p surfaces (8-15 MB) are cached.
+// NVMTL_SURF_IMPORT_CACHE_MAX_MB (default 64 with 8 GB of VRAM or more, else 16; 0 = no limit): larger surfaces (a 4K
+// window or composite is ~33 MB) are imported per wrapper as without the cache, so on a small card the cache never holds the
+// VRAM of the big surfaces that 4K HiDPI capture pages off; 1080p and 1440p surfaces (8-15 MB) are cached everywhere.
 static uint64_t nvmtl_ic_env(const char *name, uint64_t def, uint64_t unit)
 {
     const char *e = getenv(name); if (!e || !*e) return def * unit;
