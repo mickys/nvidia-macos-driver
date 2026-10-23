@@ -6933,6 +6933,10 @@ static void nvmtl_sic_sweep(void)
     for (unsigned k = 0; k < ng; k++) { nvmtl_vk_buffer_destroy(&gone[k].buf); CFRelease((CFTypeRef)gone[k].surf); }
 }
 // Every 500 ms, off the caller's thread: finish signalled deferred uploads, free idle cache entries.
+// The source is kept in a static: the plugin is one Objective-C translation unit built with ARC, so a dispatch source held
+// only by a local was released when this block returned and the timer never fired (2.5.3-mickys.5 and .6 had no timer: the
+// uploads themselves still reaped, idle entries stayed until the next upload).
+static dispatch_source_t g_surfin_timer;
 static void nvmtl_surfin_tick_start(void)
 {
     static dispatch_once_t once;
@@ -6940,7 +6944,9 @@ static void nvmtl_surfin_tick_start(void)
         dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
         if (!t) return;
         dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), 500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
-        dispatch_source_set_event_handler(t, ^{ if (g_state == 1) { nvmtl_surfin_reap(); nvmtl_sic_sweep(); } });
+        dispatch_source_set_event_handler(t, ^{ if (g_state == 1) { nvmtl_surfin_reap(); nvmtl_sic_sweep();
+            static unsigned ticks; if (++ticks <= 2 || ticks % 1200 == 0) nvlog("surface-in timer: tick %u (reap + page-cache sweep)", ticks); } });
+        g_surfin_timer = t;
         dispatch_resume(t);
     });
 }
