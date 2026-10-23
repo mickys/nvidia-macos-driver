@@ -62,6 +62,11 @@ On by default, because they made capture faster or correct and added no stalls:
   one since the plugin's own last write, four times in a row, is taken as read, and the upload is skipped (two-plane
   surfaces likewise, after the plugin's own per-plane seed moves). RTX 4090, Parsec, same session with the skip off / on:
   4K 10-bit 30.0 / 36.9 fps, 1080p 10-bit 55.7 / 65.3, 1080p 8-bit 54.2 / 56.4; frames in order, late frames nearly gone.
+- **Captured frames copied out by the GPU** (`NVMTL_GPU_COPYOUT`, since 2.5.3-mickys.3). With captured frames kept in
+  order (below), WindowServer waits on every captured frame until its NV12 frame is in the surface's memory; that copy-out
+  was a readback plus a CPU copy after the GPU finished (~2 ms per 1080p frame). The GPU now copies the frame into the
+  surface's memory at the end of the same command buffer. RTX 4090, same session off / on, frames in order in both: Parsec
+  1080p 165 Hz 8-bit 57.6 / 65.3 fps, 4K HiDPI 8-bit 30.3 / 41.1; screen recording with Screen Sharing 98-108 / 129-154.
 - **Captured frames in order** (`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=3`). WindowServer draws each captured frame into a
   two-plane (NV12) surface, which the plugin writes through a private image and copies out when the GPU has finished. The
   recorder or streamer (ScreenCaptureKit, Parsec) reads the surface as soon as WindowServer's command buffer is scheduled,
@@ -100,6 +105,7 @@ Off by default (put the line into `nvrm610.conf`, then log out and in):
 
 | line | what it does | why it is off |
 |---|---|---|
+| `NVMTL_GPU_COPYOUT=0` | turns the GPU copy-out of captured frames off | (on by default) |
 | `NVMTL_SURFIN_READER_SKIP=0` | turns the capture-frame upload skip off | (on by default) |
 | `NVMTL_PLANE_SEED=0` | turns the plane seed off | (on by default) |
 | `NVMTL_SURF_IMPORT_CACHE=0` | turns the import cache off | (on by default) |
