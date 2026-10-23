@@ -1023,15 +1023,17 @@ static uint64_t nvmtl_ic_idle_ns(void)
     dispatch_once(&once, ^{ v = nvmtl_ic_env("NVMTL_SURF_IMPORT_CACHE_IDLE_MS", 2000, 1000000ull); });
     return v;
 }
+long nvmtl_ic_max_mb_override(void);   // nvmtl_vk.c: /tmp/nvmtl-ic-max-mb (diagnostic builds), -1 = none
 static uint64_t nvmtl_ic_max_bytes(void)
 {
     static uint64_t v; static dispatch_once_t once;
     dispatch_once(&once, ^{ v = nvmtl_ic_env("NVMTL_SURF_IMPORT_CACHE_MAX_MB", 16, 1ull << 20); });
-    return v;
+    const long o = nvmtl_ic_max_mb_override();
+    return o >= 0 ? (uint64_t)o << 20 : v;
 }
 static nvmtl_ic_ent g_ic[NVMTL_IC_N];
 static os_unfair_lock g_ic_lock = OS_UNFAIR_LOCK_INIT;
-static unsigned long long g_ic_hits, g_ic_imports, g_ic_stale;
+static unsigned long long g_ic_hits, g_ic_imports, g_ic_stale, g_ic_big;
 static int nvmtl_ic_on(void)
 {
     static int on = -1;
@@ -1070,7 +1072,7 @@ static int nvmtl_ic_get(IOSurfaceRef surf, size_t need, nvk_buffer *out)
     if (!nvmtl_ic_on()) return nvmtl_vk_surface_vram(sid, 0, need, out);
     nvmtl_ic_trim(0);
     if (nvmtl_ic_max_bytes() && need > nvmtl_ic_max_bytes()) {   // too big to keep: a plain import, nvmtl_ic_put does not find it
-        static _Atomic unsigned long long big; const unsigned long long n = atomic_fetch_add(&big, 1) + 1;
+        const unsigned long long n = __atomic_add_fetch(&g_ic_big, 1, __ATOMIC_RELAXED);
         if (n < 4 || n % 1000 == 0) nvlog("family VRAM import cache: %llu imports over %llu MB not cached", n, (unsigned long long)(nvmtl_ic_max_bytes() >> 20));
         return nvmtl_vk_surface_vram(sid, 0, need, out);
     }
