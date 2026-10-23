@@ -1422,12 +1422,15 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
         return YES;
     }
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    // GPU copy-out: the command buffer already copied this plane into the surface's pages; the lock still moves the seed
+    BOOL gpuOut = NO;
+    if (__atomic_load_n(&r->_gpuOutPending, __ATOMIC_ACQUIRE) > 0) { __atomic_sub_fetch(&r->_gpuOutPending, 1, __ATOMIC_ACQ_REL); gpuOut = YES; }
     uint32_t lockopt = nvmtl_noseed() ? kIOSurfaceLockReadOnly : 0;
     uint32_t lockSeed = 0;
     if (IOSurfaceLock(r->_surf, lockopt, &lockSeed) != kIOReturnSuccess) { nvlog("G13 surface-out: IOSurfaceLock FAILED"); return NO; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = (base && row) ? nvmtl_vk_image_read(r->_q, &r->_i, base, row) : -1;
+    int rc = gpuOut ? 0 : (base && row) ? nvmtl_vk_image_read(r->_q, &r->_i, base, row) : -1;
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     uint32_t seed = 0; IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed); if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
     if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }

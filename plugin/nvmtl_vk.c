@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+#include <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -6463,6 +6464,56 @@ static void img_to(nvk_cmdbuf *c, nvk_image *img, VkImageLayout to,
     }
     pvkCmdPipelineBarrier(c->cb, srcS, dstS, 0, 0, NULL, 0, NULL, 1, &b);
     img->layout = to;
+}
+
+/* GPU copy-out (NVMTL_GPU_COPYOUT): a plane of an IOSurface WindowServer draws through a private image (the NV12 capture
+   surfaces of ScreenCaptureKit / Parsec) is copied into the surface's own pages by the GPU at the end of the command buffer
+   that drew it, instead of a readback into a staging buffer plus a CPU copy after completion. The command buffer is
+   reported scheduled only after its publication (the frame-order fix), so the shorter publication shortens WindowServer's
+   wait. The whole surface allocation is imported once as device memory and kept (each plane is copied at its byte offset);
+   an entry is reused or dropped only after 2 s without use, so no in-flight copy loses its memory. */
+typedef struct { IOSurfaceRef surf; nvk_buffer buf; uint64_t used_ns; } nvmtl_gco_imp;
+static nvmtl_gco_imp g_gco_imp[8];
+static pthread_mutex_t g_gco_mx = PTHREAD_MUTEX_INITIALIZER;
+static nvk_buffer *nvmtl_gco_import(IOSurfaceRef surf)   /* g_gco_mx held */
+{
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int free_i = -1;
+    for (int i = 0; i < 8; i++) {
+        if (g_gco_imp[i].surf == surf && g_gco_imp[i].buf.buf) { g_gco_imp[i].used_ns = now; return &g_gco_imp[i].buf; }
+        if (free_i < 0 && (!g_gco_imp[i].surf || now - g_gco_imp[i].used_ns > 2000000000ull)) free_i = i;
+    }
+    if (free_i < 0) return NULL;
+    nvmtl_gco_imp *e = &g_gco_imp[free_i];
+    if (e->surf) { nvmtl_vk_buffer_destroy(&e->buf); CFRelease(e->surf); memset(e, 0, sizeof *e); }
+    void *base = IOSurfaceGetBaseAddress(surf);
+    size_t bytes = IOSurfaceGetAllocSize(surf);
+    if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
+    if (!base || nvmtl_vk_buffer_import_host(base, bytes, &e->buf)) { memset(e, 0, sizeof *e); return NULL; }
+    CFRetain(surf); e->surf = surf; e->used_ns = now;
+    return &e->buf;
+}
+/* records image -> plane `plane` of surf_ (an IOSurfaceRef) into c, which is still recording and outside a render pass; 0 = recorded */
+int nvmtl_vk_record_plane_to_surface(nvk_cmdbuf *c, nvk_image *img, void *surf_, uint32_t plane)
+{
+    IOSurfaceRef surf = (IOSurfaceRef)surf_;
+    if (!c || !c->cb || c->in_rp || !img || !img->img || !surf || img->samples > 1 || img->bw > 1 || img->bh > 1) return -1;
+    const size_t bpp = img->bpp ? img->bpp : 1, row = IOSurfaceGetBytesPerRowOfPlane(surf, plane);
+    const uint8_t *b0 = IOSurfaceGetBaseAddress(surf), *bp = IOSurfaceGetBaseAddressOfPlane(surf, plane);
+    if (!b0 || !bp || bp < b0 || !row || row % bpp || row < (size_t)img->w * bpp) return -1;
+    const size_t off = (size_t)(bp - b0);
+    if (off % 4 || off % bpp) return -1;
+    pthread_mutex_lock(&g_gco_mx);
+    nvk_buffer *b = nvmtl_gco_import(surf);
+    pthread_mutex_unlock(&g_gco_mx);
+    if (!b || off + row * (size_t)img->h > b->size) return -1;
+    img_to(c, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy bic = { off, (uint32_t)(row / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+    pvkCmdCopyImageToBuffer(c->cb, img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buf, 1, &bic);
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    return 0;
 }
 
 static void nvmtl_private_depth_layout(nvk_cmdbuf *c, nvk_image *img, VkImageLayout to)
