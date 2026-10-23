@@ -6635,7 +6635,10 @@ static void nvmtl_sic_sweep(void)
         if (g_sic[i].surf && !g_sic[i].pins && now - g_sic[i].used_ns > NVMTL_SIC_IDLE_NS) nvmtl_sic_drop(&g_sic[i]);
     pthread_mutex_unlock(&g_sic_mx);
 }
-// Every 500 ms, off the caller's thread: finish signalled deferred uploads, free idle cache entries.
+// Every 500 ms, off the caller's thread: finish signalled deferred uploads, free idle cache entries. The source is kept in
+// a static: the plugin is one Objective-C translation unit built with ARC, and a dispatch source held only by a local is
+// released when the block returns, so the timer never fires.
+static dispatch_source_t g_surfin_timer;
 static void nvmtl_surfin_tick_start(void)
 {
     static dispatch_once_t once;
@@ -6644,6 +6647,7 @@ static void nvmtl_surfin_tick_start(void)
         if (!t) return;
         dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), 500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
         dispatch_source_set_event_handler(t, ^{ if (g_state == 1) { nvmtl_surfin_reap(); nvmtl_sic_sweep(); } });
+        g_surfin_timer = t;
         dispatch_resume(t);
     });
 }
