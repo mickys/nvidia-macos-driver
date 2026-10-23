@@ -41,14 +41,14 @@ v2.5.3
 
 | Branch | Based on | Items | Commits |
 |---|---|---|---|
-| [`upstream/fixes`](https://github.com/mickys/nvidia-macos-driver/compare/v2.5.3...upstream/fixes) | v2.5.3 | 1, 2, 3 | 18c9cdd, 3901503, 21ab072 |
+| [`upstream/fixes`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/fixes) | v2.5.3 | 1, 2, 3 | 18c9cdd, 3901503, 21ab072 |
 | [`upstream/page-cache`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/fixes...upstream/page-cache) | `upstream/fixes` | 9 | aed2036 |
-| [`upstream/capture-order`](https://github.com/mickys/nvidia-macos-driver/compare/v2.5.3...upstream/capture-order) | v2.5.3 | 4, 5 | c77ee56, bfaaf26 |
-| [`upstream/plane-seed`](https://github.com/mickys/nvidia-macos-driver/compare/v2.5.3...upstream/plane-seed) | v2.5.3 | 6 | 0c98c3e |
+| [`upstream/capture-order`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/capture-order) | v2.5.3 | 4, 5 | c77ee56, bfaaf26 |
+| [`upstream/plane-seed`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/plane-seed) | v2.5.3 | 6 | 0c98c3e |
 | [`upstream/reader-skip`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/plane-seed...upstream/reader-skip) | `upstream/plane-seed` | 7 | 1e7d414 |
 | [`upstream/import-cache`](https://github.com/mickys/nvidia-macos-driver/compare/upstream/plane-seed...upstream/import-cache) | `upstream/plane-seed` | 8 | 6d20e60 |
-| [`upstream/nvrmfb-modes`](https://github.com/mickys/nvidia-macos-driver/compare/v2.5.3...upstream/nvrmfb-modes) | v2.5.3 | NVRMFB | 9c023cd |
-| [`upstream/all`](https://github.com/mickys/nvidia-macos-driver/compare/v2.5.3...upstream/all) | v2.5.3 | every leaf merged (a test integration, not for merging) | 8a2e674 |
+| [`upstream/nvrmfb-modes`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/nvrmfb-modes) | v2.5.3 | NVRMFB | 9c023cd |
+| [`upstream/all`](https://github.com/mickys/nvidia-macos-driver/compare/75e2e28...upstream/all) | v2.5.3 | every leaf merged (a test integration, not for merging) | 8a2e674 |
 
 `upstream/all`, installed on the test machine (RTX 4090, macOS 26.7.1), passed the fork's release checks: NV12 round trips at
 1080p and 4K (0 mismatches), CPU-drawn surface uploads at four sizes on the GPU and CPU paths (8 of 8 runs, 0 wrong), and a
