@@ -6297,7 +6297,58 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
 // The caller holds the surface lock across the call, and the import is released before it returns.
 // Non-zero when the pages cannot be imported (block-compressed format, base or length not a multiple of the import
 // alignment, no host import on this device); the caller then uses nvmtl_vk_image_write.
-int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes)
+// Theory tests on #296 (diagnostic switches, checked every 250 ms):
+//   /tmp/nvmtl-surfin-cache    keep each surface's page import between uploads instead of importing and releasing the pages
+//                              for every upload (the kernel wires and maps ~8100 pages per 4K upload, then undoes it)
+//   /tmp/nvmtl-surfin-barrier  order the upload after earlier GPU reads of the image (the copy's barrier started from
+//                              top-of-pipe / undefined, so a composite still sampling the previous frame was not waited for)
+static int nvmtl_vk_tmpsw(const char *path, uint64_t *next, int *on)
+{
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= *next) { *next = now + 250000000ull; *on = access(path, F_OK) == 0; }
+    return *on;
+}
+int nvmtl_surfin_cache_on(void) { static uint64_t n; static int on; return nvmtl_vk_tmpsw("/tmp/nvmtl-surfin-cache", &n, &on); }
+int nvmtl_surfin_barrier_on(void) { static uint64_t n; static int on; return nvmtl_vk_tmpsw("/tmp/nvmtl-surfin-barrier", &n, &on); }
+typedef struct { const void *surf; void *base; size_t bytes; nvk_buffer buf; uint64_t used_ns; } nvmtl_sic;
+static nvmtl_sic g_sic[16];
+static pthread_mutex_t g_sic_mx = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic unsigned long long g_sic_made, g_sic_hit;
+// the cached import of (surf, base, bytes); the uploads that use it wait for their copy, so any entry can go at any time
+static nvk_buffer *nvmtl_sic_get(const void *surf, void *base, size_t bytes)   /* g_sic_mx held */
+{
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int slot = -1, old = 0;
+    for (int i = 0; i < 16; i++) {
+        nvmtl_sic *e = &g_sic[i];
+        if (e->surf == surf && e->base == base && e->bytes == bytes && e->buf.buf) { e->used_ns = now; g_sic_hit++; return &e->buf; }
+        if (e->surf && now - e->used_ns > 2000000000ull) { nvmtl_vk_buffer_destroy(&e->buf); CFRelease((CFTypeRef)e->surf); memset(e, 0, sizeof *e); }
+        if (slot < 0 && !e->surf) slot = i;
+        if (g_sic[i].used_ns < g_sic[old].used_ns) old = i;
+    }
+    if (slot < 0) { slot = old; nvmtl_vk_buffer_destroy(&g_sic[slot].buf); CFRelease((CFTypeRef)g_sic[slot].surf); memset(&g_sic[slot], 0, sizeof g_sic[slot]); }
+    nvmtl_sic *e = &g_sic[slot];
+    if (nvmtl_vk_buffer_import_host(base, bytes, &e->buf)) { memset(e, 0, sizeof *e); return NULL; }
+    CFRetain((CFTypeRef)surf); e->surf = surf; e->base = base; e->bytes = bytes; e->used_ns = now; g_sic_made++;
+    return &e->buf;
+}
+// statistics for desk-run.sh: every 2 s a line in $TMPDIR/nvmtl-surfstat-<pid>.log ("N copies, T ms," for the uploads since)
+static _Atomic unsigned long long g_ss_n, g_ss_ns, g_ss_host, g_ss_cpu;
+void nvmtl_surfin_stat(int host, uint64_t ns)
+{
+    g_ss_n++; g_ss_ns += ns; if (host) g_ss_host++; else g_ss_cpu++;
+    static uint64_t next; const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (now < next) return;
+    next = now + 2000000000ull;
+    const unsigned long long n = atomic_exchange(&g_ss_n, 0), t = atomic_exchange(&g_ss_ns, 0), h = atomic_exchange(&g_ss_host, 0), c = atomic_exchange(&g_ss_cpu, 0);
+    const char *td = getenv("TMPDIR"); char path[512];
+    snprintf(path, sizeof path, "%s/nvmtl-surfstat-%d.log", (td && *td) ? td : "/private/tmp", (int)getpid());
+    FILE *f = fopen(path, "a"); if (!f) return;
+    fprintf(f, "  shared VRAM surface-in: %llu copies, %.2f ms, host %llu cpu %llu, imports %llu, cache hits %llu, cache %d barrier %d\n",
+            n, t / 1e6, h, c, (unsigned long long)g_sic_made, (unsigned long long)g_sic_hit, nvmtl_surfin_cache_on(), nvmtl_surfin_barrier_on());
+    fclose(f);
+}
+int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, const void *surf)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
     nvmtl_vk_image_upload_barrier(img);   // a deferred CPU upload (#96) still pending on the image must not land after this one
@@ -6305,17 +6356,23 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
     if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
     if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
     if ((size_t)img->h * row_bytes > bytes) return -1;
-    nvk_buffer hb;
-    if (nvmtl_vk_buffer_import_host(base, bytes, &hb)) return -1;
+    const int cached = surf && nvmtl_surfin_cache_on();
+    nvk_buffer hb, *hp = &hb;
+    if (cached) {
+        pthread_mutex_lock(&g_sic_mx);
+        hp = nvmtl_sic_get(surf, base, bytes);
+        if (!hp) { pthread_mutex_unlock(&g_sic_mx); return -1; }
+    } else if (nvmtl_vk_buffer_import_host(base, bytes, &hb)) return -1;
     nvk_cmdbuf c;
-    if (nvmtl_vk_cmd_begin(q, &c)) { nvmtl_vk_buffer_destroy(&hb); return -1; }
+    if (nvmtl_vk_cmd_begin(q, &c)) { if (cached) pthread_mutex_unlock(&g_sic_mx); else nvmtl_vk_buffer_destroy(&hb); return -1; }
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
-    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+    const int ordered = nvmtl_surfin_barrier_on();
+    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, ordered ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    pvkCmdPipelineBarrier(c.cb, ordered ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
     VkBufferImageCopy bic = { 0, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
-    pvkCmdCopyBufferToImage(c.cb, (VkBuffer)hb.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    pvkCmdCopyBufferToImage(c.cb, (VkBuffer)hp->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -6323,7 +6380,7 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
     pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
     img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     const int rc = nvmtl_vk_submit_wait_at(&c, "surface upload (imported pages)");
-    nvmtl_vk_buffer_destroy(&hb);
+    if (cached) pthread_mutex_unlock(&g_sic_mx); else nvmtl_vk_buffer_destroy(&hb);
     return rc;
 }
 /* PR #96 (deferred surface-upload wait), behind NVMTL_ASYNC_SURFIN=<n> (0 or unset: the synchronous upload above).
@@ -6384,10 +6441,10 @@ int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t r
         nvmtl_copy_from_surface(dst + (size_t)y * tight, (const uint8_t *)src + (size_t)y * row_bytes, tight);
     if (nvmtl_vk_cmd_begin(q, c)) { if (au) nvmtl_surfin_drop(au); return -1; }
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
-    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, nvmtl_surfin_barrier_on() ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    pvkCmdPipelineBarrier(c->cb, nvmtl_surfin_barrier_on() ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
     VkBufferImageCopy bic = { 0, 0, 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
     pvkCmdCopyBufferToImage(c->cb, (VkBuffer)stage->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
