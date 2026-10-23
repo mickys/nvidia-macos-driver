@@ -181,14 +181,33 @@ nvenc-run HandBrakeCLI -i in.mkv -o out.mp4 -e vt_h265
 nvenc-run avconvert --preset PresetHEVCHighestQuality --source in.mov --output out.mov
 ```
 
-`sudo ./install.sh --cli-aliases` also makes `ffmpeg`, `HandBrakeCLI` and `avconvert` go through `nvenc-run` in new
-Terminal windows (zsh, and bash login shells: a line in `/etc/zshrc` and `/etc/bashrc`; `command ffmpeg ...` bypasses
-it once).
+`sudo ./install.sh --cli-wrappers` makes plain `ffmpeg`, `ffprobe`, `ffplay`, `HandBrakeCLI` and `avconvert` go through
+`nvenc-run` everywhere a shell starts them: new Terminal windows, scripts and `ssh mac ffmpeg ...`. It installs wrappers with
+those names in `/usr/local/share/mickys-overlay/bin` and puts that folder first in `PATH` from `/etc/zshenv` (every zsh),
+`/etc/zshrc` and `/etc/bashrc` (interactive bash login shells; bash scripts started from zsh inherit the `PATH`). Each wrapper runs the real tool of its
+name: the next one in `PATH`, else the one in `/usr/local/bin`, `/opt/homebrew/bin` or `/opt/local/bin` (so `ssh mac ffmpeg
+...` works even though non-interactive shells leave those out of `PATH`). `NVENC_WRAP=0 ffmpeg ...` bypasses it once. A `PATH` set later in your own `~/.zshrc` (for
+example Homebrew's `brew shellenv`) can put `/usr/local/bin` back in front: add the wrapper folder after it there.
+`sudo ./install.sh --cli-aliases` is the older, narrower option: shell functions for `ffmpeg`, `HandBrakeCLI` and
+`avconvert` in interactive zsh and bash login shells only (`command ffmpeg ...` bypasses them once).
+
+**Decoding in ffmpeg needs it too.** Without `nvenc-run`, `ffmpeg -hwaccel videotoolbox` gets our decoders only after its
+first VideoToolbox session: that session copies the list of decoders and only then starts the GPU, which loads the plugin and
+registers ours, too late for it. ffmpeg drops the first packet (the key frame) and decodes on from the next one, so
+everything up to the next key frame is missing (since mickys/nvenc 0.9.5 those frames are dropped as "reference missing";
+earlier versions showed one grey picture for them). For AV1 (no Apple decoder on Intel Macs) that is the first GOP, often
+several seconds; for H.264 / HEVC the first session gets NullMoth's or Apple's decoder instead. Through `nvenc-run` (or
+`--cli-wrappers`) our decoders are registered before the first session: a 300-frame 4K AV1 clip comes out bit-exact against
+libdav1d on every frame. Apps are not affected: they start the GPU before they decode.
 Nothing else is loaded into other programs: the overlay never sets `DYLD_INSERT_LIBRARIES` globally.
 
 Why a wrapper: macOS has no way for a third party to register a video encoder for every process. VideoToolbox only
 loads encoder plug-in bundles signed by Apple, and MediaExtension (macOS 15+) has extension points for decoders but not
-for encoders. `nvenc-run` sets `DYLD_INSERT_LIBRARIES` for the one tool. That works for unsigned tools (ffmpeg builds
+for encoders. Decoder bundles fare no better: VideoToolbox reads `/Library/Video/Plug-Ins` once per process, but an
+ad-hoc-signed AV1 decoder bundle there is passed over just the same (tested on macOS 26.7.1). A MediaExtension decoder
+would need Apple's `com.apple.developer.mediaextension.videodecoder` entitlement, would run out of process in a sandbox
+(our decoders talk to the GPU directly), and is offered only to apps that ask for "professional video workflow" decoders,
+which ffmpeg does for ProRes only. `nvenc-run` sets `DYLD_INSERT_LIBRARIES` for the one tool. That works for unsigned tools (ffmpeg builds
 from evermeet.cx or Homebrew) and, with the boot settings NullMoth's driver needs (relaxed SIP, `amfi_get_out_of_my_way`),
 also for hardened and Apple binaries such as `/usr/bin/avconvert`; on a stock Mac those would drop the variable.
 
@@ -249,7 +268,7 @@ and 29 % less in a Core Image blur, while the synchronous elapsed time grows by 
 tar -xzf mickys-overlay-<version>.tar.gz && cd mickys-overlay-<version>
 sudo ./install.sh                      # encoder for every app; NullMoth's plugin stays exactly as it is
 sudo ./install.sh --nvenc=parsecd,obs  # encoder only for these processes
-sudo ./install.sh --cli-aliases        # and ffmpeg/HandBrakeCLI/avconvert through nvenc-run in Terminal
+sudo ./install.sh --cli-wrappers       # and ffmpeg/ffprobe/HandBrakeCLI/avconvert through nvenc-run in shells and scripts
 sudo ./install.sh --no-decoders        # the encoders only (NVENCVT_NO_DEC=1 in /usr/local/etc/nvencvt.conf)
 sudo ./install.sh --desktop            # also this fork's plugin build (see "What it changes")
 sudo ./install.sh --desktop --nvenc=off  # the plugin build only, no encoder

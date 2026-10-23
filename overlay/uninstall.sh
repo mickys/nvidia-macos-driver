@@ -8,10 +8,11 @@ set -euo pipefail
 die() { echo "STOP: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run with sudo"
 # command-line part first: it is ours even when NullMoth's installer has already replaced the plugin
-MARK='# mickys overlay --cli-aliases'
-for f in /etc/zshrc /etc/bashrc; do
-  [ -f "$f" ] && grep -qF "$MARK" "$f" || continue
-  grep -vF "$MARK" "$f" > "$f.mickys" || true; cat "$f.mickys" > "$f"; rm -f "$f.mickys"
+MARK='# mickys overlay --cli-aliases'; WMARK='# mickys overlay --cli-wrappers'
+for f in /etc/zshenv /etc/zshrc /etc/bashrc; do   # the --cli-aliases / --cli-wrappers lines
+  [ -f "$f" ] && grep -qF -e "$MARK" -e "$WMARK" "$f" || continue
+  grep -vF -e "$MARK" -e "$WMARK" "$f" > "$f.mickys" || true; cat "$f.mickys" > "$f"; rm -f "$f.mickys"
+  [ -s "$f" ] || [ "$f" != /etc/zshenv ] || rm -f "$f"   # macOS ships no /etc/zshenv: the overlay made it
 done
 rm -rf /usr/local/share/mickys-overlay
 VC=/usr/local/etc/nvencvt.conf   # the --no-decoders line (other lines stay)
