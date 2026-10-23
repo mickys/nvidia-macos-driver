@@ -1582,6 +1582,14 @@ uint64_t nvmtl_vk_vram_bytes(void)
         if ((g_memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && g_memp.memoryHeaps[i].size > best) best = g_memp.memoryHeaps[i].size;
     return best;
 }
+// the largest device-local heap: the card's VRAM (0 before the device is up)
+uint64_t nvmtl_vk_vram_heap_bytes(void)
+{
+    uint64_t best = 0;
+    for (uint32_t i = 0; i < g_memp.memoryHeapCount; i++)
+        if ((g_memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && g_memp.memoryHeaps[i].size > best) best = g_memp.memoryHeaps[i].size;
+    return best;
+}
 void nvmtl_vk_mem_split(uint64_t *vram, uint64_t *sys) { if (vram) *vram = g_vram_bytes; if (sys) *sys = g_sys_bytes; }
 static int nvmtl_vk_vram_budget(uint64_t *budget, uint64_t *used)
 {
@@ -2093,7 +2101,11 @@ static int nvmtl_spirv_bands_ok(const void *p, size_t n, const char *what)
     free(heap);
     return ok;
 }
-static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
+static int nvmtl_spirv_bmask_x(const void *p, size_t n, uint64_t out[4], int skip_fetch);
+static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4]) { return nvmtl_spirv_bmask_x(p, n, out, 0); }
+// skip_fetch: the framebuffer-fetch set (3: [[color(n)]] at binding 192+n, bound on its own) is left out like the heap. Counted,
+// its binding 192 is no stage binding and voided the whole mask, so every draw of such a pipeline wrote all ~180 descriptors.
+static int nvmtl_spirv_bmask_x(const void *p, size_t n, uint64_t out[4], int skip_fetch)
 {
     const uint32_t *w = (const uint32_t *)p; size_t nw = n / 4;
     memset(out, 0, 4 * sizeof *out);
@@ -2106,7 +2118,7 @@ static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
     for (size_t i = 5; i < nw; ) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
         if (!wc || i + wc > nw) { free(heap); return 0; }
-        if (op == 71 && wc == 4 && w[i + 2] == 34 && w[i + 3] == 2 && w[i + 1] < bound) heap[w[i + 1]] = 1;
+        if (op == 71 && wc == 4 && w[i + 2] == 34 && (w[i + 3] == 2 || (skip_fetch && w[i + 3] == 3)) && w[i + 1] < bound) heap[w[i + 1]] = 1;
         i += wc;
     }
     int ok = 1;
@@ -2886,6 +2898,8 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
 static VkDescriptorSet nvmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb)
 { return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL); }
 #define NVMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
+int nvmtl_desc_mask_on(void);
+static _Atomic unsigned long long g_desc_copies, g_desc_allmask;   // descriptors copied from a previous set; sets of pipelines with no binding mask
 static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
                                              VkDescriptorSet from, const uint64_t *copym)
 {
@@ -3026,7 +3040,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
         ii[i] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, (VkImageView)view, VK_IMAGE_LAYOUT_GENERAL };
         w[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, NVMTL_BINDING_NUMBER(i), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii[i], NULL, NULL };
     }
-    nvmtl_enc78_count(E78C_WRITES, nw);
+    nvmtl_enc78_count(E78C_WRITES, nw); g_desc_copies += ncp;
     pvkUpdateDescriptorSets(g_dev, nw, w, ncp, cp);
     return set;
 }
@@ -3035,7 +3049,9 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
     if (!t || which > 1 || !nvmtl_enc78_on(NVMTL_E78_H3)) return nvmtl_snapshot_set_t(c, which, p->stex_hi[which], p->tbany ? p->tbm[which] : NULL);
     const uint64_t all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
-    const uint64_t *pm = p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all;
+    const uint64_t *pm = nvmtl_desc_mask_on() ? (p->bmask2_ok ? p->bmask2 : (p->gmask2_ok && which < 2) ? p->gmask2[which] : all)
+                                              : (p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all);
+    if (pm == all) g_desc_allmask++;
     uint32_t hi = p->stex_hi[which];
     // A texture binding holds an image or, for a shader that reads a texel buffer there, a texel buffer (the layout's
     // descriptors are mutable). The last set can be bound again, or copied from, only by a pipeline that reads the same
@@ -4174,6 +4190,7 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
 
     if (!nvmtl_spirv_ok(vs, vn, "vertex module") || !nvmtl_spirv_ok(fs, fn, "fragment module")) return -1;
     if (!td) out->gmask_ok = (uint32_t)(nvmtl_spirv_bmask(vs, vn, out->gmask[0]) && nvmtl_spirv_bmask(fs, fn, out->gmask[1]));
+    if (!td) out->gmask2_ok = (uint32_t)(nvmtl_spirv_bmask_x(vs, vn, out->gmask2[0], 1) && nvmtl_spirv_bmask_x(fs, fn, out->gmask2[1], 1));
     VkShaderModuleCreateInfo vsm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, vn, (const uint32_t *)vs };
     uint32_t *fcopy = (uint32_t *)malloc(fn);
     if (!fcopy) { nvlog("vk: out of memory copying the fragment module"); return -1; }
@@ -4381,6 +4398,7 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
     out->tbany = (out->tbm[0][0] | out->tbm[0][1] | out->tbm[0][2] | out->tbm[0][3]) != 0;
     out->lin = nvmtl_spirv_has_specid(cs, n / 4, 3);
     out->bmask_ok = (uint32_t)nvmtl_spirv_bmask(cs, n, out->bmask);
+    out->bmask2_ok = (uint32_t)nvmtl_spirv_bmask_x(cs, n, out->bmask2, 1);
     VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, n, (const uint32_t *)cs };
     VkShaderModule mod = VK_NULL_HANDLE;
     VKCK(pvkCreateShaderModule(g_dev, &smi, NULL, &mod), "vkCreateShaderModule(compute)");
@@ -6297,33 +6315,169 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
 // The caller holds the surface lock across the call, and the import is released before it returns.
 // Non-zero when the pages cannot be imported (block-compressed format, base or length not a multiple of the import
 // alignment, no host import on this device); the caller then uses nvmtl_vk_image_write.
-int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes)
+// Capture-cost changes to the GPU upload of CPU-drawn windows (#296) and to descriptor sets, on by default since
+// 2.5.3-mickys.4 (each `<NAME>=0` in nvrm610.conf turns it off; diagnostic builds: a /tmp/nvmtl-<x>-off file turns it off
+// live, checked every 250 ms; release builds ignore /tmp/nvmtl-* files). RTX 4090, Safari animating full screen, the
+// published 2.5.3-mickys.3 vs all of them: 1080p 165 Hz 67 -> 120-125 screen updates/s, Parsec 29 -> 47 fps; 4K 48-50 -> 60.
+//   NVMTL_SURFIN_PAGE_CACHE  keep each surface's page import between uploads instead of importing and releasing its pages
+//                            for every upload (the kernel wires and maps ~8100 pages per 4K upload, then undoes it)
+//   NVMTL_SURFIN_ASYNC       with the page cache: submit the upload without waiting for it (queue order + the barrier order it
+//                            before the command buffer that samples the image; the image's upload guard finishes it before
+//                            the image is read back, uploaded again or destroyed; its cache entry stays pinned until then)
+//   NVMTL_SURFIN_ORDERED     order the upload after earlier GPU reads of the image (the copy's barrier started from
+//                            top-of-pipe, so a composite still sampling the previous frame was not waited for)
+//   NVMTL_DESC_MASK          binding masks that leave the framebuffer-fetch set out (nvmtl_spirv_bmask_x), so a draw writes
+//                            only the descriptors its shaders declare: WindowServer wrote ~180 per draw, 2.2 million a second
+static int nvmtl_vk_tmpsw(const char *path, uint64_t *next, int *on)
+{
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= *next) { *next = now + 250000000ull; *on = access(path, F_OK) == 0; }
+    return *on;
+}
+static int nvmtl_capsw(const char *name, const char *off, int *env, uint64_t *next, int *tmpoff)
+{
+    if (*env < 0) { const char *e = getenv(name); *env = !(e && e[0] == '0'); nvlog("%s %s (%s=%s)", name, *env ? "on" : "off", name, e ? e : "unset"); }
+    return *env && !nvmtl_vk_tmpsw(off, next, tmpoff);
+}
+int nvmtl_surfin_cache_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_PAGE_CACHE", "/tmp/nvmtl-surfin-cache-off", &e, &n, &o); }
+int nvmtl_surfin_barrier_on(void) { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ORDERED", "/tmp/nvmtl-surfin-barrier-off", &e, &n, &o); }
+int nvmtl_surfin_async_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ASYNC", "/tmp/nvmtl-surfin-async-off", &e, &n, &o); }
+int nvmtl_desc_mask_on(void)      { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_DESC_MASK", "/tmp/nvmtl-desc-mask-off", &e, &n, &o); }
+// diagnostic builds: /tmp/nvmtl-ic-max-mb (a number) overrides the VRAM import cache's per-surface cap
+long nvmtl_ic_max_mb_override(void)
+{
+    static uint64_t next; static long v = -1;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= next) {
+        next = now + 250000000ull; long x = -1;
+        FILE *f = fopen("/tmp/nvmtl-ic-max-mb", "r"); if (f) { if (fscanf(f, "%ld", &x) != 1 || x < 0) x = -1; fclose(f); }
+        v = x;
+    }
+    return v;
+}
+#define NVMTL_SURFIN_HOST_INFLIGHT 4
+typedef struct nvmtl_asyncup { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; int surfin; int sic; } nvmtl_asyncup;
+static unsigned nvmtl_async_surfin(void);
+static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit);
+static nvmtl_asyncup *nvmtl_surfin_rec_host(unsigned limit);
+static void nvmtl_surfin_drop(nvmtl_asyncup *au);
+static void nvmtl_surfin_store(nvk_image *img, nvmtl_asyncup *au);
+static uint64_t nvmtl_asyncup_take(nvk_image *img);
+static void nvmtl_asyncup_finish(uint64_t token);
+// pins: deferred uploads still reading the entry's pages (it is neither freed nor replaced until they finish)
+typedef struct { const void *surf; void *base; size_t bytes; nvk_buffer buf; uint64_t used_ns; int pins; } nvmtl_sic;
+#define NVMTL_SIC_N 64   /* a capture keeps more surfaces in play than the window alone (16 thrashed with Parsec) */
+#define NVMTL_SIC_BYTES (512ull << 20)
+static nvmtl_sic g_sic[NVMTL_SIC_N];
+static pthread_mutex_t g_sic_mx = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic unsigned long long g_sic_made, g_sic_hit, g_sic_full, g_ss_defer;
+// the slot of the cached import of (surf, base, bytes), or -1 (every slot pinned, or the import failed)
+static int nvmtl_sic_get(const void *surf, void *base, size_t bytes)   /* g_sic_mx held */
+{
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int slot = -1, old = -1;
+    for (int i = 0; i < NVMTL_SIC_N; i++) {
+        nvmtl_sic *e = &g_sic[i];
+        if (e->surf == surf && e->base == base && e->bytes == bytes && e->buf.buf) { e->used_ns = now; g_sic_hit++; return i; }
+        if (e->surf && !e->pins && now - e->used_ns > 2000000000ull) { nvmtl_vk_buffer_destroy(&e->buf); CFRelease((CFTypeRef)e->surf); memset(e, 0, sizeof *e); }
+        if (slot < 0 && !e->surf) slot = i;
+        if (e->surf && !e->pins && (old < 0 || e->used_ns < g_sic[old].used_ns)) old = i;
+    }
+    if (slot < 0) {
+        if (old < 0) { g_sic_full++; return -1; }
+        slot = old; nvmtl_vk_buffer_destroy(&g_sic[slot].buf); CFRelease((CFTypeRef)g_sic[slot].surf); memset(&g_sic[slot], 0, sizeof g_sic[slot]);
+    }
+    // the imports keep their pages wired: at most NVMTL_SIC_BYTES of them, the least recently used unpinned ones go first
+    for (;;) {
+        size_t held = 0; int lru = -1;
+        for (int i = 0; i < NVMTL_SIC_N; i++) if (g_sic[i].surf) {
+            held += g_sic[i].bytes;
+            if (!g_sic[i].pins && (lru < 0 || g_sic[i].used_ns < g_sic[lru].used_ns)) lru = i;
+        }
+        if (held + bytes <= NVMTL_SIC_BYTES || lru < 0) break;
+        nvmtl_vk_buffer_destroy(&g_sic[lru].buf); CFRelease((CFTypeRef)g_sic[lru].surf); memset(&g_sic[lru], 0, sizeof g_sic[lru]);
+    }
+    nvmtl_sic *e = &g_sic[slot];
+    if (nvmtl_vk_buffer_import_host(base, bytes, &e->buf)) { memset(e, 0, sizeof *e); return -1; }
+    CFRetain((CFTypeRef)surf); e->surf = surf; e->base = base; e->bytes = bytes; e->used_ns = now; g_sic_made++;
+    return slot;
+}
+static void nvmtl_sic_unpin(int slot) { pthread_mutex_lock(&g_sic_mx); if (g_sic[slot].pins > 0) g_sic[slot].pins--; pthread_mutex_unlock(&g_sic_mx); }
+// statistics for desk-run.sh / parsec-sic.sh: every 2 s a line in $TMPDIR/nvmtl-surfstat-<pid>.log ("N copies, T ms," for the
+// uploads since), with this process's family VRAM import cache and descriptor set counters (deltas over the 2 s)
+static _Atomic unsigned long long g_ss_n, g_ss_ns, g_ss_host, g_ss_cpu;
+void nvmtl_surfin_stat(int host, uint64_t ns)
+{
+#if NVMTL_RELEASE
+    (void)host; (void)ns; return;
+#endif
+    g_ss_n++; g_ss_ns += ns; if (host) g_ss_host++; else g_ss_cpu++;
+    static uint64_t next; const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (now < next) return;
+    next = now + 2000000000ull;
+    const unsigned long long n = atomic_exchange(&g_ss_n, 0), t = atomic_exchange(&g_ss_ns, 0), h = atomic_exchange(&g_ss_host, 0), c = atomic_exchange(&g_ss_cpu, 0);
+    static unsigned long long last[9];
+    const unsigned long long cur[9] = { g_ic_imports, g_ic_hits, g_ic_stale, g_ic_big,
+                                        __atomic_load_n(&g_e78c[E78C_SETNEW], __ATOMIC_RELAXED), __atomic_load_n(&g_e78c[E78C_SETREUSE], __ATOMIC_RELAXED),
+                                        __atomic_load_n(&g_e78c[E78C_WRITES], __ATOMIC_RELAXED), g_desc_copies, g_desc_allmask };
+    unsigned long long d[9]; for (int k = 0; k < 9; k++) { d[k] = cur[k] - last[k]; last[k] = cur[k]; }
+    char miss[360]; nvmtl_ic_miss_dump(miss, sizeof miss);
+    const char *td = getenv("TMPDIR"); char path[512];
+    snprintf(path, sizeof path, "%s/nvmtl-surfstat-%d.log", (td && *td) ? td : "/private/tmp", (int)getpid());
+    FILE *f = fopen(path, "a"); if (!f) return;
+    fprintf(f, "  shared VRAM surface-in: %llu copies, %.2f ms, host %llu cpu %llu, imports %llu, cache hits %llu, deferred %llu, full %llu,"
+               " cache %d ordered %d async %d mask %d icmax %ld | vram import cache: %llu imports %llu hits %llu stale %llu over-cap"
+               " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies | ic misses by size:%s\n",
+            n, t / 1e6, h, c, (unsigned long long)g_sic_made, (unsigned long long)g_sic_hit, (unsigned long long)g_ss_defer, (unsigned long long)g_sic_full,
+            nvmtl_surfin_cache_on(), nvmtl_surfin_barrier_on(), nvmtl_surfin_async_on(), nvmtl_desc_mask_on(), nvmtl_ic_max_mb_override(),
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], miss);
+    fclose(f);
+}
+
+int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, const void *surf)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
-    nvmtl_vk_image_upload_barrier(img);   // a deferred CPU upload (#96) still pending on the image must not land after this one
+    nvmtl_vk_image_upload_barrier(img);   // a deferred upload (#96, or the one below) still pending on the image must not land after this one
     // bufferRowLength counts texels, so the row pitch has to be a whole number of them
     if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
     if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
     if ((size_t)img->h * row_bytes > bytes) return -1;
-    nvk_buffer hb;
-    if (nvmtl_vk_buffer_import_host(base, bytes, &hb)) return -1;
-    nvk_cmdbuf c;
-    if (nvmtl_vk_cmd_begin(q, &c)) { nvmtl_vk_buffer_destroy(&hb); return -1; }
+    const int cached = surf && nvmtl_surfin_cache_on();
+    // deferred: taken before g_sic_mx, since making room may finish (and unpin) the oldest deferred upload
+    nvmtl_asyncup *au = cached && nvmtl_surfin_async_on() ? nvmtl_surfin_rec_host(NVMTL_SURFIN_HOST_INFLIGHT) : NULL;
+    nvk_buffer hb, *hp = &hb; int slot = -1;
+    if (cached) {
+        pthread_mutex_lock(&g_sic_mx);
+        slot = nvmtl_sic_get(surf, base, bytes);
+        if (slot < 0) { pthread_mutex_unlock(&g_sic_mx); if (au) nvmtl_surfin_drop(au); return -1; }
+        hp = &g_sic[slot].buf;
+    } else if (nvmtl_vk_buffer_import_host(base, bytes, &hb)) return -1;
+    nvk_cmdbuf local, *c = au ? &au->cb : &local;
+    if (nvmtl_vk_cmd_begin(q, c)) { if (cached) pthread_mutex_unlock(&g_sic_mx); else nvmtl_vk_buffer_destroy(&hb); if (au) nvmtl_surfin_drop(au); return -1; }
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
-    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+    const int ordered = nvmtl_surfin_barrier_on();
+    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, ordered ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    pvkCmdPipelineBarrier(c->cb, ordered ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
     VkBufferImageCopy bic = { 0, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
-    pvkCmdCopyBufferToImage(c.cb, (VkBuffer)hb.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    pvkCmdCopyBufferToImage(c->cb, (VkBuffer)hp->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    // deferred: a later command buffer may also blit from it or read it in a compute pass, not only sample it in a fragment shader
     VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
-        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, au ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT) : VK_ACCESS_SHADER_READ_BIT,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, au ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
     img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    const int rc = nvmtl_vk_submit_wait_at(&c, "surface upload (imported pages)");
-    nvmtl_vk_buffer_destroy(&hb);
+    if (au) {
+        if (nvmtl_vk_submit_begin_at(c, &au->infl, "surface upload (imported pages, deferred)")) { pthread_mutex_unlock(&g_sic_mx); nvmtl_surfin_drop(au); return -1; }
+        g_sic[slot].pins++; au->sic = slot + 1; g_ss_defer++;
+        pthread_mutex_unlock(&g_sic_mx);
+        nvmtl_surfin_store(img, au);
+        return 0;
+    }
+    const int rc = nvmtl_vk_submit_wait_at(c, "surface upload (imported pages)");
+    if (cached) pthread_mutex_unlock(&g_sic_mx); else nvmtl_vk_buffer_destroy(&hb);
     return rc;
 }
 /* PR #96 (deferred surface-upload wait), behind NVMTL_ASYNC_SURFIN=<n> (0 or unset: the synchronous upload above).
@@ -6332,13 +6486,6 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
  * use-after-free that had #96 reverted). At most n deferred uploads are in flight per process: the oldest is finished
  * before another one starts. Their staging buffers come from a small pool, so a deferred upload allocates nothing. */
 // one async upload in flight; surfin: a deferred surface upload, whose staging buffer goes back to a pool
-typedef struct nvmtl_asyncup { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; int surfin; } nvmtl_asyncup;
-static unsigned nvmtl_async_surfin(void);
-static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit);
-static void nvmtl_surfin_drop(nvmtl_asyncup *au);
-static void nvmtl_surfin_store(nvk_image *img, nvmtl_asyncup *au);
-static uint64_t nvmtl_asyncup_take(nvk_image *img);
-static void nvmtl_asyncup_finish(uint64_t token);
 
 // Fills a family VRAM buffer with a whole IOSurface allocation (fork: multi-plane surfaces share one import, and the
 // kernel pages the whole allocation off, so every byte of it has to be current before any plane is marked newer).
@@ -6384,10 +6531,10 @@ int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t r
         nvmtl_copy_from_surface(dst + (size_t)y * tight, (const uint8_t *)src + (size_t)y * row_bytes, tight);
     if (nvmtl_vk_cmd_begin(q, c)) { if (au) nvmtl_surfin_drop(au); return -1; }
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
-    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, nvmtl_surfin_barrier_on() ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    pvkCmdPipelineBarrier(c->cb, nvmtl_surfin_barrier_on() ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
     VkBufferImageCopy bic = { 0, 0, 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
     pvkCmdCopyBufferToImage(c->cb, (VkBuffer)stage->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
@@ -6592,6 +6739,7 @@ static void nvmtl_surfin_unlist(nvmtl_asyncup *au)   // under g_asyncup_mutex
 // Return a finished (or never submitted) deferred upload's staging buffer to the pool, or free it.
 static void nvmtl_surfin_drop(nvmtl_asyncup *au)
 {
+    if (au->sic) nvmtl_sic_unpin(au->sic - 1);   // a deferred host-page upload: its cache entry may go now
     int kept = 0;
     if (au->stage.buf && au->stage.size <= NVMTL_UPSTAGE_KEEP) {
         pthread_mutex_lock(&g_asyncup_mutex);
@@ -6637,9 +6785,8 @@ void nvmtl_vk_image_upload_barrier(nvk_image *img) { nvmtl_asyncup_finish(nvmtl_
 // A record for a deferred surface upload with a staging buffer of at least `size` bytes, or NULL for a synchronous upload.
 // With `limit` deferred uploads already in flight the oldest is finished first (taken off its image, so the image's own
 // guard finds nothing left to finish).
-static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit)
+static void nvmtl_surfin_limit(unsigned limit)
 {
-    if (size > NVMTL_UPSTAGE_KEEP) return NULL;   // a one-off larger upload stays synchronous
     for (;;) {
         nvmtl_asyncup *oldest = NULL;
         pthread_mutex_lock(&g_asyncup_mutex);
@@ -6652,6 +6799,19 @@ static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit)
         if (!oldest) break;
         nvmtl_asyncup_finish((uint64_t)(uintptr_t)oldest);
     }
+}
+// A record for a deferred upload from a surface's cached page import (no staging buffer), after making room for it.
+static nvmtl_asyncup *nvmtl_surfin_rec_host(unsigned limit)
+{
+    nvmtl_surfin_limit(limit);
+    nvmtl_asyncup *au = (nvmtl_asyncup *)calloc(1, sizeof *au);
+    if (au) au->surfin = 1;
+    return au;
+}
+static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit)
+{
+    if (size > NVMTL_UPSTAGE_KEEP) return NULL;   // a one-off larger upload stays synchronous
+    nvmtl_surfin_limit(limit);
     nvmtl_asyncup *au = (nvmtl_asyncup *)calloc(1, sizeof *au);
     if (!au) return NULL;
     au->surfin = 1;
