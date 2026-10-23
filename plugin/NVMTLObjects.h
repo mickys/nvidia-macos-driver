@@ -45,6 +45,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   uint32_t _viewType, _viewSlices, _relativeLevel, _relativeSlice;
   uint32_t _baseSlice, _baseLevel;
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
+  int _gpuOutPending;      // GPU copy-out: committed frames whose planes the GPU copies into the IOSurface (surface-out skips its own copy)
   nvk_buffer _vramBuf; BOOL _vramOn;
   BOOL _stex;
   uint64_t _resid;

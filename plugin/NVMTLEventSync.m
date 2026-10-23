@@ -190,8 +190,40 @@ static BOOL nvmtl_ws_publish_settled(NSArray *settled, NVMTLCommandBuffer *cb) {
 // (nvmtl_surface_register_writes): a record stamped before the move matched nothing, every frame's read of the surface
 // still in flight took the CPU path (page-off, wait, 8 MB upload) on the compositor's thread, and a 144 Hz desktop ran
 // at 90 frames a second.
+// GPU copy-out (on by default, NVMTL_GPU_COPYOUT=0 off): planes of two-plane IOSurfaces drawn through private images
+// (WindowServer's NV12 capture surfaces) go into the surface's pages on the GPU at the end of this command buffer, and
+// the last part becomes a writer of the surface, so its publication waits for the copy. Their publication then skips the
+// readback + CPU copy, and with schedule-after-publish (NVMTL_SCHEDULE_AFTER_SURFACE_WRITES) WindowServer's wait at the
+// capture commit shrinks to the GPU's own time.
+static int nvmtl_gpu_copyout_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("NVMTL_GPU_COPYOUT"); on = !(e && e[0] == '0');
+        nvlog("GPU copy-out %s (NVMTL_GPU_COPYOUT=%s)", on ? "on" : "off", e ?: "unset"); }
+    return on;
+}
+static void nvmtl_ws_gpu_copyout(NVMTLCommandBuffer *cb) {
+    NVMTLSubmissionPart *last = nil;
+    for (NVMTLSubmissionPart *part in cb->_parts)
+        if ([part isKindOfClass:[NVMTLSubmissionPart class]] && part->commands.cb) last = part;
+    if (!last) return;
+    NSMutableSet *seen = nil;
+    for (NVMTLSubmissionPart *part in [cb->_parts copy]) {
+        if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        for (NVMTLTexture *t in [part->surfaces copy]) {
+            NVMTLTexture *r = t->_parent ? t->_parent : t;
+            if (!r->_surf || r->_vramOn || IOSurfaceGetPlaneCount(r->_surf) < 2) continue;
+            if (!seen) seen = [NSMutableSet new];
+            if ([seen containsObject:r]) continue;
+            [seen addObject:r];
+            if (nvmtl_vk_record_plane_to_surface(&last->commands, &r->_i, (void *)r->_surf, (uint32_t)r->_plane)) continue;
+            if (![last->surfaces containsObject:t]) last->surfaces = [last->surfaces setByAddingObject:t];
+            __atomic_add_fetch(&r->_gpuOutPending, 1, __ATOMIC_ACQ_REL);
+            static unsigned n; if (n++ < 4 || n % 5000 == 0) nvlog("GPU copy-out: surface %u plane %lu %ux%u (#%u)", (unsigned)IOSurfaceGetID(r->_surf), (unsigned long)r->_plane, r->_i.w, r->_i.h, n);
+        }
+    }
+}
 static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
     if (!nvmtl_ws_kernel_waits()) return;
+    if (nvmtl_gpu_copyout_on()) nvmtl_ws_gpu_copyout(cb);
     NSMutableSet *ids = nil;
     for (NVMTLSubmissionPart *part in cb->_parts) {
         if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
