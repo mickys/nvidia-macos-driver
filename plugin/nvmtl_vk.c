@@ -2700,7 +2700,7 @@ static int nvmtl_keep_page_push(nvmtl_address_page *p)
 #define NVMTL_WSEQ_LOST 0xFFFFFFFEu
 static nvk_buffer g_wit; static int g_wit_state;
 static uint32_t g_wit_seq;
-static uint64_t g_wit_ok, g_wit_waited, g_wit_leak, g_wit_blind, g_wit_ctl_run, g_wit_ctl_fired, g_wit_lost;
+static uint64_t g_wit_ok, g_wit_waited, g_wit_leak, g_wit_blind, g_wit_ctl_run, g_wit_ctl_fired, g_wit_lost, g_wit_lapped;
 static int nvmtl_wit_ready(void)
 {
     int st = __atomic_load_n(&g_wit_state, __ATOMIC_ACQUIRE);
@@ -2750,6 +2750,16 @@ static int nvmtl_keep_verdict(uint32_t s)
     if (s == NVMTL_WSEQ_LOST) return -1;
     if (g_state != 1 || g_wit_state <= 0) return -1;
     if (nvmtl_wit_read(s) == s) { __atomic_add_fetch(&g_wit_ok, 1, __ATOMIC_RELAXED); return 1; }
+    // A later lap of the same slot: a command buffer submitted NVMTL_WIT_SLOTS (or more) after this one wrote it, on the same
+    // in-order queue, so this one finished long ago (its fence has signalled too). It happens to command buffers finished late,
+    // like a deferred surface upload whose image was not touched again for a while: this check waited the full second below
+    // and leaked the pool every time, and after NVMTL_WIT_LOST_MAX of them pool reuse went off for the whole process
+    // (WindowServer at 12 fps). notes/plan-page-cache-stall.md.
+    { const uint32_t v = nvmtl_wit_read(s), d = v - s;
+      if (v && v < NVMTL_WSEQ_LOST && d && d < 0x80000000u && d % NVMTL_WIT_SLOTS == 0) {
+          const unsigned long long n = __atomic_add_fetch(&g_wit_lapped, 1, __ATOMIC_RELAXED);
+          if (n == 1 || (n & 0xFF) == 0) nvlog("vk: keep witness %u checked after its slot was reused by %u (%llu so far): finished, not lost", s, v, n);
+          return 1; } }
     static long wait_ms = -1; if (wait_ms < 0) { const char *e = getenv("NVMTL_WIT_WAIT_MS"); wait_ms = e ? atol(e) : 1000; }
     const uint64_t w0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     for (;;) {
@@ -6315,12 +6325,11 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
 // The caller holds the surface lock across the call, and the import is released before it returns.
 // Non-zero when the pages cannot be imported (block-compressed format, base or length not a multiple of the import
 // alignment, no host import on this device); the caller then uses nvmtl_vk_image_write.
-// Capture-cost changes to the GPU upload of CPU-drawn windows (#296) and to descriptor sets (2.5.3-mickys.4). On by default:
-// NVMTL_DESC_MASK, NVMTL_SURFIN_ORDERED (`=0` off; diagnostic builds: /tmp/nvmtl-<x>-off turns one off live). Off by default:
-// NVMTL_SURFIN_PAGE_CACHE (and with it NVMTL_SURFIN_ASYNC), `=1` on (diagnostic builds: /tmp/nvmtl-surfin-cache turns it on
-// live): with it, WindowServer stalled ~1 s now and then (an upload of ~1000 ms, about one per minute with Parsec streaming a
-// full-screen Metal app), most likely the pages it keeps wired meeting an unmap of the surface. Release builds ignore
-// /tmp/nvmtl-* files. RTX 4090, Safari animating full screen, the published 2.5.3-mickys.3 vs all of them on: 1080p 165 Hz 67
+// Capture-cost changes to the GPU upload of CPU-drawn windows (#296) and to descriptor sets. On by default, each `=0` off
+// (diagnostic builds: /tmp/nvmtl-<x>-off turns one off live; release builds ignore /tmp/nvmtl-* files): NVMTL_DESC_MASK,
+// NVMTL_SURFIN_ORDERED (2.5.3-mickys.4), NVMTL_SURFIN_PAGE_CACHE and NVMTL_SURFIN_ASYNC (2.5.3-mickys.5; off in .4 after ~1 s
+// WindowServer stalls: a deferred upload finished long after its submit waited out nvmtl_keep_verdict's 1000 ms - fixed there
+// and by nvmtl_surfin_reap; notes/plan-page-cache-stall.md). RTX 4090, Safari animating full screen, the published 2.5.3-mickys.3 vs all of them on: 1080p 165 Hz 67
 // -> 131-135 screen updates/s, Parsec 29 -> 47 fps; 4K 48-50 -> 60.
 //   NVMTL_SURFIN_PAGE_CACHE  keep each surface's page import between uploads instead of importing and releasing its pages
 //                            for every upload (the kernel wires and maps ~8100 pages per 4K upload, then undoes it)
@@ -6343,7 +6352,7 @@ static int nvmtl_capsw(const char *name, int def, const char *flip, int *env, ui
     if (*env < 0) { const char *e = getenv(name); *env = e && *e ? e[0] != '0' : def; nvlog("%s %s (%s=%s)", name, *env ? "on" : "off", name, e ? e : "unset"); }
     return def ? (*env && !nvmtl_vk_tmpsw(flip, next, tmp)) : (*env || nvmtl_vk_tmpsw(flip, next, tmp));
 }
-int nvmtl_surfin_cache_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_PAGE_CACHE", 0, "/tmp/nvmtl-surfin-cache", &e, &n, &o); }
+int nvmtl_surfin_cache_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_PAGE_CACHE", 1, "/tmp/nvmtl-surfin-cache-off", &e, &n, &o); }
 int nvmtl_surfin_barrier_on(void) { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ORDERED", 1, "/tmp/nvmtl-surfin-barrier-off", &e, &n, &o); }
 int nvmtl_surfin_async_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ASYNC", 1, "/tmp/nvmtl-surfin-async-off", &e, &n, &o); }
 int nvmtl_desc_mask_on(void)      { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_DESC_MASK", 1, "/tmp/nvmtl-desc-mask-off", &e, &n, &o); }
@@ -6364,6 +6373,7 @@ typedef struct nvmtl_asyncup { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf
 static unsigned nvmtl_async_surfin(void);
 static nvmtl_asyncup *nvmtl_surfin_rec(size_t size, unsigned limit);
 static nvmtl_asyncup *nvmtl_surfin_rec_host(unsigned limit);
+static void nvmtl_surfin_tick_start(void);
 static void nvmtl_surfin_drop(nvmtl_asyncup *au);
 static void nvmtl_surfin_store(nvk_image *img, nvmtl_asyncup *au);
 static uint64_t nvmtl_asyncup_take(nvk_image *img);
@@ -6376,20 +6386,50 @@ static nvmtl_sic g_sic[NVMTL_SIC_N];
 static pthread_mutex_t g_sic_mx = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic unsigned long long g_sic_made, g_sic_hit, g_sic_full, g_ss_defer;
 // the slot of the cached import of (surf, base, bytes), or -1 (every slot pinned, or the import failed)
+// Page-cache stall probe (diagnostic builds; notes/plan-page-cache-stall.md): what one nvmtl_sic_get did, and how long the
+// frees took. Filled under g_sic_mx by the call that holds it, read by the same thread right after.
+typedef struct { unsigned drops, idle, lru, budget; uint64_t free_ns, free_max_ns, rel_ns, rel_max_ns, import_ns; int hit; } nvmtl_sicprobe;
+static nvmtl_sicprobe g_sicp;
+// diagnostic builds: /tmp/nvmtl-sic-idle-ms (a number) replaces the 2 s idle limit (a large one = idle entries are never freed)
+static uint64_t nvmtl_sic_idle_ns(void)
+{
+    static uint64_t next, v = 2000000000ull;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= next) {
+        next = now + 250000000ull; long x = -1;
+        FILE *f = fopen("/tmp/nvmtl-sic-idle-ms", "r"); if (f) { if (fscanf(f, "%ld", &x) != 1 || x < 0) x = -1; fclose(f); }
+        v = x >= 0 ? (uint64_t)x * 1000000ull : 2000000000ull;
+    }
+    return v;
+}
+// frees one entry (its page import, then our reference to its surface), timing each half
+static void nvmtl_sic_drop(nvmtl_sic *e)   /* g_sic_mx held */
+{
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    nvmtl_vk_buffer_destroy(&e->buf);
+    const uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    CFRelease((CFTypeRef)e->surf);
+    const uint64_t t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    memset(e, 0, sizeof *e);
+    g_sicp.drops++; g_sicp.free_ns += t1 - t0; g_sicp.rel_ns += t2 - t1;
+    if (t1 - t0 > g_sicp.free_max_ns) g_sicp.free_max_ns = t1 - t0;
+    if (t2 - t1 > g_sicp.rel_max_ns) g_sicp.rel_max_ns = t2 - t1;
+}
 static int nvmtl_sic_get(const void *surf, void *base, size_t bytes)   /* g_sic_mx held */
 {
-    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), idle = nvmtl_sic_idle_ns();
+    memset(&g_sicp, 0, sizeof g_sicp);
     int slot = -1, old = -1;
     for (int i = 0; i < NVMTL_SIC_N; i++) {
         nvmtl_sic *e = &g_sic[i];
-        if (e->surf == surf && e->base == base && e->bytes == bytes && e->buf.buf) { e->used_ns = now; g_sic_hit++; return i; }
-        if (e->surf && !e->pins && now - e->used_ns > 2000000000ull) { nvmtl_vk_buffer_destroy(&e->buf); CFRelease((CFTypeRef)e->surf); memset(e, 0, sizeof *e); }
+        if (e->surf == surf && e->base == base && e->bytes == bytes && e->buf.buf) { e->used_ns = now; g_sic_hit++; g_sicp.hit = 1; return i; }
+        if (e->surf && !e->pins && now - e->used_ns > idle) { nvmtl_sic_drop(e); g_sicp.idle++; }
         if (slot < 0 && !e->surf) slot = i;
         if (e->surf && !e->pins && (old < 0 || e->used_ns < g_sic[old].used_ns)) old = i;
     }
     if (slot < 0) {
         if (old < 0) { g_sic_full++; return -1; }
-        slot = old; nvmtl_vk_buffer_destroy(&g_sic[slot].buf); CFRelease((CFTypeRef)g_sic[slot].surf); memset(&g_sic[slot], 0, sizeof g_sic[slot]);
+        slot = old; nvmtl_sic_drop(&g_sic[slot]); g_sicp.lru++;
     }
     // the imports keep their pages wired: at most NVMTL_SIC_BYTES of them, the least recently used unpinned ones go first
     for (;;) {
@@ -6399,12 +6439,30 @@ static int nvmtl_sic_get(const void *surf, void *base, size_t bytes)   /* g_sic_
             if (!g_sic[i].pins && (lru < 0 || g_sic[i].used_ns < g_sic[lru].used_ns)) lru = i;
         }
         if (held + bytes <= NVMTL_SIC_BYTES || lru < 0) break;
-        nvmtl_vk_buffer_destroy(&g_sic[lru].buf); CFRelease((CFTypeRef)g_sic[lru].surf); memset(&g_sic[lru], 0, sizeof g_sic[lru]);
+        nvmtl_sic_drop(&g_sic[lru]); g_sicp.budget++;
     }
     nvmtl_sic *e = &g_sic[slot];
-    if (nvmtl_vk_buffer_import_host(base, bytes, &e->buf)) { memset(e, 0, sizeof *e); return -1; }
+    const uint64_t ti = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const int ir = nvmtl_vk_buffer_import_host(base, bytes, &e->buf);
+    g_sicp.import_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - ti;
+    if (ir) { memset(e, 0, sizeof *e); return -1; }
     CFRetain((CFTypeRef)surf); e->surf = surf; e->base = base; e->bytes = bytes; e->used_ns = now; g_sic_made++;
     return slot;
+}
+// diagnostic builds: one line per surface-in call over 100 ms, in $TMPDIR/nvmtl-slow-<pid>.log (wall clock, every segment)
+static _Atomic unsigned long long g_ss_slow, g_ss_slow_max_ns;
+void nvmtl_surfin_slow(const char *fmt, ...)
+{
+#if NVMTL_RELEASE
+    (void)fmt; return;
+#endif
+    const char *td = getenv("TMPDIR"); char path[512];
+    snprintf(path, sizeof path, "%s/nvmtl-slow-%d.log", (td && *td) ? td : "/private/tmp", (int)getpid());
+    FILE *f = fopen(path, "a"); if (!f) return;
+    struct timeval tv; gettimeofday(&tv, NULL); struct tm tm; localtime_r(&tv.tv_sec, &tm);
+    fprintf(f, "%02d:%02d:%02d.%03d ", tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(tv.tv_usec / 1000));
+    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
+    fputc('\n', f); fclose(f);
 }
 static void nvmtl_sic_unpin(int slot) { pthread_mutex_lock(&g_sic_mx); if (g_sic[slot].pins > 0) g_sic[slot].pins--; pthread_mutex_unlock(&g_sic_mx); }
 // statistics for desk-run.sh / parsec-sic.sh: every 2 s a line in $TMPDIR/nvmtl-surfstat-<pid>.log ("N copies, T ms," for the
@@ -6431,17 +6489,19 @@ void nvmtl_surfin_stat(int host, uint64_t ns)
     FILE *f = fopen(path, "a"); if (!f) return;
     fprintf(f, "  shared VRAM surface-in: %llu copies, %.2f ms, host %llu cpu %llu, imports %llu, cache hits %llu, deferred %llu, full %llu,"
                " cache %d ordered %d async %d mask %d icmax %ld | vram import cache: %llu imports %llu hits %llu stale %llu over-cap"
-               " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies | ic misses by size:%s\n",
+               " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies | ic misses by size:%s | slow %llu max %.1f ms\n",
             n, t / 1e6, h, c, (unsigned long long)g_sic_made, (unsigned long long)g_sic_hit, (unsigned long long)g_ss_defer, (unsigned long long)g_sic_full,
             nvmtl_surfin_cache_on(), nvmtl_surfin_barrier_on(), nvmtl_surfin_async_on(), nvmtl_desc_mask_on(), nvmtl_ic_max_mb_override(),
-            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], miss);
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], miss, (unsigned long long)atomic_exchange(&g_ss_slow, 0), atomic_exchange(&g_ss_slow_max_ns, 0) / 1e6);
     fclose(f);
 }
 
 int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, const void *surf)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
+    uint64_t T[8] = { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };   // stall probe: start, barrier, rec, lock, sic_get, begin, record, submit
     nvmtl_vk_image_upload_barrier(img);   // a deferred upload (#96, or the one below) still pending on the image must not land after this one
+    T[1] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     // bufferRowLength counts texels, so the row pitch has to be a whole number of them
     if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
     if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
@@ -6449,15 +6509,21 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
     const int cached = surf && nvmtl_surfin_cache_on();
     // deferred: taken before g_sic_mx, since making room may finish (and unpin) the oldest deferred upload
     nvmtl_asyncup *au = cached && nvmtl_surfin_async_on() ? nvmtl_surfin_rec_host(NVMTL_SURFIN_HOST_INFLIGHT) : NULL;
-    nvk_buffer hb, *hp = &hb; int slot = -1;
+    T[2] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    nvk_buffer hb, *hp = &hb; int slot = -1; nvmtl_sicprobe pr; memset(&pr, 0, sizeof pr);
     if (cached) {
+        nvmtl_surfin_tick_start();
         pthread_mutex_lock(&g_sic_mx);
+        T[3] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         slot = nvmtl_sic_get(surf, base, bytes);
+        pr = g_sicp;
         if (slot < 0) { pthread_mutex_unlock(&g_sic_mx); if (au) nvmtl_surfin_drop(au); return -1; }
         hp = &g_sic[slot].buf;
-    } else if (nvmtl_vk_buffer_import_host(base, bytes, &hb)) return -1;
+    } else { T[3] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); if (nvmtl_vk_buffer_import_host(base, bytes, &hb)) return -1; }
+    T[4] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     nvk_cmdbuf local, *c = au ? &au->cb : &local;
     if (nvmtl_vk_cmd_begin(q, c)) { if (cached) pthread_mutex_unlock(&g_sic_mx); else nvmtl_vk_buffer_destroy(&hb); if (au) nvmtl_surfin_drop(au); return -1; }
+    T[5] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
     const int ordered = nvmtl_surfin_barrier_on();
     VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, ordered ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -6473,15 +6539,28 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, au ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
     img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    T[6] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int rc = 0;
     if (au) {
         if (nvmtl_vk_submit_begin_at(c, &au->infl, "surface upload (imported pages, deferred)")) { pthread_mutex_unlock(&g_sic_mx); nvmtl_surfin_drop(au); return -1; }
         g_sic[slot].pins++; au->sic = slot + 1; g_ss_defer++;
         pthread_mutex_unlock(&g_sic_mx);
         nvmtl_surfin_store(img, au);
-        return 0;
+    } else {
+        rc = nvmtl_vk_submit_wait_at(c, "surface upload (imported pages)");
+        if (cached) pthread_mutex_unlock(&g_sic_mx); else nvmtl_vk_buffer_destroy(&hb);
     }
-    const int rc = nvmtl_vk_submit_wait_at(c, "surface upload (imported pages)");
-    if (cached) pthread_mutex_unlock(&g_sic_mx); else nvmtl_vk_buffer_destroy(&hb);
+    T[7] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t tot = T[7] - T[0];
+    if (tot > 100000000ull) {
+        g_ss_slow++; if (tot > g_ss_slow_max_ns) g_ss_slow_max_ns = tot;
+        nvmtl_surfin_slow("write_host %.1f ms: barrier %.1f rec %.1f lock %.1f sic_get %.1f (%s, drops %u: idle %u lru %u budget %u; free %.1f max %.1f, "
+                          "release %.1f max %.1f, import %.1f) begin %.1f record %.1f submit%s %.1f | %ux%u %zu B cache %d async %d",
+                          tot / 1e6, (T[1] - T[0]) / 1e6, (T[2] - T[1]) / 1e6, (T[3] - T[2]) / 1e6, (T[4] - T[3]) / 1e6,
+                          !cached ? "uncached" : pr.hit ? "hit" : "miss", pr.drops, pr.idle, pr.lru, pr.budget, pr.free_ns / 1e6, pr.free_max_ns / 1e6,
+                          pr.rel_ns / 1e6, pr.rel_max_ns / 1e6, pr.import_ns / 1e6, (T[5] - T[4]) / 1e6, (T[6] - T[5]) / 1e6,
+                          au ? "(deferred)" : "+wait", (T[7] - T[6]) / 1e6, img->w, img->h, bytes, cached, au != NULL);
+    }
     return rc;
 }
 /* PR #96 (deferred surface-upload wait), behind NVMTL_ASYNC_SURFIN=<n> (0 or unset: the synchronous upload above).
@@ -6804,9 +6883,53 @@ static void nvmtl_surfin_limit(unsigned limit)
         nvmtl_asyncup_finish((uint64_t)(uintptr_t)oldest);
     }
 }
+// Finishes the deferred surface uploads whose fence has signalled. Without it a deferred upload was finished only when its
+// image was uploaded again, read back or destroyed - for a window that stops changing, minutes later - and by then its
+// completion witness was overwritten: a 1 s wait in nvmtl_keep_verdict inside some other upload, and a leaked pool.
+static unsigned long long g_surfin_reaped;
+static void nvmtl_surfin_reap(void)
+{
+    nvmtl_asyncup *done[NVMTL_SURFIN_MAX]; unsigned nd = 0;
+    pthread_mutex_lock(&g_asyncup_mutex);
+    for (unsigned k = 0; k < g_surfin_npend; ) {
+        nvmtl_asyncup *au = g_surfin_pend[k].au;
+        if (au->infl.fence && pvkWaitForFences(g_dev, 1, &au->infl.fence, VK_TRUE, 0) == VK_SUCCESS) {
+            if (g_surfin_pend[k].img->up_token == (uint64_t)(uintptr_t)au) g_surfin_pend[k].img->up_token = 0;
+            memmove(&g_surfin_pend[k], &g_surfin_pend[k + 1], (g_surfin_npend - k - 1) * sizeof g_surfin_pend[0]);
+            g_surfin_npend--; done[nd++] = au;
+        } else k++;
+    }
+    pthread_mutex_unlock(&g_asyncup_mutex);
+    for (unsigned k = 0; k < nd; k++) nvmtl_asyncup_finish((uint64_t)(uintptr_t)done[k]);
+    g_surfin_reaped += nd;
+}
+// Frees the page cache's idle entries (unpinned, unused for longer than the idle limit), also when no upload comes to do it
+// and when the cache has been switched off: their pages stayed pinned and their surfaces retained until the next upload.
+static void nvmtl_sic_sweep(void)
+{
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), idle = nvmtl_sic_idle_ns();
+    pthread_mutex_lock(&g_sic_mx);
+    for (int i = 0; i < NVMTL_SIC_N; i++)
+        if (g_sic[i].surf && !g_sic[i].pins && now - g_sic[i].used_ns > idle) nvmtl_sic_drop(&g_sic[i]);
+    pthread_mutex_unlock(&g_sic_mx);
+}
+// Every 500 ms, off the caller's thread: finish signalled deferred uploads, free idle cache entries.
+static void nvmtl_surfin_tick_start(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        if (!t) return;
+        dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), 500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(t, ^{ if (g_state == 1) { nvmtl_surfin_reap(); nvmtl_sic_sweep(); } });
+        dispatch_resume(t);
+    });
+}
 // A record for a deferred upload from a surface's cached page import (no staging buffer), after making room for it.
 static nvmtl_asyncup *nvmtl_surfin_rec_host(unsigned limit)
 {
+    nvmtl_surfin_tick_start();
+    nvmtl_surfin_reap();
     nvmtl_surfin_limit(limit);
     nvmtl_asyncup *au = (nvmtl_asyncup *)calloc(1, sizeof *au);
     if (au) au->surfin = 1;
