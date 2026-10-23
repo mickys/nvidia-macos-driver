@@ -403,7 +403,8 @@ static int nvmtl_skip_empty_on(void) {
     // =1 for every surface write, =0 for none.
     static int after0 = -1; if (after0 < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after0 = e && *e ? e[0] - '0' : 3; }
     static uint64_t offNext; static int offTmp;   // diagnostic builds: /tmp/nvmtl-sched-off = mode 0, live
-    const int after = nvmtl_tmp_switch("/tmp/nvmtl-sched-off", &offNext, &offTmp) ? 0 : after0;   // 3 (default): NV12 capture surfaces only (RTX 4090 1080p165 recording + Screen Sharing: 0 frames out of order instead of 9-39, app 90-103 instead of 107-128 fps; NullMoth's plugin 81-93 fps with 106-134 out of order); 0 = stock's, 2 = every private-image write, 1 = every write
+    const int after = nvmtl_tmp_switch("/tmp/nvmtl-sched-off", &offNext, &offTmp) ? 0 : after0;
+    { static int said = -1; if (after != said) { said = after; nvlog("frame-order mode now %d (NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=%d, /tmp/nvmtl-sched-off %s)", after, after0, after ? "absent" : "present"); } }   // 3 (default): NV12 capture surfaces only (RTX 4090 1080p165 recording + Screen Sharing: 0 frames out of order instead of 9-39, app 90-103 instead of 107-128 fps; NullMoth's plugin 81-93 fps with 106-134 out of order); 0 = stock's, 2 = every private-image write, 1 = every write
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) {
         if (s == drawable || !after) continue;
@@ -501,7 +502,8 @@ static int nvmtl_sched_split_on(void) {
     if (_scheduleAfterPublish) {
         if (nvmtl_sched_split_on()) {
             [_completionCondition lock];
-            if (!_scheduledWaitReleased) { _scheduledWaitReleased = YES; [_completionCondition broadcast]; }
+            if (!_scheduledWaitReleased) { _scheduledWaitReleased = YES; [_completionCondition broadcast];
+                static unsigned n; if (n++ < 4 || n % 2000 == 0) nvlog("schedule split: waitUntilScheduled released at submission (#%u)", n); }
             [_completionCondition unlock];
         }
         return;
