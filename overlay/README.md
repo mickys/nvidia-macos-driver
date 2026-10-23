@@ -38,8 +38,8 @@ HEVC (P only) encoders and every decoder but AV1; VP9 from 65x65 up.
   380 (the only hardware VP9 and AV1 decoding on an Intel Mac). `--no-decoders` keeps only the encoders.
 
 **Optional, `--desktop`: this fork's Metal plugin.** It is NullMoth 2.5.2's plugin with this fork's changes added one by
-one, each behind its own line in `/Library/GPUBundles/nvmtl/nvrm610.conf`. Three are on by default; the others are off, so
-apart from those three the plugin behaves exactly like NullMoth's. Every change was measured on its own against NullMoth's
+one, each behind its own line in `/Library/GPUBundles/nvmtl/nvrm610.conf`. The ones listed as on by default below are on;
+the others are off, so apart from those the plugin behaves exactly like NullMoth's. Every change was measured on its own against NullMoth's
 plugin, on a GTX 1650 (NullMoth 2.5.0) and again on an RTX 4090 (NullMoth 2.5.2; macOS 26.7.1, zero-copy scan-out), with a
 full-screen Metal animation while the screen was captured: by Parsec (a client connected, 20 s runs; GTX 1650) and by a
 screen recording, at 1080p 165 Hz and at 4K HiDPI.
@@ -49,11 +49,13 @@ On by default, because they made capture faster or correct and added no stalls:
 - **NV12 plane seed** (`NVMTL_PLANE_SEED`). WindowServer draws captured frames into two-plane (NV12) surfaces. NullMoth's
   plugin copies each plane out with a lock that moves the whole surface's seed, so the other plane looks stale and is
   uploaded again from the CPU before the next frame. The plugin remembers the seed moves of its own copy-outs instead.
-- **Import cache for surfaces up to 16 MB** (`NVMTL_SURF_IMPORT_CACHE`, `NVMTL_SURF_IMPORT_CACHE_MAX_MB`). CoreAnimation wraps
-  the same window surfaces in a new texture every frame, and each wrap imported the surface's video memory again (four
-  kernel calls). The import is now shared by the wraps and kept briefly. Surfaces above 16 MB (4K-sized windows and
-  composites) are imported per wrap as before: uncapped, the cache added up to 67 stalls of ~100 ms per 15 s at 4K HiDPI on
-  a GTX 1650. With the cap, 1080p and 1440p surfaces (8-15 MB) are cached.
+- **Import cache** (`NVMTL_SURF_IMPORT_CACHE`, `NVMTL_SURF_IMPORT_CACHE_MAX_MB`). CoreAnimation wraps the same window
+  surfaces in a new texture every frame, and each wrap imported the surface's video memory again (four kernel calls). The
+  import is now shared by the wraps and kept briefly. The size limit per surface follows the card since 2.5.3-mickys.4:
+  64 MB with 8 GB of video memory or more (4K windows and composites, ~33 MB, are cached too), 16 MB below (uncapped, the
+  cache added up to 67 stalls of ~100 ms per 15 s at 4K HiDPI on a 4 GB GTX 1650; 1080p and 1440p surfaces, 8-15 MB, are
+  cached there). The cache holds 128 surfaces (32 before 2.5.3-mickys.4: while the screen was captured it filled up with
+  textures in use, and the same menu-bar surfaces were imported again every frame).
 
 - **No upload of capture frames that were only read** (`NVMTL_SURFIN_READER_SKIP`, since 2.5.3-mickys.2). ScreenCaptureKit
   (Parsec, recorders) locks every captured frame read-write to read it, which moves the surface's seed as a CPU write would,
@@ -67,6 +69,28 @@ On by default, because they made capture faster or correct and added no stalls:
   was a readback plus a CPU copy after the GPU finished (~2 ms per 1080p frame). The GPU now copies the frame into the
   surface's memory at the end of the same command buffer. RTX 4090, same session off / on, frames in order in both: Parsec
   1080p 165 Hz 8-bit 57.6 / 65.3 fps, 4K HiDPI 8-bit 30.3 / 41.1; screen recording with Screen Sharing 98-108 / 129-154.
+- **Descriptor masks that count only the stage's own bindings** (`NVMTL_DESC_MASK`, since 2.5.3-mickys.4). Each draw gets a
+  descriptor set holding the textures, samplers and buffers its shaders use; the plugin learns which from the shaders. A
+  shader that reads the colour attachment (framebuffer fetch, a separate set) voided that list, so every draw of such a
+  pipeline wrote all ~180 descriptors, almost all placeholders: WindowServer wrote 2.2 million descriptors a second while a
+  window animated. That set is now left out like the texture heap: about 6 writes per draw, 35 thousand a second.
+- **CPU-drawn windows uploaded without waiting** (`NVMTL_SURFIN_PAGE_CACHE`, `NVMTL_SURFIN_ASYNC`, `NVMTL_SURFIN_ORDERED`,
+  since 2.5.3-mickys.4). A window drawn on the CPU (Safari and WebKit, most AppKit apps) is copied to video memory by the
+  GPU straight from the surface's own pages. The pages were imported (wired and mapped by the kernel: ~8100 pages for a 4K
+  window) and released for every upload, and WindowServer waited for each copy. The import is now kept per surface (up to
+  64 surfaces, at most 512 MB wired, released 2 s after their last upload) and the copy is not waited for: the GPU runs it
+  before the command buffer that draws the window, and the plugin finishes it before the window's texture is read back,
+  uploaded again or freed. The copy now also waits for earlier GPU reads of the texture (`NVMTL_SURFIN_ORDERED`).
+
+| RTX 4090, full-screen Safari animation (drawn on the CPU), 2.5.3-mickys.3 / this release | 1080p 165 Hz | 4K HiDPI 60 Hz |
+|---|---|---|
+| local display, screen updates/s | 67-68 / **131-135** | 48.5-50 / **60** (the refresh rate) |
+| WindowServer CPU (user + system, of one core) | 46+28 % / 66-67+13 % | 34+28 % / 43+7 % |
+| Parsec, fps sent (frames in order in both) | 29.2 / **46.7-46.9** | 15.1-16.1 / 16.8-17.6 |
+
+A full-screen Metal app is level (153-162 / 155-165 fps without capture; through Parsec 63.7-64.8 / 65.9-68.7 fps). Every
+recorded frame of eight screen recordings was decoded: none out of order, garbled or torn.
+
 - **Captured frames in order** (`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=3`). WindowServer draws each captured frame into a
   two-plane (NV12) surface, which the plugin writes through a private image and copies out when the GPU has finished. The
   recorder or streamer (ScreenCaptureKit, Parsec) reads the surface as soon as WindowServer's command buffer is scheduled,
@@ -106,10 +130,14 @@ Off by default (put the line into `nvrm610.conf`, then log out and in):
 | line | what it does | why it is off |
 |---|---|---|
 | `NVMTL_GPU_COPYOUT=0` | turns the GPU copy-out of captured frames off | (on by default) |
+| `NVMTL_DESC_MASK=0` | descriptor sets of framebuffer-fetch pipelines written in full again | (on by default) |
+| `NVMTL_SURFIN_ASYNC=0` | WindowServer waits for each CPU-drawn window's upload again | (on by default) |
+| `NVMTL_SURFIN_PAGE_CACHE=0` | a CPU-drawn window's pages are imported and released for every upload again (also turns `NVMTL_SURFIN_ASYNC` off) | (on by default) |
+| `NVMTL_SURFIN_ORDERED=0` | the upload no longer waits for earlier GPU reads of the window's texture | (on by default) |
 | `NVMTL_SURFIN_READER_SKIP=0` | turns the capture-frame upload skip off | (on by default) |
 | `NVMTL_PLANE_SEED=0` | turns the plane seed off | (on by default) |
 | `NVMTL_SURF_IMPORT_CACHE=0` | turns the import cache off | (on by default) |
-| `NVMTL_SURF_IMPORT_CACHE_MAX_MB=N` | the cache's size limit per surface (default 16; `0` = no limit) | `0` caches 4K surfaces too: level on an RTX 4090, up to 67 stalls per 15 s at 4K HiDPI on a GTX 1650 |
+| `NVMTL_SURF_IMPORT_CACHE_MAX_MB=N` | the cache's size limit per surface (default 64 with 8 GB of video memory or more, else 16; `0` = no limit) | without a limit, up to 67 stalls per 15 s at 4K HiDPI on a GTX 1650 |
 | `NVMTL_SURF_IMPORT_CACHE_IDLE_MS=N` | how long an import stays after its last wrap goes (default 2000) | 100 ms: no difference at 4K |
 | `NVMTL_SURFIN_UPLOAD=cpu` | turns off the GPU upload of CPU-drawn windows (WebKit, CoreGraphics apps) from their own pages; NullMoth took it from this fork in 2.5.1 and has it on by default | (on by default in NullMoth's plugin and in this one; level with it off on an RTX 4090 at 1080p 165 Hz) |
 | `NVMTL_TEX_POOL=1` | CoreAnimation's per-frame intermediate textures (blur, vibrancy) reuse released ones instead of new allocations | no measurable change |
