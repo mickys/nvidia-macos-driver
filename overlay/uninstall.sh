@@ -38,20 +38,24 @@ else                                  # backup from an older overlay: re-sign in
   codesign -f -s - --preserve-metadata=identifier "$B" 2>&1 | grep -v "replacing existing signature" || true
 fi
 codesign -v "$B" || die "the bundle signature does not verify"
-FB=/Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB; RESTART=0
-if [ -f "$BK/NVRMFB" ] && ! cmp -s "$BK/NVRMFB" "$FB"; then   # --resolution was installed: NullMoth's framebuffer back
-  install -o root -g wheel -m 755 "$BK/NVRMFB" "$FB"
+FB=/Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB; AC=/Library/Extensions/NVAccel.kext/Contents/MacOS/NVAccel; RESTART=0
+FBX=0; ACX=0
+{ [ -f "$BK/NVRMFB" ] && ! cmp -s "$BK/NVRMFB" "$FB"; } && FBX=1    # --resolution was installed: NullMoth's framebuffer back
+{ [ -f "$BK/NVAccel" ] && ! cmp -s "$BK/NVAccel" "$AC"; } && ACX=1  # --desktop with NVAccel: NullMoth's accelerator back
+if [ $FBX = 1 ] || [ $ACX = 1 ]; then
+  [ $FBX = 0 ] || install -o root -g wheel -m 755 "$BK/NVRMFB" "$FB"
+  [ $ACX = 0 ] || install -o root -g wheel -m 755 "$BK/NVAccel" "$AC"
   KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc; K=/System/Library/Kernels/kernel; KARG=(--allow-missing-kdk); [ -f "$K" ] && KARG+=(--kernel "$K")
-  echo "rebuilding the Auxiliary Kernel Collection with NullMoth's NVRMFB (about a minute)"
+  echo "rebuilding the Auxiliary Kernel Collection with NullMoth's kernel extensions (about a minute)"
   rm -f "$KC.mickys-new"
   kmutil create -n aux --volume-root / "${KARG[@]}" -B /System/Library/KernelCollections/BootKernelExtensions.kc \
     -S /System/Library/KernelCollections/SystemKernelExtensions.kc --repository /Library/Extensions -A "$KC.mickys-new" -z >/tmp/mickys-kmutil.log 2>&1 \
-    || { tail -20 /tmp/mickys-kmutil.log; die "kmutil failed; NullMoth's NVRMFB is on disk but not in the kernel collection (run NullMoth's install.sh again)"; }
+    || { tail -20 /tmp/mickys-kmutil.log; die "kmutil failed; NullMoth's NVRMFB / NVAccel are on disk but not in the kernel collection (run NullMoth's install.sh again)"; }
   INS=$(kmutil inspect -a x86_64 -A "$KC.mickys-new" 2>/dev/null || true)
   for k in NVRM NVAccel NVRMFB; do
     grep -oE 'com\.nullmoth\.[A-Za-z0-9]+' <<<"$INS" | grep -Fxq "com.nullmoth.$k" || { rm -f "$KC.mickys-new"; die "com.nullmoth.$k missing from the new kernel collection (run NullMoth's install.sh again)"; }
   done
   mv -f "$KC.mickys-new" "$KC"; RESTART=1
 fi
-if [ $RESTART = 1 ]; then echo "Restored the plugin, NVRMFB and nvrm610.conf from $BK, removed nvenc-run and nvfb-edid. Restart the Mac to load them."
+if [ $RESTART = 1 ]; then echo "Restored the plugin, NVRMFB / NVAccel and nvrm610.conf from $BK, removed nvenc-run and nvfb-edid. Restart the Mac to load them."
 else echo "Restored the plugin and nvrm610.conf from $BK, removed nvenc-run. Log out and back in (or restart) to load it."; fi
