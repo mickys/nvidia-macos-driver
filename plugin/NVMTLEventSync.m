@@ -190,8 +190,40 @@ static BOOL nvmtl_ws_publish_settled(NSArray *settled, NVMTLCommandBuffer *cb) {
 // (nvmtl_surface_register_writes): a record stamped before the move matched nothing, every frame's read of the surface
 // still in flight took the CPU path (page-off, wait, 8 MB upload) on the compositor's thread, and a 144 Hz desktop ran
 // at 90 frames a second.
+// GPU copy-out (on by default, NVMTL_GPU_COPYOUT=0 off): planes of two-plane IOSurfaces drawn through private images
+// (WindowServer's NV12 capture surfaces) go into the surface's pages on the GPU at the end of this command buffer, and
+// the last part becomes a writer of the surface, so its publication waits for the copy. Their publication then skips the
+// readback + CPU copy, and with schedule-after-publish (NVMTL_SCHEDULE_AFTER_SURFACE_WRITES) WindowServer's wait at the
+// capture commit shrinks to the GPU's own time.
+static int nvmtl_gpu_copyout_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("NVMTL_GPU_COPYOUT"); on = !(e && e[0] == '0');
+        nvlog("GPU copy-out %s (NVMTL_GPU_COPYOUT=%s)", on ? "on" : "off", e ?: "unset"); }
+    return on;
+}
+static void nvmtl_ws_gpu_copyout(NVMTLCommandBuffer *cb) {
+    NVMTLSubmissionPart *last = nil;
+    for (NVMTLSubmissionPart *part in cb->_parts)
+        if ([part isKindOfClass:[NVMTLSubmissionPart class]] && part->commands.cb) last = part;
+    if (!last) return;
+    NSMutableSet *seen = nil;
+    for (NVMTLSubmissionPart *part in [cb->_parts copy]) {
+        if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        for (NVMTLTexture *t in [part->surfaces copy]) {
+            NVMTLTexture *r = t->_parent ? t->_parent : t;
+            if (!r->_surf || r->_vramOn || IOSurfaceGetPlaneCount(r->_surf) < 2) continue;
+            if (!seen) seen = [NSMutableSet new];
+            if ([seen containsObject:r]) continue;
+            [seen addObject:r];
+            if (nvmtl_vk_record_plane_to_surface(&last->commands, &r->_i, (void *)r->_surf, (uint32_t)r->_plane)) continue;
+            if (![last->surfaces containsObject:t]) last->surfaces = [last->surfaces setByAddingObject:t];
+            __atomic_add_fetch(&r->_gpuOutPending, 1, __ATOMIC_ACQ_REL);
+            static unsigned n; if (n++ < 4 || n % 5000 == 0) nvlog("GPU copy-out: surface %u plane %lu %ux%u (#%u)", (unsigned)IOSurfaceGetID(r->_surf), (unsigned long)r->_plane, r->_i.w, r->_i.h, n);
+        }
+    }
+}
 static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
     if (!nvmtl_ws_kernel_waits()) return;
+    if (nvmtl_gpu_copyout_on()) nvmtl_ws_gpu_copyout(cb);
     NSMutableSet *ids = nil;
     for (NVMTLSubmissionPart *part in cb->_parts) {
         if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
@@ -319,9 +351,22 @@ static int nvmtl_skip_empty_on(void) {
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
-    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
+    // A surface whose VRAM is shared is covered by the kernel (a CPU lock's page-off waits for the pending write); one we
+    // write through a private image is copied out only after the GPU has finished, and a CPU lock does not wait for that.
+    // WindowServer hands ScreenCaptureKit clients their frame once its command buffer is scheduled (Apple's IOSurfaceLock
+    // waits for the GPU): a capture client (Parsec's encoder, a screen recorder) read the two-plane NV12 capture surface
+    // before the copy-out, so it got the surface's previous frame, and now and then the new one when the copy-out won the
+    // race: frames out of order. Such a command buffer reports "scheduled" once its writes are published.
+    // NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=3 (default) does it only for two-plane surfaces written through private images (the
+    // NV12 surfaces WindowServer draws captured frames into, so it costs nothing without capture), =2 for every private one,
+    // =1 for every surface write, =0 for none.
+    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && *e ? e[0] - '0' : 3; }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
-    for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
+    for (NVMTLTexture *s in part->surfaces) {
+        if (s == drawable || !after) continue;
+        NVMTLTexture *r = s->_parent ? s->_parent : s;
+        if (after == 1 || (r->_surf && !r->_vramOn && (after != 3 || IOSurfaceGetPlaneCount(r->_surf) > 1))) _scheduleAfterPublish = YES;
+    }
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
     part->encoders = _nEnc - _nEncSealed; _nEncSealed = _nEnc;
     if (_g79Sig.count) { part->signals = [_g79Sig copy]; [_g79Sig removeAllObjects]; }
