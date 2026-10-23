@@ -1024,10 +1024,17 @@ static uint64_t nvmtl_ic_idle_ns(void)
     return v;
 }
 long nvmtl_ic_max_mb_override(void);   // nvmtl_vk.c: /tmp/nvmtl-ic-max-mb (diagnostic builds), -1 = none
+uint64_t nvmtl_vk_vram_heap_bytes(void);
+// The per-surface cap follows the card: 64 MB with 8 GB of VRAM or more (a 4K BGRA surface is 33 MB: over 16 MB it was
+// imported again for every texture made from it), 16 MB below (uncached big imports were the GTX 1650's 4 GB answer to ~100 ms
+// stalls at 4K HiDPI). NVMTL_SURF_IMPORT_CACHE_MAX_MB overrides either.
 static uint64_t nvmtl_ic_max_bytes(void)
 {
     static uint64_t v; static dispatch_once_t once;
-    dispatch_once(&once, ^{ v = nvmtl_ic_env("NVMTL_SURF_IMPORT_CACHE_MAX_MB", 16, 1ull << 20); });
+    dispatch_once(&once, ^{ const uint64_t vram = nvmtl_vk_vram_heap_bytes();
+        v = nvmtl_ic_env("NVMTL_SURF_IMPORT_CACHE_MAX_MB", vram >= (8ull << 30) ? 64 : 16, 1ull << 20);
+        nvlog("family VRAM import cache: surfaces up to %llu MB are kept (VRAM %llu MB; NVMTL_SURF_IMPORT_CACHE_MAX_MB overrides)",
+              (unsigned long long)(v >> 20), (unsigned long long)(vram >> 20)); });
     const long o = nvmtl_ic_max_mb_override();
     return o >= 0 ? (uint64_t)o << 20 : v;
 }
@@ -1065,6 +1072,29 @@ static void nvmtl_ic_trim(int all)
     os_unfair_lock_unlock(&g_ic_lock);
     for (int i = 0; i < n; i++) nvmtl_vk_buffer_destroy(&gone[i]);
 }
+// misses by surface size since the last statistics line (nvmtl_surfin_stat): which surfaces are new, or fell out of the table.
+// Distinct surface IDs per size tell new surfaces (many IDs) from evicted ones (few IDs, many misses).
+static struct { uint32_t w, h, n, ids, last; } g_icmiss[8];
+static os_unfair_lock g_icmiss_lock = OS_UNFAIR_LOCK_INIT;
+static void nvmtl_ic_miss_note(uint32_t w, uint32_t h, uint32_t sid)
+{
+    os_unfair_lock_lock(&g_icmiss_lock);
+    int k = 0;
+    while (k < 7 && g_icmiss[k].n && (g_icmiss[k].w != w || g_icmiss[k].h != h)) k++;
+    if (!g_icmiss[k].n && k < 7) { g_icmiss[k].w = w; g_icmiss[k].h = h; }
+    else if (g_icmiss[k].w != w || g_icmiss[k].h != h) { g_icmiss[k].w = g_icmiss[k].h = 0; }   // the 8th row: every other size
+    g_icmiss[k].n++; if (g_icmiss[k].last != sid) { g_icmiss[k].ids++; g_icmiss[k].last = sid; }
+    os_unfair_lock_unlock(&g_icmiss_lock);
+}
+static void nvmtl_ic_miss_dump(char *b, size_t cap)
+{
+    size_t o = 0; b[0] = 0;
+    os_unfair_lock_lock(&g_icmiss_lock);
+    for (int k = 0; k < 8 && o + 40 < cap; k++)
+        if (g_icmiss[k].n) o += (size_t)snprintf(b + o, cap - o, " %ux%u:%u/%uid", g_icmiss[k].w, g_icmiss[k].h, g_icmiss[k].n, g_icmiss[k].ids);
+    memset(g_icmiss, 0, sizeof g_icmiss);
+    os_unfair_lock_unlock(&g_icmiss_lock);
+}
 // the family VRAM of plane 0 of `surf` as a buffer, from the cache or a new import; 0 = ok (release with nvmtl_ic_put)
 static int nvmtl_ic_get(IOSurfaceRef surf, size_t need, nvk_buffer *out)
 {
@@ -1086,9 +1116,7 @@ static int nvmtl_ic_get(IOSurfaceRef surf, size_t need, nvk_buffer *out)
         return 0;
     }
     os_unfair_lock_unlock(&g_ic_lock);
-    { static _Atomic unsigned misslog; const unsigned k = atomic_fetch_add(&misslog, 1);   // which surfaces miss: new ones, or evicted?
-      if (k < 60 || k % 5000 == 0) nvlog("ic miss #%u: surface %u %zux%zu fmt %.4s, %zu B, use count %d", k, (unsigned)sid, IOSurfaceGetWidth(surf), IOSurfaceGetHeight(surf),
-                                          (const char *)&(uint32_t){ CFSwapInt32HostToBig(IOSurfaceGetPixelFormat(surf)) }, need, (int)IOSurfaceGetUseCount(surf)); }
+    nvmtl_ic_miss_note((uint32_t)IOSurfaceGetWidth(surf), (uint32_t)IOSurfaceGetHeight(surf), sid);
     if (nvmtl_vk_surface_vram(sid, 0, need, out)) return -1;
     static _Atomic uint64_t next = 1;
     const uint64_t cookie = ((uint64_t)getpid() << 32) | (atomic_fetch_add(&next, 1) & 0xffffffffu);

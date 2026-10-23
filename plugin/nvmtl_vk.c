@@ -1582,6 +1582,14 @@ uint64_t nvmtl_vk_vram_bytes(void)
         if ((g_memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && g_memp.memoryHeaps[i].size > best) best = g_memp.memoryHeaps[i].size;
     return best;
 }
+// the largest device-local heap: the card's VRAM (0 before the device is up)
+uint64_t nvmtl_vk_vram_heap_bytes(void)
+{
+    uint64_t best = 0;
+    for (uint32_t i = 0; i < g_memp.memoryHeapCount; i++)
+        if ((g_memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && g_memp.memoryHeaps[i].size > best) best = g_memp.memoryHeaps[i].size;
+    return best;
+}
 void nvmtl_vk_mem_split(uint64_t *vram, uint64_t *sys) { if (vram) *vram = g_vram_bytes; if (sys) *sys = g_sys_bytes; }
 static int nvmtl_vk_vram_budget(uint64_t *budget, uint64_t *used)
 {
@@ -6354,7 +6362,9 @@ static uint64_t nvmtl_asyncup_take(nvk_image *img);
 static void nvmtl_asyncup_finish(uint64_t token);
 // pins: deferred uploads still reading the entry's pages (it is neither freed nor replaced until they finish)
 typedef struct { const void *surf; void *base; size_t bytes; nvk_buffer buf; uint64_t used_ns; int pins; } nvmtl_sic;
-static nvmtl_sic g_sic[16];
+#define NVMTL_SIC_N 64   /* a capture keeps more surfaces in play than the window alone (16 thrashed with Parsec) */
+#define NVMTL_SIC_BYTES (512ull << 20)
+static nvmtl_sic g_sic[NVMTL_SIC_N];
 static pthread_mutex_t g_sic_mx = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic unsigned long long g_sic_made, g_sic_hit, g_sic_full, g_ss_defer;
 // the slot of the cached import of (surf, base, bytes), or -1 (every slot pinned, or the import failed)
@@ -6362,7 +6372,7 @@ static int nvmtl_sic_get(const void *surf, void *base, size_t bytes)   /* g_sic_
 {
     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     int slot = -1, old = -1;
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < NVMTL_SIC_N; i++) {
         nvmtl_sic *e = &g_sic[i];
         if (e->surf == surf && e->base == base && e->bytes == bytes && e->buf.buf) { e->used_ns = now; g_sic_hit++; return i; }
         if (e->surf && !e->pins && now - e->used_ns > 2000000000ull) { nvmtl_vk_buffer_destroy(&e->buf); CFRelease((CFTypeRef)e->surf); memset(e, 0, sizeof *e); }
@@ -6372,6 +6382,16 @@ static int nvmtl_sic_get(const void *surf, void *base, size_t bytes)   /* g_sic_
     if (slot < 0) {
         if (old < 0) { g_sic_full++; return -1; }
         slot = old; nvmtl_vk_buffer_destroy(&g_sic[slot].buf); CFRelease((CFTypeRef)g_sic[slot].surf); memset(&g_sic[slot], 0, sizeof g_sic[slot]);
+    }
+    // the imports keep their pages wired: at most NVMTL_SIC_BYTES of them, the least recently used unpinned ones go first
+    for (;;) {
+        size_t held = 0; int lru = -1;
+        for (int i = 0; i < NVMTL_SIC_N; i++) if (g_sic[i].surf) {
+            held += g_sic[i].bytes;
+            if (!g_sic[i].pins && (lru < 0 || g_sic[i].used_ns < g_sic[lru].used_ns)) lru = i;
+        }
+        if (held + bytes <= NVMTL_SIC_BYTES || lru < 0) break;
+        nvmtl_vk_buffer_destroy(&g_sic[lru].buf); CFRelease((CFTypeRef)g_sic[lru].surf); memset(&g_sic[lru], 0, sizeof g_sic[lru]);
     }
     nvmtl_sic *e = &g_sic[slot];
     if (nvmtl_vk_buffer_import_host(base, bytes, &e->buf)) { memset(e, 0, sizeof *e); return -1; }
@@ -6394,15 +6414,16 @@ void nvmtl_surfin_stat(int host, uint64_t ns)
                                         __atomic_load_n(&g_e78c[E78C_SETNEW], __ATOMIC_RELAXED), __atomic_load_n(&g_e78c[E78C_SETREUSE], __ATOMIC_RELAXED),
                                         __atomic_load_n(&g_e78c[E78C_WRITES], __ATOMIC_RELAXED), g_desc_copies, g_desc_allmask };
     unsigned long long d[9]; for (int k = 0; k < 9; k++) { d[k] = cur[k] - last[k]; last[k] = cur[k]; }
+    char miss[360]; nvmtl_ic_miss_dump(miss, sizeof miss);
     const char *td = getenv("TMPDIR"); char path[512];
     snprintf(path, sizeof path, "%s/nvmtl-surfstat-%d.log", (td && *td) ? td : "/private/tmp", (int)getpid());
     FILE *f = fopen(path, "a"); if (!f) return;
     fprintf(f, "  shared VRAM surface-in: %llu copies, %.2f ms, host %llu cpu %llu, imports %llu, cache hits %llu, deferred %llu, full %llu,"
                " cache %d barrier %d async %d nocopy %d icmax %ld | vram import cache: %llu imports %llu hits %llu stale %llu over-cap"
-               " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies mask %d\n",
+               " | descriptor sets: %llu new %llu reused %llu writes %llu unmasked %llu copies mask %d | ic misses by size:%s\n",
             n, t / 1e6, h, c, (unsigned long long)g_sic_made, (unsigned long long)g_sic_hit, (unsigned long long)g_ss_defer, (unsigned long long)g_sic_full,
             nvmtl_surfin_cache_on(), nvmtl_surfin_barrier_on(), nvmtl_surfin_async_on(), nvmtl_desc_nocopy_on(), nvmtl_ic_max_mb_override(),
-            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], nvmtl_desc_mask_on());
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[8], d[7], nvmtl_desc_mask_on(), miss);
     fclose(f);
 }
 
