@@ -2,8 +2,11 @@
 # Install the mickys overlay on top of NullMoth's NVIDIA driver: adds the open-source encoder libnvencvt.dylib next to
 # NullMoth's Metal plugin in /Library/GPUBundles/NVMTLDriver.bundle, which loads it by itself since 2.3.7
 # (NVMTL_NVENCVT in nvrm610.conf). NullMoth's files stay as they are.
-#   sudo ./install.sh [--desktop] [--resolution] [--event-wait] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--cli-wrappers] [--cli-aliases] [--no-decoders]
-#     --desktop      also replace the plugin binary with this fork's build (CPU-drawn windows uploaded by the GPU)
+#   sudo ./install.sh [--desktop] [--resolution] [--event-wait] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--no-accel] [--cli-wrappers] [--cli-aliases] [--no-decoders]
+#     --desktop      also replace the plugin binary with this fork's build (CPU-drawn windows uploaded by the GPU), and the
+#                    accelerator kext's binary (NVAccel) with this fork's build: a page-off waits for the GPU without the
+#                    accelerator lock, which lets two-plane capture surfaces share video memory (NVMTL_SURF_MULTIPLANE=1); restart
+#     --no-accel     with --desktop: keep NullMoth's NVAccel (and capture surfaces in private copies)
 #     --event-wait   apps wait for GPU work with an event instead of polling (NVRM_EVENT_WAIT=1 in nvrm610.conf): less CPU,
 #                    slightly more latency in synchronous work; WindowServer already waits this way
 #     --resolution   also replace the framebuffer kext's binary (NVRMFB) with this fork's build: desktop sizes below the
@@ -22,10 +25,11 @@
 # Undo: sudo ./uninstall.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-NVENC=1; ALIASES=0; WRAPS=0; ENCONLY=1; NODEC=0; RES=0; EVW=0
+NVENC=1; ALIASES=0; WRAPS=0; ENCONLY=1; NODEC=0; RES=0; EVW=0; ACCEL=-1
 for a in "$@"; do case $a in
   --desktop) ENCONLY=0 ;;
   --resolution) RES=1 ;;
+  --no-accel) ACCEL=0 ;;
   --event-wait) EVW=1 ;;
   --encoder-only) ENCONLY=1 ;;   # the default since 2.3.7-2; kept so older instructions still work
   --nvenc=*) NVENC=${a#--nvenc=} ;;
@@ -35,6 +39,7 @@ for a in "$@"; do case $a in
   *) echo "unknown option $a"; exit 2 ;;
 esac; done
 die() { echo "STOP: $*" >&2; exit 1; }
+[ $ACCEL = 0 ] || ACCEL=$(( ENCONLY == 0 ))   # with --desktop unless --no-accel
 ok() { echo "   ok  $*"; }
 [ "$(id -u)" = 0 ] || die "run with sudo"
 case $NVENC in off|1) ;; *) [[ $NVENC =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] || die "--nvenc: process names separated by commas, 1 or off" ;; esac
@@ -45,7 +50,7 @@ case $NVENC in off|1) ;; *) [[ $NVENC =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]]
 OV=$(cat "$HERE/VERSION")
 B=/Library/GPUBundles/NVMTLDriver.bundle; X=$B/Contents/MacOS; C=/Library/GPUBundles/nvmtl/nvrm610.conf
 CR=$B/Contents/_CodeSignature/CodeResources
-FB=/Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB; SMALL=/Library/NullMoth/nvfb-small; EDT=/usr/local/bin/nvfb-edid
+FB=/Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB; AC=/Library/Extensions/NVAccel.kext/Contents/MacOS/NVAccel; AMARK='# mickys overlay --desktop accel'; SMALL=/Library/NullMoth/nvfb-small; EDT=/usr/local/bin/nvfb-edid
 RUN=/usr/local/bin/nvenc-run; SH=/usr/local/share/mickys-overlay; VC=/usr/local/etc/nvencvt.conf; VMARK='# mickys overlay --no-decoders'; RC="/etc/zshrc /etc/bashrc"; MARK='# mickys overlay --cli-aliases'
 WRC="/etc/zshenv /etc/zshrc /etc/bashrc"; WMARK='# mickys overlay --cli-wrappers'; WBIN=/usr/local/share/mickys-overlay/bin
 WTOOLS="ffmpeg ffprobe ffplay HandBrakeCLI avconvert"
@@ -104,6 +109,13 @@ if [ ! -f "$BK/NVRMFB" ]; then
   cp -p "$FB" "$BK/NVRMFB" || die "backup to $BK failed"
   ok "NullMoth's NVRMFB added to the backup"
 fi
+# and NullMoth's accelerator binary (backups made before 2.5.3-mickys.8 have none; the one on disk is NullMoth's unless it is this
+# package's)
+if [ ! -f "$BK/NVAccel" ]; then
+  cmp -s "$AC" "$HERE/payload/NVAccel" && die "$AC is this overlay's build but the backup has no NullMoth NVAccel; reinstall NullMoth $HAVE"
+  cp -p "$AC" "$BK/NVAccel" || die "backup to $BK failed"
+  ok "NullMoth's NVAccel added to the backup"
+fi
 
 echo "== 3. install"
 if [ $ENCONLY = 1 ]; then
@@ -141,7 +153,7 @@ auxkc() {
   done
   mv -f "$NEW" "$KC"
 }
-FBWAS=$(shasum -a 256 "$FB" | cut -d' ' -f1)
+FBWAS=$(shasum -a 256 "$FB" | cut -d' ' -f1); ACWAS=$(shasum -a 256 "$AC" | cut -d' ' -f1)
 if [ $RES = 1 ]; then
   install -o root -g wheel -m 755 "$HERE/payload/NVRMFB" "$FB"
   : > "$SMALL"; chown root:wheel "$SMALL"; chmod 644 "$SMALL"
@@ -152,24 +164,31 @@ else
   install -o root -g wheel -m 755 "$BK/NVRMFB" "$FB"
   rm -f "$SMALL"; [ ! -e "$EDT" ] || rm -f "$EDT"
 fi
+if [ $ACCEL = 1 ]; then install -o root -g wheel -m 755 "$HERE/payload/NVAccel" "$AC"; xattr -d com.apple.quarantine "$AC" 2>/dev/null || true
+else install -o root -g wheel -m 755 "$BK/NVAccel" "$AC"; fi
 FBCHANGED=0
-if [ "$(shasum -a 256 "$FB" | cut -d' ' -f1)" != "$FBWAS" ]; then
+if [ "$(shasum -a 256 "$FB" | cut -d' ' -f1)" != "$FBWAS" ] || [ "$(shasum -a 256 "$AC" | cut -d' ' -f1)" != "$ACWAS" ]; then
   echo "   ..  rebuilding the Auxiliary Kernel Collection (about a minute)"
-  auxkc || { install -o root -g wheel -m 755 "$BK/NVRMFB" "$FB"; rm -f "$SMALL" "$EDT"; die "kmutil could not build the kernel collection; NullMoth's NVRMFB put back"; }
+  auxkc || { install -o root -g wheel -m 755 "$BK/NVRMFB" "$FB"; install -o root -g wheel -m 755 "$BK/NVAccel" "$AC"; rm -f "$SMALL" "$EDT"
+             die "kmutil could not build the kernel collection; NullMoth's NVRMFB and NVAccel put back"; }
   FBCHANGED=1
 fi
 if [ $RES = 1 ]; then ok "NVRMFB from this fork (smaller desktop sizes; EDID overrides: nvfb-edid list / sudo nvfb-edid add 1920x1080@144)$([ $FBCHANGED = 1 ] && echo ", kernel collection rebuilt")"
 else ok "NullMoth's NVRMFB$([ $FBCHANGED = 1 ] && echo " put back, kernel collection rebuilt")"; fi
+if [ $ACCEL = 1 ]; then ok "NVAccel from this fork (a page-off waits for the GPU without the accelerator lock; sysctl debug.nvaccel_pageoff_unlocked_wait)"
+else ok "NullMoth's NVAccel"; fi
 
 echo "== 4. settings (nvrm610.conf)"
 EMARK='# mickys overlay --event-wait'
-awk -v m="$EMARK" 'skip { skip = 0; next } index($0, m) == 1 { skip = 1; next } { print }' "$C" | grep -v -E '^NVMTL_NVENCVT=|^# mickys overlay' > "$C.new" || true
-PARTS=encoder; [ "$NVENC" != off ] || PARTS=; [ $ENCONLY = 1 ] || PARTS="$PARTS desktop"; [ $RES = 0 ] || PARTS="$PARTS resolution"; [ $EVW = 0 ] || PARTS="$PARTS event-wait"
+awk -v m="$EMARK" -v a="$AMARK" 'skip { skip = 0; next } index($0, m) == 1 || index($0, a) == 1 { skip = 1; next } { print }' "$C" | grep -v -E '^NVMTL_NVENCVT=|^# mickys overlay' > "$C.new" || true
+PARTS=encoder; [ "$NVENC" != off ] || PARTS=; [ $ENCONLY = 1 ] || PARTS="$PARTS desktop"; [ $ACCEL = 0 ] || PARTS="$PARTS accel"; [ $RES = 0 ] || PARTS="$PARTS resolution"; [ $EVW = 0 ] || PARTS="$PARTS event-wait"
 printf '# mickys overlay %s: %s (uninstall.sh puts the original file back)\n' "$OV" "${PARTS# }" >> "$C.new"
 [ "$NVENC" = off ] || printf 'NVMTL_NVENCVT=%s\n' "$NVENC" >> "$C.new"
 [ $EVW = 0 ] || printf '%s (uninstall.sh removes this line and the next)\nNVRM_EVENT_WAIT=1\n' "$EMARK" >> "$C.new"
+# with this fork's NVAccel, two-plane (NV12) capture surfaces share video memory: a reader's lock waits for the GPU in the kernel
+[ $ACCEL = 0 ] || printf '%s (uninstall.sh removes this line and the next)\nNVMTL_SURF_MULTIPLANE=1\n' "$AMARK" >> "$C.new"
 chown root:wheel "$C.new"; chmod 644 "$C.new"; mv "$C.new" "$C"
-ok "NVMTL_NVENCVT=${NVENC/off/(not set)}$([ $EVW = 1 ] && echo ", NVRM_EVENT_WAIT=1 (--event-wait)")"
+ok "NVMTL_NVENCVT=${NVENC/off/(not set)}$([ $EVW = 1 ] && echo ", NVRM_EVENT_WAIT=1 (--event-wait)")$([ $ACCEL = 1 ] && echo ", NVMTL_SURF_MULTIPLANE=1 (--desktop with NVAccel)")"
 
 echo "== 5. command-line tools"
 for f in $RC $WRC; do   # drop earlier --cli-aliases / --cli-wrappers hooks; rewrite in place to keep the file's owner and mode
@@ -222,7 +241,7 @@ else ok "hardware decoders on (H.264, HEVC, VP9, AV1, MPEG-1/2, MPEG-4 Part 2; -
 
 echo
 WHAT="the encoders and decoders"; [ $NODEC = 0 ] || WHAT="the encoders"
-if [ $FBCHANGED = 1 ]; then echo "Done. Restart the Mac to load the $([ $RES = 1 ] && echo "new framebuffer (then pick a size in System Settings > Displays)" || echo "NullMoth framebuffer again")."
+if [ $FBCHANGED = 1 ]; then echo "Done. Restart the Mac to load the new kernel extensions$([ $RES = 1 ] && echo " (then pick a size in System Settings > Displays)")."
 elif [ $ENCONLY = 1 ]; then echo "Done. Apps you open from now on get $WHAT (quit and reopen running ones)."
 else echo "Done. Log out and back in (or restart) so WindowServer and running apps load the new plugin."; fi
 [ "$NVENC" = off ] || [ $WRAPS = 1 ] || echo "Command-line tools (ffmpeg, HandBrakeCLI, avconvert) see the encoders, and the decoders from the first frame, only through nvenc-run:   nvenc-run ffmpeg ...   (sudo ./install.sh --cli-wrappers does that for you)"
