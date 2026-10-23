@@ -6325,12 +6325,11 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
 // The caller holds the surface lock across the call, and the import is released before it returns.
 // Non-zero when the pages cannot be imported (block-compressed format, base or length not a multiple of the import
 // alignment, no host import on this device); the caller then uses nvmtl_vk_image_write.
-// Capture-cost changes to the GPU upload of CPU-drawn windows (#296) and to descriptor sets (2.5.3-mickys.4). On by default:
-// NVMTL_DESC_MASK, NVMTL_SURFIN_ORDERED (`=0` off; diagnostic builds: /tmp/nvmtl-<x>-off turns one off live). Off by default:
-// NVMTL_SURFIN_PAGE_CACHE (and with it NVMTL_SURFIN_ASYNC), `=1` on (diagnostic builds: /tmp/nvmtl-surfin-cache turns it on
-// live): with it, WindowServer stalled ~1 s now and then (an upload of ~1000 ms, about one per minute with Parsec streaming a
-// full-screen Metal app), most likely the pages it keeps wired meeting an unmap of the surface. Release builds ignore
-// /tmp/nvmtl-* files. RTX 4090, Safari animating full screen, the published 2.5.3-mickys.3 vs all of them on: 1080p 165 Hz 67
+// Capture-cost changes to the GPU upload of CPU-drawn windows (#296) and to descriptor sets. On by default, each `=0` off
+// (diagnostic builds: /tmp/nvmtl-<x>-off turns one off live; release builds ignore /tmp/nvmtl-* files): NVMTL_DESC_MASK,
+// NVMTL_SURFIN_ORDERED (2.5.3-mickys.4), NVMTL_SURFIN_PAGE_CACHE and NVMTL_SURFIN_ASYNC (2.5.3-mickys.5; off in .4 after ~1 s
+// WindowServer stalls: a deferred upload finished long after its submit waited out nvmtl_keep_verdict's 1000 ms - fixed there
+// and by nvmtl_surfin_reap; notes/plan-page-cache-stall.md). RTX 4090, Safari animating full screen, the published 2.5.3-mickys.3 vs all of them on: 1080p 165 Hz 67
 // -> 131-135 screen updates/s, Parsec 29 -> 47 fps; 4K 48-50 -> 60.
 //   NVMTL_SURFIN_PAGE_CACHE  keep each surface's page import between uploads instead of importing and releasing its pages
 //                            for every upload (the kernel wires and maps ~8100 pages per 4K upload, then undoes it)
@@ -6353,7 +6352,7 @@ static int nvmtl_capsw(const char *name, int def, const char *flip, int *env, ui
     if (*env < 0) { const char *e = getenv(name); *env = e && *e ? e[0] != '0' : def; nvlog("%s %s (%s=%s)", name, *env ? "on" : "off", name, e ? e : "unset"); }
     return def ? (*env && !nvmtl_vk_tmpsw(flip, next, tmp)) : (*env || nvmtl_vk_tmpsw(flip, next, tmp));
 }
-int nvmtl_surfin_cache_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_PAGE_CACHE", 0, "/tmp/nvmtl-surfin-cache", &e, &n, &o); }
+int nvmtl_surfin_cache_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_PAGE_CACHE", 1, "/tmp/nvmtl-surfin-cache-off", &e, &n, &o); }
 int nvmtl_surfin_barrier_on(void) { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ORDERED", 1, "/tmp/nvmtl-surfin-barrier-off", &e, &n, &o); }
 int nvmtl_surfin_async_on(void)   { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_SURFIN_ASYNC", 1, "/tmp/nvmtl-surfin-async-off", &e, &n, &o); }
 int nvmtl_desc_mask_on(void)      { static int e = -1, o; static uint64_t n; return nvmtl_capsw("NVMTL_DESC_MASK", 1, "/tmp/nvmtl-desc-mask-off", &e, &n, &o); }
