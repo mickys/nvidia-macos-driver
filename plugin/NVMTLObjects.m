@@ -85,6 +85,8 @@ __attribute__((constructor)) static void nvmtl_conf_knobs(void)
     { extern char **environ; char *names[256]; unsigned n = 0;
       for (char **e = environ; e && *e && n < 256; e++)
           if (!strncmp(*e, "NVMTL_", 6) || !strncmp(*e, "NVK_", 4) || !strncmp(*e, "NAK_", 4) || !strncmp(*e, "NVRM_", 5)) {
+              // Keep the switch that restores inline presents.
+              if (!strncmp(*e, "NVMTL_PRESENT_INLINE=", 21)) continue;
               const char *eq = strchr(*e, '='); if (!eq) continue;
               names[n] = strndup(*e, (size_t)(eq - *e)); if (names[n]) n++; }
       for (unsigned i = 0; i < n; i++) { unsetenv(names[i]); free(names[i]); } }
