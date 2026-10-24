@@ -21,7 +21,7 @@ decoders for these cards' NVENC and NVDEC ([mickys/nvenc](https://github.com/mic
 NullMoth's plugin has a hook for exactly this: with `NVMTL_NVENCVT` set in `nvrm610.conf` it loads `libnvencvt.dylib` from
 its own bundle (never into WindowServer, and only if the library and its folder are owned by root and not writable by
 group or others), and VideoToolbox picks it over the other codecs by rating (1100). It is available to every app that
-uses VideoToolbox and the Metal plugin (Parsec, OBS, AVFoundation apps that use Metal; not QuickTime Player's or Safari's video playback, which never load the plugin and keep Apple's decoders), and to command-line tools through `nvenc-run`
+uses VideoToolbox (Parsec, OBS, QuickTime and other AVFoundation apps; not Safari's video playback, whose GPU process cannot load the plugin), and to command-line tools through `nvenc-run`
 (see below; the optional `--cli-wrappers` makes a plain `ffmpeg` use it, which ffmpeg also needs to decode from the first
 frame). It checks the GPU first and stays off on other cards (RTX 20 / 30 / 50 keep NullMoth's encoders).
 
