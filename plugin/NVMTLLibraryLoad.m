@@ -851,6 +851,8 @@ NSArray<NSString *> *nvmtl_externs_of_airs(NSDictionary<NSString *, NSString *> 
     }
 }
 
+static void nvmtl_fc_dump(const char *dd, NSString *ll, NSString *stage, const uint32_t *idx, const uint32_t *sizes,
+                          const uint8_t *const *payloads, size_t n, const char *e);
 NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, NSString *name, NSString **error) {
     if (!air || !ll || !stage || !nvmtl_xlate_ready()) { if(error)*error=@"missing entry or translator"; return nil; }
     if (air.length >= 20 && *(const uint32_t *)air.bytes == 0x07230203u) return air;
@@ -863,7 +865,10 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
         else {
             gSpvMiss++;
             if (xlate(ll.UTF8String, stage.UTF8String, &spv, &spvn, err, sizeof err) != 0) {
-                nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err); if (error) *error = @(err); return nil;
+                nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err);
+                // NVMTL_XLATE_FAIL_DUMP=<dir>: keep the refused module (AIR text + stage/name/error) to replay it offline.
+                nvmtl_fc_dump(getenv("NVMTL_XLATE_FAIL_DUMP"), ll, [stage stringByAppendingFormat:@"\nname %@", name], NULL, NULL, NULL, 0, err);
+                if (error) *error = @(err); return nil;
             }
             spvData = [NSData dataWithBytes:spv length:spvn];
             { NSError *werr = nil;
