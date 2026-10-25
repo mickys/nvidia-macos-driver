@@ -2825,6 +2825,9 @@ unsigned nvmtl_apps1_resolve_miss, nvmtl_apps1_resolve_extra, nvmtl_apps1_ds_res
 @interface NVMTLRenderCommandEncoder () { unsigned _groupDepth, _dumpDepth; NSString *_dumpName; BOOL _dumpPso; }
 - (void)nvmtlDumpBoundFragmentBuffers;
 @end
+#if !NVMTL_RELEASE
+@interface NVMTLRenderCommandEncoder () { @public __unsafe_unretained NVMTLTexture *_probeTex[4]; } @end
+#endif
 @implementation NVMTLRenderCommandEncoder
 - (NSUInteger)tileWidth { return 0; }
 - (NSUInteger)tileHeight { return 0; }
@@ -2934,7 +2937,54 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
     }
     return selected;
 }
+#if !NVMTL_RELEASE
+static float nvmtl_probe_half(uint16_t h) {
+    uint32_t e = (h >> 10) & 31, f = h & 1023; float v;
+    if (!e) v = f / 16777216.0f; else if (e == 31) v = f ? 0 : 65504; else v = (1024 + f) * ldexpf(1, (int)e - 25);
+    return (h & 0x8000) ? -v : v;
+}
+#endif
+#if !NVMTL_RELEASE
+// /tmp/nvmtl-probe2 (diagnostic builds): the next 24 draws after the file appears log their fragment shader and the
+// textures bound at fragment indices 0-3 with their bindless heap slots, and read those textures back once the command
+// buffer completes (mean of each channel, share of non-zero texels): is what the shader samples empty?
+static void nvmtl_probe_tex_read(unsigned n, unsigned k, NVMTLTexture *t) {
+    nvk_image *i = [t nvi]; unsigned bpp = i ? i->bpp : 0;
+    if (!i || !i->w || !i->h || (bpp != 1 && bpp != 4 && bpp != 8) || i->bw > 1) {
+        nvlog("PROBE2 #%u tex%u %ux%u fmt %lu bpp %u block %ux%u: not read", n, k, i ? i->w : 0, i ? i->h : 0, (unsigned long)t->_fmt, bpp, i ? i->bw : 0, i ? i->bh : 0); return; }
+    size_t row = (size_t)i->w * bpp; uint8_t *px = malloc(row * i->h); if (!px) return;
+    if (nvmtl_vk_image_read(t->_q, i, px, row)) { nvlog("PROBE2 #%u tex%u readback FAILED", n, k); free(px); return; }
+    double sum[4] = {0}; uint64_t nz = 0, cnt = (uint64_t)i->w * i->h; int ch = bpp == 1 ? 1 : 4;
+    for (uint64_t q = 0; q < cnt; q++) { float c[4] = {0};
+        for (int j = 0; j < ch; j++) c[j] = bpp == 8 ? nvmtl_probe_half(((uint16_t *)px)[q * 4 + j]) : px[q * ch + j] / 255.0f;
+        for (int j = 0; j < 4; j++) sum[j] += c[j];
+        if (c[0] || c[1] || c[2] || c[3]) nz++; }
+    free(px);
+    nvlog("PROBE2 #%u tex%u %p %ux%u fmt %lu: mean %.3f %.3f %.3f %.3f, %.1f%% non-zero", n, k, (__bridge void *)t, i->w, i->h, (unsigned long)t->_fmt,
+          sum[0] / cnt, sum[1] / cnt, sum[2] / cnt, sum[3] / cnt, 100.0 * nz / cnt);
+}
+- (void)nvmtlDrawProbe {
+    static uint64_t next; static int on; static _Atomic int budget, armed;
+    if (!nvmtl_tmp_switch("/tmp/nvmtl-probe2", &next, &on)) { armed = 0; return; }
+    if (!atomic_exchange(&armed, 1)) budget = 24;
+    if (atomic_fetch_sub(&budget, 1) <= 0) return;
+    static _Atomic unsigned seq; unsigned n = atomic_fetch_add(&seq, 1);
+    extern uint32_t nvmtl_bl_slot(void *);
+    char line[400]; int k = snprintf(line, sizeof line, "PROBE2 #%u draw fs %s target %ux%u:", n, _ps ? _ps->_fname.UTF8String : "-", _target ? [_target nvi]->w : 0, _target ? [_target nvi]->h : 0);
+    NVMTLTexture *tex[4];
+    for (int j = 0; j < 4; j++) { tex[j] = _probeTex[j];
+        if (tex[j] && k < (int)sizeof line - 60) k += snprintf(line + k, sizeof line - k, " t%d %ux%u fmt %lu slot %u", j, [tex[j] nvi]->w, [tex[j] nvi]->h,
+                                                              (unsigned long)tex[j]->_fmt, nvmtl_bl_slot([tex[j] nvsampleview])); }
+    nvlog("%s", line);
+    NSArray *keep = @[tex[0] ?: (id)NSNull.null, tex[1] ?: (id)NSNull.null, tex[2] ?: (id)NSNull.null, tex[3] ?: (id)NSNull.null];
+    [_cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        for (unsigned j = 0; j < 4; j++) if (keep[j] != NSNull.null) nvmtl_probe_tex_read(n, j, keep[j]); }];
+}
+#endif
 - (BOOL)nvmtlBindSamplerPipeline {
+#if !NVMTL_RELEASE
+    [self nvmtlDrawProbe];
+#endif
     if (!_ps) return NO;
     NVMTLRenderPipelineState *selected=_ps;
     if (_vertexSamplers.count || _fragmentSamplers.count) {
@@ -3266,6 +3316,9 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
     NVMTLTexture *nt = (NVMTLTexture *)t;
     if (!nt) { nvlog("setFragmentTexture: nil at index %lu", (unsigned long)i); return; }
+#if !NVMTL_RELEASE
+    if (i < 4) _probeTex[i] = nt;
+#endif
     nvmtl_retain_resource(_cb, nt);
     nvmtl_surface_cpu_dump(nt->_parent ? nt->_parent : nt);
     nvmtl_surface_in_for_cb(_cb, nt);
@@ -3417,11 +3470,6 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 // /tmp/nvmtl-probe (diagnostic builds): the next 48 render passes after the file appears read their colour target back
 // once their command buffer completes and log its size, format, mean of each channel and the share of non-zero texels,
 // to find the pass where a picture goes black. Re-armed by removing and re-creating the file.
-static float nvmtl_probe_half(uint16_t h) {
-    uint32_t e = (h >> 10) & 31, f = h & 1023; float v;
-    if (!e) v = f / 16777216.0f; else if (e == 31) v = f ? 0 : 65504; else v = (1024 + f) * ldexpf(1, (int)e - 25);
-    return (h & 0x8000) ? -v : v;
-}
 static void nvmtl_pass_probe(NVMTLCommandBuffer *cb, NVMTLTexture *t, NSString *pso, uint32_t load) {
     static uint64_t next; static int on; static _Atomic int budget, armed;
     if (!nvmtl_tmp_switch("/tmp/nvmtl-probe", &next, &on)) { armed = 0; return; }
