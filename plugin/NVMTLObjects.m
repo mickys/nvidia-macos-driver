@@ -2985,6 +2985,9 @@ static void nvmtl_probe_tex_read(unsigned n, unsigned k, NVMTLTexture *t) {
           [_cb addCompletedHandler:^(id<MTLCommandBuffer> done) { const float *g = vb->_b.map ? (const float *)((uint8_t *)vb->_b.map + off) : NULL;
               const float *c = (const float *)((uint8_t *)nvmtl_buf_cpu(vb) + off);
               nvlog("PROBE2 #%u vb0 after: cpu m1 %.4g %.4g %.4g %.4g, gpu m1 %.4g %.4g %.4g %.4g", n, c[16], c[21], c[28], c[29], g ? g[16] : -1, g ? g[21] : -1, g ? g[28] : -1, g ? g[29] : -1); }];
+          { const float *c = (const float *)((uint8_t *)nvmtl_buf_cpu(vb) + off); NSUInteger nf = MIN((NSUInteger)64, (vb->_b.size - off) / 4);
+            char d[1400]; int k = 0; for (NSUInteger q = 0; q < nf && k < (int)sizeof d - 16; q++) k += snprintf(d + k, sizeof d - k, "%s%.4g", q % 16 ? " " : " | ", c[q]);
+            nvlog("PROBE2 #%u vb0 full:%s", n, d); }
       } else nvlog("PROBE2 #%u vb0 none", n); }
     NSArray *keep = @[tex[0] ?: (id)NSNull.null, tex[1] ?: (id)NSNull.null, tex[2] ?: (id)NSNull.null, tex[3] ?: (id)NSNull.null];
     [_cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
