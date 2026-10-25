@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Tahoe + RTX 4090: game tests</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Steam games on macOS 26 + NVIDIA RTX 4090 (NullMoth driver, fork build)</h1>
+  <div id="summary">loading…</div>
+  <div class="note">fps = screen updates/s from the driver (all windows, incl. the Metal HUD overlay; capped at 165 Hz). The game's own frame rate is the FPS line of the Metal HUD visible top-right in the screenshots.</div>
+  <div class="note">Fix branch = the driver fixes a game needs, each a branch of <a href="https://github.com/mickys/nvidia-macos-driver">mickys/nvidia-macos-driver</a> based on NullMoth v2.5.4 (all of them together: <a href="https://github.com/mickys/nvidia-macos-driver/compare/4677905...games/all">games/all</a>); what each one fixes: <a href="https://github.com/mickys/nvidia-macos-driver/blob/dev/overlay/UPSTREAM-CANDIDATES-GAMES.md">UPSTREAM-CANDIDATES-GAMES.md</a>.</div>
+  <div class="controls">
+    <input id="q" type="search" placeholder="filter by name…">
+    <select id="st"><option value="">all statuses</option></select>
+    <label><input id="auto" type="checkbox" checked> auto-refresh (60 s)</label>
+  </div>
+</header>
+<main>
+  <table id="list">
+    <thead><tr><th>#</th><th>Game</th><th>Status</th><th>Menu fps</th><th>Game fps</th><th>CPU peak %</th><th>RAM peak MB</th><th>VRAM peak MB</th><th>Shots</th><th title="fork branches based on NullMoth v2.5.4 that this game needs">Fix branch</th><th>Notes</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <section id="perms"></section>
+</main>
+<div id="lightbox" hidden><img alt=""><div class="cap"></div></div>
+<script src="app.js"></script>
+</body>
+</html>
