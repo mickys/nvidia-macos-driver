@@ -94,6 +94,8 @@ __attribute__((constructor)) static void nvmtl_conf_knobs(void)
                   || !strncmp(*e, "NVMTL_UNIFORM_CBUF_STATS=", 25)) continue;
               // Keep the switch that restores inline presents.
               if (!strncmp(*e, "NVMTL_PRESENT_INLINE=", 21)) continue;
+              // Keep the translator failure dump directory (writes only on a refused translation).
+              if (!strncmp(*e, "NVMTL_XLATE_FAIL_DUMP=", 22)) continue;
               const char *eq = strchr(*e, '='); if (!eq) continue;
               names[n] = strndup(*e, (size_t)(eq - *e)); if (names[n]) n++; }
       for (unsigned i = 0; i < n; i++) { unsetenv(names[i]); free(names[i]); } }
@@ -4757,7 +4759,13 @@ static NSUInteger nvmtl_texture_slice_count(NVMTLTexture *t) {
     if (nvmtl_vk_cmd_copy_image_sub3(&_cb->_c, [s nvi], (uint32_t)sl + s->_baseLevel, (uint32_t)ss + s->_baseSlice, (uint32_t)so.x, (uint32_t)so.y, (uint32_t)so.z,
                                 [d nvi], (uint32_t)dl + d->_baseLevel, (uint32_t)ds + d->_baseSlice, (uint32_t)dof.x, (uint32_t)dof.y, (uint32_t)dof.z,
                                 (uint32_t)size.width, (uint32_t)size.height, (uint32_t)(size.depth ? size.depth : 1)))
-        nvlog("blit copyFromTexture: FAILED");
+        // the reason is logged by copy_image_sub, which a release build drops (no failure word in it): say what was asked
+        nvlog("blit copyFromTexture: FAILED (pf %lu %lux%lu type %lu samples %lu L%lu S%lu (%lu,%lu) -> pf %lu %lux%lu type %lu samples %lu L%lu S%lu (%lu,%lu), %lux%lux%lu)",
+              (unsigned long)s.pixelFormat, (unsigned long)s.width, (unsigned long)s.height, (unsigned long)s.textureType, (unsigned long)s.sampleCount,
+              (unsigned long)sl, (unsigned long)ss, (unsigned long)so.x, (unsigned long)so.y,
+              (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.textureType, (unsigned long)d.sampleCount,
+              (unsigned long)dl, (unsigned long)ds, (unsigned long)dof.x, (unsigned long)dof.y,
+              (unsigned long)size.width, (unsigned long)size.height, (unsigned long)size.depth);
     else if (overwrite) nvmtl_surface_overwrite_recorded(_cb, d);
 }
 - (void)sampleCountersInBuffer:(id)sb atSampleIndex:(NSUInteger)i withBarrier:(BOOL)b { nvmtl_sample_counter(_cb, sb, i, self, b); }
@@ -4851,7 +4859,10 @@ static NSUInteger nvmtl_texture_slice_count(NVMTLTexture *t) {
       for (NSUInteger zi = 0; zi < nz && !rc; zi++)
           rc = nvmtl_vk_cmd_copy_buffer_to_image_level_layer(&_cb->_c, &b->_b, so + zi * per, (uint32_t)row, [t nvi],
                                       (uint32_t)dof.x, (uint32_t)dof.y, (uint32_t)size.width, (uint32_t)size.height, (uint32_t)dl + t->_baseLevel, (uint32_t)(vol ? dof.z + zi : ds + t->_baseSlice));
-      if (rc) nvlog("blit copyFromBuffer:toTexture: FAILED (level %lu slice %lu)", (unsigned long)dl, (unsigned long)ds);
+      if (rc) nvlog("blit copyFromBuffer:toTexture: FAILED (level %lu slice %lu; pf %lu %lux%lu mips %lu; buffer %lu B off %lu row %lu img %lu; region (%lu,%lu) %lux%lux%lu)",
+                    (unsigned long)dl, (unsigned long)ds, (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height,
+                    (unsigned long)t.mipmapLevelCount, (unsigned long)b->_b.size, (unsigned long)so, (unsigned long)row, (unsigned long)img,
+                    (unsigned long)dof.x, (unsigned long)dof.y, (unsigned long)size.width, (unsigned long)size.height, (unsigned long)size.depth);
       else if (overwrite) nvmtl_surface_overwrite_recorded(_cb, t);
       { NVMTLTexture *r = t->_parent ?: t;
         if (dl + t->_baseLevel > 0) r->_mipsWritten = YES;
