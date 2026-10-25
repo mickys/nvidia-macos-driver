@@ -5191,10 +5191,6 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 - (void)popDebugGroup {}
 - (void)encodeSignalEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordSignal:e value:v]; }
 - (void)encodeWaitForEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordWait:e value:v]; }
-// -encodeWaitForEvent:value:timeout: (newer Metal) waits like the call above; the timeout (ms) only bounds a wait whose
-// signal never comes and is not honoured here. Hades issues it on every frame once -commandBuffer answers; the
-// forwarding stub dropped the wait.
-- (void)encodeWaitForEvent:(id<MTLEvent>)e value:(uint64_t)v timeout:(uint64_t)ms { (void)ms; [self nvmtlRecordWait:e value:v]; }
 // The display-pipe swap follows this call immediately in WindowServer. NVAccel
 // cannot order that swap after an NVK fence, so wait for the pixels to finish
 // before allowing the surface to become scanout. Other applications keep the
