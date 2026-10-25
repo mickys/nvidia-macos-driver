@@ -3648,6 +3648,28 @@ static void nvmtl_pass_probe(NVMTLCommandBuffer *cb, NVMTLTexture *t, NSString *
     if (nvmtl_vk_cmd_set_topology(&_cb->_c, (unsigned)type)) return;
     if ([self nvmtlVertexInputs]) return;
     nvtrace("  indexed count %lu u32 %d off %lu instances %lu baseVertex %ld", (unsigned long)count, it == MTLIndexTypeUInt32, (unsigned long)off, (unsigned long)instances, (long)baseVertex);
+#if !NVMTL_RELEASE
+    { static uint64_t next; static int on; static _Atomic int budget, armed;
+      if (!nvmtl_tmp_switch("/tmp/nvmtl-probe2", &next, &on)) armed = 0;
+      else { if (!atomic_exchange(&armed, 1)) budget = 24;
+        if (atomic_fetch_sub(&budget, 1) > 0) {
+          MTLVertexDescriptor *vd = _ps->_descriptor.vertexDescriptor;
+          for (int q = 0; q < 2 && (NSUInteger)q < count; q++) {
+              const uint8_t *ip = (const uint8_t *)nvmtl_buf_cpu(b) + off;
+              long idx = (it == MTLIndexTypeUInt32 ? ((const uint32_t *)ip)[q] : ((const uint16_t *)ip)[q]) + baseVertex;
+              char line[600]; int k = snprintf(line, sizeof line, "PROBE3 fs %s count %lu idx[%d]=%ld:", _ps->_fname.UTF8String ?: "-", (unsigned long)count, q, idx);
+              for (int a = 0; a < 6 && k < (int)sizeof line - 80; a++) {
+                  MTLVertexAttributeDescriptor *ad = vd.attributes[a]; if (ad.format == MTLVertexFormatInvalid) continue;
+                  NSUInteger bi = ad.bufferIndex; NVMTLBuffer *vb = bi < NVMTL_NBUFAT ? _vbufAt[bi] : nil; if (!vb) continue;
+                  NSUInteger st = vd.layouts[bi].stride; const uint8_t *p = (const uint8_t *)nvmtl_buf_cpu(vb) + _vbufOff[bi] + (NSUInteger)idx * st + ad.offset;
+                  if ((uint8_t *)p + 16 > (uint8_t *)nvmtl_buf_cpu(vb) + vb->_b.size) { k += snprintf(line + k, sizeof line - k, " a%d OUT", a); continue; }
+                  const float *f = (const float *)p;
+                  if (ad.format == MTLVertexFormatUChar4Normalized) k += snprintf(line + k, sizeof line - k, " a%d %u %u %u %u", a, p[0], p[1], p[2], p[3]);
+                  else k += snprintf(line + k, sizeof line - k, " a%d(f%lu) %.4g %.4g %.4g %.4g", a, (unsigned long)ad.format, f[0], f[1], f[2], f[3]);
+              }
+              nvlog("%s", line);
+          } } } }
+#endif
     nvmtl_vk_cmd_draw_indexed(&_cb->_c, &b->_b, off, (uint32_t)count, it == MTLIndexTypeUInt32,
                               (uint32_t)instances, (int32_t)baseVertex, (uint32_t)baseInstance);
 }
