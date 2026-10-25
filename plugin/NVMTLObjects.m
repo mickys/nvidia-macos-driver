@@ -2966,6 +2966,13 @@ static float nvmtl_probe_half(uint16_t h) {
 // buffer completes (mean of each channel, share of non-zero texels): is what the shader samples empty?
 static void nvmtl_probe_tex_read(unsigned n, unsigned k, NVMTLTexture *t) {
     nvk_image *i = [t nvi]; unsigned bpp = i ? i->bpp : 0;
+    if (i && i->w && i->h && i->bw > 1 && i->bh > 1 && bpp) {   // block-compressed: raw blocks, share of non-zero bytes
+        size_t bx = (i->w + i->bw - 1) / i->bw, by = (i->h + i->bh - 1) / i->bh, row = bx * bpp; uint8_t *px = malloc(row * by); if (!px) return;
+        int rc = nvmtl_vk_image_read(t->_q, i, px, row);
+        uint64_t nz = 0, tot = (uint64_t)row * by; for (uint64_t q = 0; q < tot; q++) nz += px[q] != 0;
+        char hx[100]; int hk = 0; for (int q = 0; q < 32 && q < (int)tot; q++) hk += snprintf(hx + hk, sizeof hx - hk, "%02x", px[q]);
+        nvlog("PROBE2 #%u tex%u %ux%u fmt %lu blocks %zux%zu x %u B: read rc %d, %.1f%% non-zero bytes, first %s", n, k, i->w, i->h, (unsigned long)t->_fmt, bx, by, bpp, rc, 100.0 * nz / (tot ? tot : 1), hx);
+        free(px); return; }
     if (!i || !i->w || !i->h || (bpp != 1 && bpp != 4 && bpp != 8) || i->bw > 1) {
         nvlog("PROBE2 #%u tex%u %ux%u fmt %lu bpp %u block %ux%u: not read", n, k, i ? i->w : 0, i ? i->h : 0, (unsigned long)t->_fmt, bpp, i ? i->bw : 0, i ? i->bh : 0); return; }
     size_t row = (size_t)i->w * bpp; uint8_t *px = malloc(row * i->h); if (!px) return;
