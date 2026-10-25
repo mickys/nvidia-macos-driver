@@ -2983,6 +2983,8 @@ static void nvmtl_probe_tex_read(unsigned n, unsigned k, NVMTLTexture *t) {
     static uint64_t next; static int on; static _Atomic int budget, armed;
     if (!nvmtl_tmp_switch("/tmp/nvmtl-probe2", &next, &on)) { armed = 0; return; }
     if (!atomic_exchange(&armed, 1)) budget = 24;
+    { static int w = -1; if (w < 0) { w = 0; FILE *f = fopen("/tmp/nvmtl-probe-w", "r"); if (f) { if (fscanf(f, "%d", &w) != 1) w = 0; fclose(f); } }
+      if (w > 0 && (!_probeTex[0] || [_probeTex[0] nvi]->w != (uint32_t)w)) return; }   // /tmp/nvmtl-probe-w: only draws whose texture 0 has this width
     if (atomic_fetch_sub(&budget, 1) <= 0) return;
     static _Atomic unsigned seq; unsigned n = atomic_fetch_add(&seq, 1);
     extern uint32_t nvmtl_bl_slot(void *);
