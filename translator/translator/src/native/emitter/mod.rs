@@ -67,6 +67,9 @@ pub(super) struct Emitter {
     vector_word_roots: HashMap<Word, VectorWordRoot>,
     vector_word_pointers: HashMap<String, VectorWordPointer>,
     local_pointer_fields: HashMap<LocalPointerField, TypedValue>,
+    /// pointers loaded from a local pointer field whose stored value is resolved after emission (the sidecar's
+    /// local_pointer_field_loads): a phi of such loads of one field is a load of that field too
+    unresolved_local_field_loads: HashMap<String, LocalPointerField>,
     pointer_forward_values: HashMap<String, TypedValue>,
     raw_memcpy_shadows: HashMap<String, Vec<(u64, Word)>>,
     imageblock_data_scratch: Option<(Word, LlType)>,
@@ -378,6 +381,7 @@ impl Emitter {
             vector_word_roots: HashMap::new(),
             vector_word_pointers: HashMap::new(),
             local_pointer_fields: HashMap::new(),
+            unresolved_local_field_loads: HashMap::new(),
             pointer_forward_values: HashMap::new(),
             raw_memcpy_shadows: HashMap::new(),
             imageblock_data_scratch: None,

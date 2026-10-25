@@ -96,6 +96,9 @@ static nvmtl_lower_mesh_fn xlate_lower_mesh;
 typedef int (*nvmtl_lower_mesh2_fn)(const char *, const char *, const char *, const char *, uint32_t, uint32_t,
     uint8_t **, size_t *, uint8_t **, size_t *, uint8_t **, size_t *, uint32_t *, char *, size_t);
 static nvmtl_lower_mesh2_fn xlate_lower_mesh2;
+typedef int (*nvmtl_promote_uniform_fn)(const uint8_t *, size_t, uint32_t, uint32_t,
+                                       uint8_t **, size_t *, uint32_t *, char *, size_t);
+static nvmtl_promote_uniform_fn xlate_promote_uniform;
 static char kNVMTLTableFns;
 
 static int nvmtl_xlate_ready(void) {
@@ -117,6 +120,7 @@ static int nvmtl_xlate_ready(void) {
         xlate_lower_ex = (nvmtl_lower_ex_fn)dlsym(h, "nvmtl_lower_buffer_addresses_ex");
         xlate_to_uniform = (nvmtl_to_uniform_fn)dlsym(h, "nvmtl_table_to_uniform");
         if (!xlate_to_uniform) nvlog("translate: no nvmtl_table_to_uniform in this translator - a module that address lowering refuses is refused outright while the table is Uniform");
+        xlate_promote_uniform = (nvmtl_promote_uniform_fn)dlsym(h, "nvmtl_promote_gl_uniform");
         xlate_free = (nvmtl_free_fn)dlsym(h, "nvmtl_translate_free");
         xlate_sampler = (nvmtl_sampler_fn)dlsym(h, "nvmtl_translate_samplers");
         xlate_tglen = (nvmtl_tglen_fn)dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
@@ -851,6 +855,8 @@ NSArray<NSString *> *nvmtl_externs_of_airs(NSDictionary<NSString *, NSString *> 
     }
 }
 
+static void nvmtl_fc_dump(const char *dd, NSString *ll, NSString *stage, const uint32_t *idx, const uint32_t *sizes,
+                          const uint8_t *const *payloads, size_t n, const char *e);
 NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, NSString *name, NSString **error) {
     if (!air || !ll || !stage || !nvmtl_xlate_ready()) { if(error)*error=@"missing entry or translator"; return nil; }
     if (air.length >= 20 && *(const uint32_t *)air.bytes == 0x07230203u) return air;
@@ -863,7 +869,10 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
         else {
             gSpvMiss++;
             if (xlate(ll.UTF8String, stage.UTF8String, &spv, &spvn, err, sizeof err) != 0) {
-                nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err); if (error) *error = @(err); return nil;
+                nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err);
+                // NVMTL_XLATE_FAIL_DUMP=<dir>: keep the refused module (AIR text + stage/name/error) to replay it offline.
+                nvmtl_fc_dump(getenv("NVMTL_XLATE_FAIL_DUMP"), ll, [stage stringByAppendingFormat:@"\nname %@", name], NULL, NULL, NULL, 0, err);
+                if (error) *error = @(err); return nil;
             }
             spvData = [NSData dataWithBytes:spv length:spvn];
             { NSError *werr = nil;
@@ -1482,6 +1491,7 @@ static void nvmtl_air_plain_struct(NSDictionary *nodes, NSString *node, NSIntege
         NSString *a = tok[i], *b = tok[i + 1], *c = tok[i + 2], *t = tok[i + 3], *n = tok[i + 4];
         if ([a hasPrefix:@"i32 "] && [b hasPrefix:@"i32 "] && [c hasPrefix:@"i32 "] && [t hasPrefix:@"!\""] && [n hasPrefix:@"!\""] && t.length > 3 && n.length > 3) {
             [ms addObject:@{ @"off": @([[a substringFromIndex:4] integerValue]), @"size": @([[b substringFromIndex:4] integerValue]),
+                             @"count": @([[c substringFromIndex:4] integerValue]),
                              @"type": [t substringWithRange:NSMakeRange(2, t.length - 3)], @"name": [n substringWithRange:NSMakeRange(2, n.length - 3)] }];
             i += 5;
         } else i++;
@@ -1540,6 +1550,40 @@ NSDictionary *nvmtl_air_names(NVMTLFunction *fn)
         nvlog("air names: %s — %lu argument(s), %lu struct member(s) named, %lu plain-struct member(s)", fname.UTF8String, (unsigned long)args.count, (unsigned long)members.count, (unsigned long)np);
         return fn->_airNames;
     }
+}
+
+static char kNVMTLGLUniformIndex;
+static uint32_t nvmtl_gl_uniform_index(id function)
+{
+    NVMTLFunction *fn = [function isKindOfClass:[NVMTLFunction class]] ? function : nil;
+    if (!fn) return UINT32_MAX;
+    NSNumber *inherited = objc_getAssociatedObject(fn, &kNVMTLGLUniformIndex);
+    if (inherited) return inherited.unsignedIntValue;
+    if (!fn->_air.length) return UINT32_MAX;
+    NSString *expected = [fn->_stage isEqualToString:@"vertex"] ? @"vs_uniform_buffer"
+        : [fn->_stage isEqualToString:@"fragment"] ? @"fs_uniform_buffer" : nil;
+    if (!expected) return UINT32_MAX;
+    NSDictionary *names = nvmtl_air_names(fn);
+    uint32_t found = UINT32_MAX;
+    for (NSString *key in names[@"args"]) {
+        if (![key hasPrefix:@"buffer:"] || ![names[@"args"][key] isEqual:expected]
+            || ![names[@"access"][key] isEqual:@"read"]) continue;
+        NSUInteger slot = [[key substringFromIndex:7] integerValue];
+        if (slot >= 32 || found != UINT32_MAX) return UINT32_MAX;
+        for (NSDictionary *binding in nvmtl_function_reflection(fn)[@"bindings"])
+            if ([binding[@"kind"] isEqual:@"Buffer"] && [binding[@"metal_index"] unsignedIntegerValue] == slot
+                && [binding[@"address_space"] isEqual:@2] && [binding[@"access"] isEqual:@"ReadOnly"])
+                found = (uint32_t)slot;
+    }
+    return found;
+}
+static void nvmtl_gl_uniform_inherit(id function, id source)
+{
+    // Sampler-specialized functions have SPIR-V but no AIR. Carry only the
+    // already checked GL slot, without changing their reflection/linking path.
+    uint32_t slot = nvmtl_gl_uniform_index(source);
+    if (function && slot < 32)
+        objc_setAssociatedObject(function, &kNVMTLGLUniformIndex, @(slot), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 NSUInteger nvmtl_air_max_tg(NVMTLFunction *fn)
