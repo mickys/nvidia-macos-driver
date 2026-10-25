@@ -775,6 +775,10 @@ static int nvmtl_pixfmt(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8)
     static MTLPixelFormat seen[32]; static int nseen;
     int dup = 0; for (int i = 0; i < nseen; i++) if (seen[i] == f) dup = 1;
     if (!dup) { if (nseen < 32) seen[nseen++] = f; nvlog("pixel format %lu is NOT carried by this driver yet (compressed / depth-stencil / packed YUV) — nil", (unsigned long)f); }
+#if !NVMTL_RELEASE
+    if (!dup) { NSArray *st = [NSThread callStackSymbols]; NSUInteger nst = MIN(st.count, (NSUInteger)14);
+        for (NSUInteger i = 1; i < nst; i++) nvlog("pixel format %lu caller %lu: %s", (unsigned long)f, (unsigned long)i, [st[i] UTF8String]); }
+#endif
     return -1;
 }
 int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8) { return nvmtl_pixfmt(f, vk, bpp, a8); }
