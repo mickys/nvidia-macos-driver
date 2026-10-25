@@ -3413,8 +3413,47 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     _visOffset = offset; _visPending = YES;
     [self nvmtlBeginVisibility];
 }
+#if !NVMTL_RELEASE
+// /tmp/nvmtl-probe (diagnostic builds): the next 48 render passes after the file appears read their colour target back
+// once their command buffer completes and log its size, format, mean of each channel and the share of non-zero texels,
+// to find the pass where a picture goes black. Re-armed by removing and re-creating the file.
+static float nvmtl_probe_half(uint16_t h) {
+    uint32_t e = (h >> 10) & 31, f = h & 1023; float v;
+    if (!e) v = f / 16777216.0f; else if (e == 31) v = f ? 0 : 65504; else v = (1024 + f) * ldexpf(1, (int)e - 25);
+    return (h & 0x8000) ? -v : v;
+}
+static void nvmtl_pass_probe(NVMTLCommandBuffer *cb, NVMTLTexture *t, NSString *pso, uint32_t load) {
+    static uint64_t next; static int on; static _Atomic int budget, armed;
+    if (!nvmtl_tmp_switch("/tmp/nvmtl-probe", &next, &on)) { armed = 0; return; }
+    if (!atomic_exchange(&armed, 1)) budget = 48;
+    if (!t || atomic_fetch_sub(&budget, 1) <= 0) return;
+    static _Atomic unsigned seq; unsigned n = atomic_fetch_add(&seq, 1);
+    NSString *lbl = [pso copy];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        nvk_image *i = [t nvi]; if (!i || !i->w || !i->h || (i->bpp != 4 && i->bpp != 8)) {
+            nvlog("PROBE #%u target %ux%u fmt %lu bpp %u: not read", n, i ? i->w : 0, i ? i->h : 0, (unsigned long)t->_fmt, i ? i->bpp : 0); return; }
+        size_t row = (size_t)i->w * i->bpp; uint8_t *px = malloc(row * i->h); if (!px) return;
+        if (nvmtl_vk_image_read(t->_q, i, px, row)) { nvlog("PROBE #%u readback FAILED", n); free(px); return; }
+        double sum[4] = {0}; uint64_t nz = 0, cnt = (uint64_t)i->w * i->h;
+        for (uint64_t k = 0; k < cnt; k++) {
+            float c[4];
+            if (i->bpp == 4) for (int j = 0; j < 4; j++) c[j] = px[k * 4 + j] / 255.0f;
+            else for (int j = 0; j < 4; j++) c[j] = nvmtl_probe_half(((uint16_t *)px)[k * 4 + j]);
+            for (int j = 0; j < 4; j++) sum[j] += c[j];
+            if (c[0] != 0 || c[1] != 0 || c[2] != 0) nz++;
+        }
+        free(px);
+        nvlog("PROBE #%u target %p %ux%u fmt %lu load %u pso '%s': mean %.3f %.3f %.3f %.3f, %.1f%% non-black",
+              n, (__bridge void *)t, i->w, i->h, (unsigned long)t->_fmt, load, lbl.UTF8String ?: "-",
+              sum[0] / cnt, sum[1] / cnt, sum[2] / cnt, sum[3] / cnt, 100.0 * nz / cnt);
+    }];
+}
+#endif
 - (void)endEncoding {
     _cb->_nEnd++;
+#if !NVMTL_RELEASE
+    nvmtl_pass_probe(_cb, _target, _ps.label, _load);
+#endif
     if (_dumpPso) { _dumpPso = NO; [self nvmtlDumpBoundFragmentBuffers]; }
     [self nvmtlCloseVisibility];
     if (_begun) nvmtl_vk_cmd_end_render(&_cb->_c);
