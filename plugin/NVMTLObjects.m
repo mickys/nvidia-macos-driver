@@ -3673,13 +3673,14 @@ static void nvmtl_pass_probe(NVMTLCommandBuffer *cb, NVMTLTexture *t, NSString *
     { static uint64_t next; static int on; static _Atomic int budget, armed;
       if (!nvmtl_tmp_switch("/tmp/nvmtl-probe2", &next, &on)) armed = 0;
       else { if (!atomic_exchange(&armed, 1)) budget = 24;
-        if (atomic_fetch_sub(&budget, 1) > 0) {
+        static int w = -1; if (w < 0) { w = 0; FILE *f = fopen("/tmp/nvmtl-probe-w", "r"); if (f) { if (fscanf(f, "%d", &w) != 1) w = 0; fclose(f); } }
+        if ((w <= 0 || (_probeTex[0] && [_probeTex[0] nvi]->w == (uint32_t)w)) && atomic_fetch_sub(&budget, 1) > 0) {
           MTLVertexDescriptor *vd = _ps->_descriptor.vertexDescriptor;
-          for (int q = 0; q < 2 && (NSUInteger)q < count; q++) {
+          for (int q = 0; q < 4 && (NSUInteger)q < count; q++) {
               const uint8_t *ip = (const uint8_t *)nvmtl_buf_cpu(b) + off;
               long idx = (it == MTLIndexTypeUInt32 ? ((const uint32_t *)ip)[q] : ((const uint16_t *)ip)[q]) + baseVertex;
               char line[600]; int k = snprintf(line, sizeof line, "PROBE3 fs %s count %lu idx[%d]=%ld:", _ps->_fname.UTF8String ?: "-", (unsigned long)count, q, idx);
-              for (int a = 0; a < 6 && k < (int)sizeof line - 80; a++) {
+              for (int a = 0; a < 8 && k < (int)sizeof line - 80; a++) {
                   MTLVertexAttributeDescriptor *ad = vd.attributes[a]; if (ad.format == MTLVertexFormatInvalid) continue;
                   NSUInteger bi = ad.bufferIndex; NVMTLBuffer *vb = bi < NVMTL_NBUFAT ? _vbufAt[bi] : nil; if (!vb) continue;
                   NSUInteger st = vd.layouts[bi].stride; const uint8_t *p = (const uint8_t *)nvmtl_buf_cpu(vb) + _vbufOff[bi] + (NSUInteger)idx * st + ad.offset;
