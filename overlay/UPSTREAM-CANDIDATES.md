@@ -1,5 +1,7 @@
 # Plugin changes in mickys/nvidia-macos-driver that may be worth taking upstream
 
+The driver fixes that games need are in a second report, [UPSTREAM-CANDIDATES-GAMES.md](UPSTREAM-CANDIDATES-GAMES.md) (one branch per fix, based on v2.5.4).
+
 Nine changes to `plugin/` (NVMTLDriver) carried in the fork's `dev` branch on top of v2.5.3, one change to NVAccel, plus one
 framebuffer feature.
 Each is behind its own switch, so it can be compared with the stock behaviour in the same build. Each group is also on its
