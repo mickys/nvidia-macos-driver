@@ -2976,6 +2976,16 @@ static void nvmtl_probe_tex_read(unsigned n, unsigned k, NVMTLTexture *t) {
         if (tex[j] && k < (int)sizeof line - 60) k += snprintf(line + k, sizeof line - k, " t%d %ux%u fmt %lu slot %u", j, [tex[j] nvi]->w, [tex[j] nvi]->h,
                                                               (unsigned long)tex[j]->_fmt, nvmtl_bl_slot([tex[j] nvsampleview])); }
     nvlog("%s", line);
+    { NVMTLBuffer *vb = _vbufAt[0]; NSUInteger off = _vbufOff[0];
+      if (vb) { const float *cpu = (const float *)((uint8_t *)nvmtl_buf_cpu(vb) + off), *gpu = vb->_b.map ? (const float *)((uint8_t *)vb->_b.map + off) : NULL;
+          nvlog("PROBE2 #%u vb0 %p len %zu off %lu mode %lu shadow %d: cpu m0 %.4g %.4g %.4g %.4g | m1 %.4g %.4g %.4g %.4g %.4g %.4g %.4g %.4g; gpu m1 %.4g %.4g %.4g %.4g",
+                n, (__bridge void *)vb, vb->_b.size, (unsigned long)off, (unsigned long)vb.storageMode, vb->_shadow.map != NULL,
+                cpu[0], cpu[5], cpu[10], cpu[15], cpu[16], cpu[17], cpu[20], cpu[21], cpu[28], cpu[29], cpu[30], cpu[31],
+                gpu ? gpu[16] : -1, gpu ? gpu[21] : -1, gpu ? gpu[28] : -1, gpu ? gpu[29] : -1);
+          [_cb addCompletedHandler:^(id<MTLCommandBuffer> done) { const float *g = vb->_b.map ? (const float *)((uint8_t *)vb->_b.map + off) : NULL;
+              const float *c = (const float *)((uint8_t *)nvmtl_buf_cpu(vb) + off);
+              nvlog("PROBE2 #%u vb0 after: cpu m1 %.4g %.4g %.4g %.4g, gpu m1 %.4g %.4g %.4g %.4g", n, c[16], c[21], c[28], c[29], g ? g[16] : -1, g ? g[21] : -1, g ? g[28] : -1, g ? g[29] : -1); }];
+      } else nvlog("PROBE2 #%u vb0 none", n); }
     NSArray *keep = @[tex[0] ?: (id)NSNull.null, tex[1] ?: (id)NSNull.null, tex[2] ?: (id)NSNull.null, tex[3] ?: (id)NSNull.null];
     [_cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         for (unsigned j = 0; j < 4; j++) if (keep[j] != NSNull.null) nvmtl_probe_tex_read(n, j, keep[j]); }];
