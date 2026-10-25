@@ -8,9 +8,10 @@ supported by NullMoth. Report problems with it at
 
 By default it replaces nothing: NullMoth's plugin loads `libnvencvt.dylib` by itself since 2.3.7, so the overlay adds the
 library next to it, one line in `nvrm610.conf` and `/usr/local/bin/nvenc-run`. With `--desktop` it also replaces the Metal
-plugin binary (`NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver`) with this fork's build, and with `--resolution` the
-framebuffer kernel extension's binary (`NVRMFB.kext/Contents/MacOS/NVRMFB`). Either, both or neither; NVRM, NVAccel,
-the firmware and everything else always stay NullMoth's.
+plugin binary (`NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver`), the shader translator next to it
+(`libnvmtl_translate.dylib`, since 2.5.4-mickys.1) and the accelerator kernel extension's binary (NVAccel) with this fork's
+builds, and with `--resolution` the framebuffer kernel extension's binary (`NVRMFB.kext/Contents/MacOS/NVRMFB`). Either,
+both or neither; NVRM, the firmware and everything else always stay NullMoth's.
 
 ## What it changes
 
@@ -38,7 +39,16 @@ HEVC (P only) encoders and every decoder but AV1; VP9 from 65x65 up.
   streams. 4K: H.264 about 210 fps (NullMoth's decoder: 40, Apple's software decoder: 24), HEVC about 350, VP9 340, AV1
   380 (the only hardware VP9 and AV1 decoding on an Intel Mac). `--no-decoders` keeps only the encoders.
 
-**Optional, `--desktop`: this fork's Metal plugin.** It is NullMoth 2.5.2's plugin with this fork's changes added one by
+**Optional, `--desktop`: the fixes games need.** 70 Intel-Mac Steam games were tested on macOS 26.7.1 with an RTX 4090
+(results, ten screenshots and fps per game: [mickys.github.io/nvidia-macos-driver](https://mickys.github.io/nvidia-macos-driver/)).
+13 needed a driver fix: Apple GL's private ARGB8 pixel format (Homeworld: Deserts of Kharak, Master of Orion, Endless Legend),
+array members of uniform structs in the reflection (Hades, Graveyard Keeper), and shader translator fixes (Hades, Darkest
+Dungeon II, Civilization VI, Stellaris, Dome Keeper, Imagine Earth), texture copies and uploads (Cult of the Lamb, Dome Keeper)
+and two deadlocks with the Metal performance HUD on (Soulstone Survivors, Cult of the Lamb, No Man's Sky). `--desktop` carries
+them all (plugin and translator); each is also a branch of its own on NullMoth v2.5.4, described in
+[UPSTREAM-CANDIDATES-GAMES.md](UPSTREAM-CANDIDATES-GAMES.md). They have no switch: they only change what used to fail.
+
+**Optional, `--desktop`: this fork's Metal plugin.** It is NullMoth 2.5.4's plugin with this fork's changes added one by
 one, each behind its own line in `/Library/GPUBundles/nvmtl/nvrm610.conf`. The ones listed as on by default below are on;
 the others are off, so apart from those the plugin behaves exactly like NullMoth's. Every change was measured on its own against NullMoth's
 plugin, on a GTX 1650 (NullMoth 2.5.0) and again on an RTX 4090 (NullMoth 2.5.2; macOS 26.7.1, zero-copy scan-out), with a
@@ -257,11 +267,11 @@ and 29 % less in a Core Image blur, while the synchronous elapsed time grows by 
 
 ## Requirements
 
-- NullMoth's driver **2.5.3** (or 2.5.2) installed and running. The installer refuses anything else: it checks NullMoth's
+- NullMoth's driver **2.5.4** installed and running. The installer refuses anything else: it checks NullMoth's
   version record, the version of the NVRM, NVAccel and NVRMFB kernel extensions on disk, and the version of the ones
   running (after a NullMoth update, restart before installing the overlay). The plugin and the kernel driver share
-  interfaces, so an overlay lists the NullMoth versions it was built for (`COMPATIBLE-DRIVERS` in the package). 2.5.3
-  changes only NVRM's handling of `nvregdwords=`; its NVAccel, NVRMFB and Metal plugin are byte for byte 2.5.2's.
+  interfaces, so an overlay lists the NullMoth versions it was built for (`COMPATIBLE-DRIVERS` in the package). 2.5.4
+  changed NVAccel and the Metal plugin, so this overlay's builds of both take those changes and it needs 2.5.4.
 - An x86_64 Mac (Intel or AMD hackintosh) running macOS 15 or 26, as NullMoth's driver requires. Tested only on
   macOS 26.7.1 with an RTX 4090 and a GTX 1650 so far.
 - The encoder part needs an RTX 40 card or a GTX 1650 (TU117: GTX 1650, T400 / T600 / T1000). The desktop and resolution parts work on every card the driver supports.
@@ -274,7 +284,7 @@ sudo ./install.sh                      # encoder for every app; NullMoth's plugi
 sudo ./install.sh --nvenc=parsecd,obs  # encoder only for these processes
 sudo ./install.sh --cli-wrappers       # and ffmpeg/ffprobe/HandBrakeCLI/avconvert through nvenc-run in shells and scripts
 sudo ./install.sh --no-decoders        # the encoders only (NVENCVT_NO_DEC=1 in /usr/local/etc/nvencvt.conf)
-sudo ./install.sh --desktop            # also this fork's plugin and NVAccel builds (see "What it changes"; restart afterwards)
+sudo ./install.sh --desktop            # also this fork's plugin, translator and NVAccel builds (see "What it changes"; restart afterwards)
 sudo ./install.sh --desktop --no-accel # the plugin build only, NullMoth's NVAccel
 sudo ./install.sh --desktop --nvenc=off  # the plugin build only, no encoder
 sudo ./install.sh --resolution         # also this fork's framebuffer build: smaller desktops, EDID overrides (restart)
@@ -304,8 +314,7 @@ on Apple's drivers, instead of WindowServer waiting at every capture commit. RTX
 NVAccel, installs this one and rebuilds the Auxiliary Kernel Collection: restart the Mac afterwards. `sudo sysctl -w
 debug.nvaccel_pageoff_unlocked_wait=0` brings the locked wait back until the next restart; counters
 `debug.nvaccel_pageoff_unlocked_waits` / `_locked_not_owner`. Source: this repository's `kexts/NVRM/accel` at the release tag
-(branch `accel-unlocked-wait`), built against NVIDIA's 615.78.08 headers like NullMoth's (NullMoth 2.5.2 and 2.5.3 ship the same
-NVAccel).
+(branch `accel-unlocked-wait`, on NullMoth 2.5.4's NVAccel), built against NVIDIA's 615.78.08 headers like NullMoth's.
 
 ## Undo
 
@@ -313,7 +322,7 @@ NVAccel).
 sudo ./uninstall.sh
 ```
 
-It puts the plugin, its signature and `nvrm610.conf` back exactly as they were, and removes `libnvencvt.dylib`,
+It puts the plugin, the shader translator, its signature and `nvrm610.conf` back exactly as they were, and removes `libnvencvt.dylib`,
 `nvenc-run`, the `--cli-wrappers` wrappers and lines (and `/etc/zshenv` if only that line was in it), the `--cli-aliases`
 lines and the `--no-decoders` setting; it puts NullMoth's NVAccel back after `--desktop`, and after `--resolution` NullMoth's
 NVRMFB (kernel collection rebuilt) and removes `nvfb-edid` and `/Library/NullMoth/nvfb-small` (EDID override files
@@ -337,7 +346,10 @@ stay: NullMoth's framebuffer ignores them). Then log out and back in, or restart
   `build/fb_build.sh` against NVIDIA's open-gpu-kernel-modules 615.78.08 headers (NullMoth 2.5.2's RM version; the same
   script builds NullMoth's own 2.5.2 NVRMFB byte for byte); `nvfb-edid` from `tools/nvfb-edid.c`.
 - Plugin (`--desktop` only): `plugin/` of [mickys/nvidia-macos-driver](https://github.com/mickys/nvidia-macos-driver) at the tag named in
-  `SOURCE` (NullMoth 2.5.2 plus the overlay's commits, each behind a config line), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
+  `SOURCE` (NullMoth 2.5.4 plus the overlay's commits), built as a release (`NVMTL_RELEASE=1`, macOS 15.0 minimum).
+- Shader translator (`--desktop` only): `translator/` at the same tag (NullMoth 2.5.4's plus upstream PR #343 and this fork's
+  translator fixes), a cargo release build of `translator/wrapper` with Rust 1.98.1, as NullMoth's `build/build_xlate_release.sh`.
 - Encoder: [mickys/nvenc](https://github.com/mickys/nvenc) at the commit named in `SOURCE`.
-- The plugin source is under the PolyForm Noncommercial License 1.0.0 (`LICENSE`), like NullMoth's. The encoder is MIT
-  (`LICENSE-nvenc`).
+- The plugin source is under the PolyForm Noncommercial License 1.0.0 (`LICENSE`), like NullMoth's. The shader translator is
+  under the GNU LGPL 3.0 / GPL 3.0 (`LICENSE-translator-LGPL-3.0`, `LICENSE-translator-GPL-3.0`), like NullMoth's; its source is
+  the tag above. The encoder is MIT (`LICENSE-nvenc`).

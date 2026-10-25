@@ -1,5 +1,5 @@
 #!/bin/bash
-# Undo the mickys overlay: put back the Metal plugin binary and nvrm610.conf saved by install.sh, remove
+# Undo the mickys overlay: put back the Metal plugin binary, the shader translator and nvrm610.conf saved by install.sh, remove
 # libnvencvt.dylib if it was not there before, and remove nvenc-run, the --cli-aliases hook and the --no-decoders line;
 # after --resolution also NullMoth's NVRMFB (kernel collection rebuilt; restart), nvfb-edid and /Library/NullMoth/nvfb-small.
 # EDID overrides in /Library/NullMoth/edid-override stay (NullMoth's framebuffer ignores them).
@@ -29,6 +29,7 @@ B=/Library/GPUBundles/NVMTLDriver.bundle; X=$B/Contents/MacOS; C=/Library/GPUBun
 NOW=$(cat /Library/NullMoth/driver-version 2>/dev/null || echo unknown); WAS=$(cat "$BK/driver-version" 2>/dev/null || echo unknown)
 [ "$NOW" = "$WAS" ] || die "the driver changed since the backup ($WAS -> $NOW); NullMoth's installer already replaced the overlay"
 install -o root -g wheel -m 755 "$BK/NVMTLDriver" "$X/NVMTLDriver"
+[ ! -f "$BK/libnvmtl_translate.dylib" ] || install -o root -g wheel -m 755 "$BK/libnvmtl_translate.dylib" "$X/libnvmtl_translate.dylib"
 if [ -f "$BK/libnvencvt.dylib" ]; then install -o root -g wheel -m 755 "$BK/libnvencvt.dylib" "$X/libnvencvt.dylib"
 else rm -f "$X/libnvencvt.dylib"; fi
 install -o root -g wheel -m 644 "$BK/nvrm610.conf" "$C"

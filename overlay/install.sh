@@ -3,8 +3,9 @@
 # NullMoth's Metal plugin in /Library/GPUBundles/NVMTLDriver.bundle, which loads it by itself since 2.3.7
 # (NVMTL_NVENCVT in nvrm610.conf). NullMoth's files stay as they are.
 #   sudo ./install.sh [--desktop] [--resolution] [--event-wait] [--nvenc=<process list>|--nvenc=1|--nvenc=off] [--no-accel] [--cli-wrappers] [--cli-aliases] [--no-decoders]
-#     --desktop      also replace the plugin binary with this fork's build (CPU-drawn windows uploaded by the GPU), and the
-#                    accelerator kext's binary (NVAccel) with this fork's build: a page-off waits for the GPU without the
+#     --desktop      also replace the plugin binary with this fork's build (CPU-drawn windows uploaded by the GPU, the fixes
+#                    games need) and the shader translator (libnvmtl_translate.dylib) with this fork's build (the shader fixes
+#                    games need), and the accelerator kext's binary (NVAccel) with this fork's build: a page-off waits for the GPU without the
 #                    accelerator lock, which lets two-plane capture surfaces share video memory (NVMTL_SURF_MULTIPLANE=1); restart
 #     --no-accel     with --desktop: keep NullMoth's NVAccel (and capture surfaces in private copies)
 #     --event-wait   apps wait for GPU work with an event instead of polling (NVRM_EVENT_WAIT=1 in nvrm610.conf): less CPU,
@@ -109,6 +110,15 @@ if [ ! -f "$BK/NVRMFB" ]; then
   cp -p "$FB" "$BK/NVRMFB" || die "backup to $BK failed"
   ok "NullMoth's NVRMFB added to the backup"
 fi
+# NullMoth's shader translator (backups made before 2.5.4-mickys.1 have none; the one on disk is NullMoth's unless it is this
+# package's)
+XL=$X/libnvmtl_translate.dylib
+if [ ! -f "$BK/libnvmtl_translate.dylib" ]; then
+  [ -f "$XL" ] || die "NullMoth's shader translator is missing ($XL); reinstall NullMoth $HAVE"
+  cmp -s "$XL" "$HERE/payload/libnvmtl_translate.dylib" && die "$XL is this overlay's build but the backup has no NullMoth translator; reinstall NullMoth $HAVE"
+  cp -p "$XL" "$BK/libnvmtl_translate.dylib" || die "backup to $BK failed"
+  ok "NullMoth's shader translator added to the backup"
+fi
 # and NullMoth's accelerator binary (backups made before 2.5.3-mickys.8 have none; the one on disk is NullMoth's unless it is this
 # package's)
 if [ ! -f "$BK/NVAccel" ]; then
@@ -121,6 +131,7 @@ echo "== 3. install"
 if [ $ENCONLY = 1 ]; then
   # NullMoth's own plugin, as the backup holds it (puts it back after a full install of the overlay)
   install -o root -g wheel -m 755 "$BK/NVMTLDriver" "$X/NVMTLDriver"
+  install -o root -g wheel -m 755 "$BK/libnvmtl_translate.dylib" "$XL"
   [ ! -f "$BK/CodeResources" ] || install -o root -g wheel -m 644 "$BK/CodeResources" "$CR"
   install -o root -g wheel -m 755 "$HERE/payload/libnvencvt.dylib" "$X/libnvencvt.dylib"
   xattr -d com.apple.quarantine "$X/libnvencvt.dylib" 2>/dev/null || true
@@ -131,12 +142,14 @@ if [ $ENCONLY = 1 ]; then
 else
   install -o root -g wheel -m 755 "$HERE/payload/NVMTLDriver" "$X/NVMTLDriver"
   install -o root -g wheel -m 755 "$HERE/payload/libnvencvt.dylib" "$X/libnvencvt.dylib"
+  install -o root -g wheel -m 755 "$HERE/payload/libnvmtl_translate.dylib" "$XL"
   # a browser-downloaded package carries com.apple.quarantine onto the extracted files; system binaries should not have it
-  xattr -d com.apple.quarantine "$X/NVMTLDriver" "$X/libnvencvt.dylib" 2>/dev/null || true
+  xattr -d com.apple.quarantine "$X/NVMTLDriver" "$X/libnvencvt.dylib" "$XL" 2>/dev/null || true
   codesign -f -s - "$X/libnvencvt.dylib" 2>&1 | grep -v "replacing existing signature" || true
+  codesign -f -s - "$XL" 2>&1 | grep -v "replacing existing signature" || true
   codesign -f -s - --preserve-metadata=identifier "$B" 2>&1 | grep -v "replacing existing signature" || true
   codesign -v "$B" || die "the bundle signature does not verify (undo: sudo ./uninstall.sh)"
-  ok "plugin and libnvencvt.dylib installed, bundle re-signed"
+  ok "plugin, shader translator and libnvencvt.dylib installed, bundle re-signed"
 fi
 
 # the Auxiliary Kernel Collection with the framebuffer binary on disk, built the way NullMoth's installer builds it; every
