@@ -3676,7 +3676,7 @@ static void nvmtl_pass_probe(NVMTLCommandBuffer *cb, NVMTLTexture *t, NSString *
         static int w = -1; if (w < 0) { w = 0; FILE *f = fopen("/tmp/nvmtl-probe-w", "r"); if (f) { if (fscanf(f, "%d", &w) != 1) w = 0; fclose(f); } }
         if ((w <= 0 || (_probeTex[0] && [_probeTex[0] nvi]->w == (uint32_t)w)) && atomic_fetch_sub(&budget, 1) > 0) {
           MTLVertexDescriptor *vd = _ps->_descriptor.vertexDescriptor;
-          for (int q = 0; q < 4 && (NSUInteger)q < count; q++) {
+          for (int q = 0; q < 0 && (NSUInteger)q < count; q++) {
               const uint8_t *ip = (const uint8_t *)nvmtl_buf_cpu(b) + off;
               long idx = (it == MTLIndexTypeUInt32 ? ((const uint32_t *)ip)[q] : ((const uint16_t *)ip)[q]) + baseVertex;
               char line[600]; int k = snprintf(line, sizeof line, "PROBE3 fs %s count %lu idx[%d]=%ld:", _ps->_fname.UTF8String ?: "-", (unsigned long)count, q, idx);
@@ -3690,7 +3690,25 @@ static void nvmtl_pass_probe(NVMTLCommandBuffer *cb, NVMTLTexture *t, NSString *
                   else k += snprintf(line + k, sizeof line - k, " a%d(f%lu) %.4g %.4g %.4g %.4g", a, (unsigned long)ad.format, f[0], f[1], f[2], f[3]);
               }
               nvlog("%s", line);
-          } } } }
+          }
+          // whole draw: every vertex's position, colour alpha and whether its uv lies in its TEXCOORD1..2 rect (text clip)
+          { MTLVertexAttributeDescriptor *a0 = vd.attributes[0], *a1 = vd.attributes[1], *a2 = vd.attributes[2], *a3 = vd.attributes[3], *a4 = vd.attributes[4];
+            NVMTLBuffer *vb = _vbufAt[a0.bufferIndex]; NSUInteger st = vd.layouts[a0.bufferIndex].stride;
+            if (vb && st && a1.format == MTLVertexFormatUChar4Normalized) {
+              const uint8_t *ip = (const uint8_t *)nvmtl_buf_cpu(b) + off, *base = (const uint8_t *)nvmtl_buf_cpu(vb) + _vbufOff[a0.bufferIndex];
+              float ylo = 1e9, yhi = -1e9, xlo = 1e9, xhi = -1e9; unsigned a0n = 0, a255 = 0, amid = 0, inrect = 0;
+              for (NSUInteger q = 0; q < count; q++) {
+                  long idx = (it == MTLIndexTypeUInt32 ? ((const uint32_t *)ip)[q] : ((const uint16_t *)ip)[q]) + baseVertex;
+                  const uint8_t *v = base + (NSUInteger)idx * st; if (v + st > (const uint8_t *)nvmtl_buf_cpu(vb) + vb->_b.size) break;
+                  const float *pos = (const float *)(v + a0.offset), *uv = (const float *)(v + a2.offset), *r0 = (const float *)(v + a3.offset), *r1 = (const float *)(v + a4.offset);
+                  uint8_t al = v[a1.offset + 3];
+                  if (pos[1] < ylo) ylo = pos[1]; if (pos[1] > yhi) yhi = pos[1]; if (pos[0] < xlo) xlo = pos[0]; if (pos[0] > xhi) xhi = pos[0];
+                  if (al == 0) a0n++; else if (al == 255) a255++; else amid++;
+                  (void)uv; (void)r0; (void)r1; inrect += 0;
+              }
+              nvlog("PROBE3 draw summary count %lu: x %.0f..%.0f y %.0f..%.0f alpha0 %u alpha255 %u alpha-mid %u", (unsigned long)count, xlo, xhi, ylo, yhi, a0n, a255, amid);
+            } }
+          } } }
 #endif
     nvmtl_vk_cmd_draw_indexed(&_cb->_c, &b->_b, off, (uint32_t)count, it == MTLIndexTypeUInt32,
                               (uint32_t)instances, (int32_t)baseVertex, (uint32_t)baseInstance);
